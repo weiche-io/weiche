@@ -7,8 +7,8 @@ use crate::{
 use anyhow::Context;
 use bytes::Bytes;
 use compio::{
-    net::TcpStream,
-    runtime::{self, fd::PollFd, time::timeout},
+    net::{TcpListener, TcpStream},
+    runtime::{self, time::timeout},
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use http::{HeaderMap, Request, Response, StatusCode, Uri, Version, header};
@@ -17,18 +17,17 @@ use hyper::{body::Incoming, service::service_fn};
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
-    future::poll_fn,
     net::SocketAddr,
     pin::Pin,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 // response leases stay on the compio worker and must not cross threads.
 type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error>>>;
@@ -45,13 +44,6 @@ impl Drop for Permit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-// only an unattached, owned socket crosses threads; no compio I/O is in flight.
-struct Accepted {
-    socket: std::net::TcpStream,
-    peer: SocketAddr,
-    permit: Permit,
 }
 
 struct ConnectionGuard {
@@ -96,19 +88,13 @@ impl Worker {
         *self.snapshot.borrow_mut() = snapshot;
     }
 
-    fn serve(&self, accepted: Accepted, shutdown: watch::Receiver<bool>) {
-        let Accepted {
-            socket,
-            peer,
-            permit,
-        } = accepted;
-        let stream = match TcpStream::from_std(socket) {
-            Ok(stream) => stream,
-            Err(error) => {
-                tracing::warn!(worker = self.id, %peer, %error, "failed to attach client socket");
-                return;
-            }
-        };
+    fn serve(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        permit: Permit,
+        shutdown: watch::Receiver<bool>,
+    ) {
         // the 2026-11-12 kind benchmark showed ~40 ms gaps between response
         // headers and bodies; disable Nagle before HTTP to avoid delayed ACKs.
         if let Err(error) = stream.set_nodelay(true) {
@@ -153,36 +139,75 @@ impl Worker {
         .await;
     }
 
-    async fn receive(
+    async fn run(
         mut self,
-        mut incoming: mpsc::Receiver<Accepted>,
-        shutdown: watch::Receiver<bool>,
-    ) {
-        let stop = stopped(shutdown.clone());
-        tokio::pin!(stop);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut stop => break,
-                changed = self.config.changed() => {
-                    if changed.is_err() {
-                        // the supervisor owns shutdown, including control-thread exit.
-                        stopped(shutdown.clone()).await;
-                        break;
+        total: Arc<AtomicUsize>,
+        listeners: Arc<Listeners>,
+        stop: watch::Sender<bool>,
+    ) -> anyhow::Result<()> {
+        let shutdown = stop.subscribe();
+        let stopped = stopped(shutdown.clone());
+        tokio::pin!(stopped);
+        let mut listener = None;
+        let mut bound = None;
+        let mut requested = None;
+        let result = async {
+            'listen: loop {
+                if *shutdown.borrow() { break; }
+                let desired = self.snapshot.borrow().bind;
+                if desired != bound || desired != requested {
+                    requested = desired;
+                    listener = None;
+                    bound = None;
+                    listeners.clear(self.id);
+                    if let Some(address) = desired {
+                        match listeners.bind(self.id, address) {
+                            Ok(socket) => {
+                                tracing::info!(worker = self.id, address = %socket.local_addr()?, "compio reuseport listener ready");
+                                listener = Some(socket);
+                                bound = Some(address);
+                            }
+                            Err(error) => tracing::error!(worker = self.id, %address, %error, "HTTP listener bind failed; retrying"),
+                        }
                     }
-                    self.refresh();
-                },
-                accepted = incoming.recv() => match accepted {
-                    Some(accepted) => {
-                        self.serve(accepted, shutdown.clone());
-                        yield_to_connections().await;
-                    },
-                    None => break,
-                },
+                }
+                let accepted = async { listener.as_ref().unwrap().accept().await };
+                tokio::pin!(accepted);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stopped => break 'listen,
+                        changed = self.config.changed() => {
+                            if changed.is_err() {
+                                // the supervisor also observes publisher closure and stops all workers.
+                                (&mut stopped).await;
+                                break 'listen;
+                            }
+                            self.refresh();
+                            let desired = self.snapshot.borrow().bind;
+                            if desired != bound || desired != requested { continue 'listen; }
+                            // keep this native accept future alive across route-only updates.
+                        },
+                        _ = runtime::time::sleep(Duration::from_millis(250)), if listener.is_none() => continue 'listen,
+                        result = &mut accepted, if listener.is_some() => {
+                            let (stream, peer) = result?;
+                            if total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).is_ok() {
+                                self.serve(stream, peer, Permit(total.clone()), shutdown.clone());
+                            }
+                            continue 'listen;
+                        },
+                    }
+                }
             }
+            Ok(())
+        }.await;
+        drop(listener);
+        listeners.clear(self.id);
+        if result.is_err() {
+            stop.send_replace(true);
         }
-        drop(incoming);
         self.drain().await;
+        result
     }
 }
 
@@ -192,69 +217,128 @@ pub(crate) async fn stopped(mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn yield_to_connections() {
-    // a continuously ready accept/receive loop must still let HTTP tasks run.
-    let mut yielded = false;
-    poll_fn(|cx| {
-        if std::mem::replace(&mut yielded, true) {
-            std::task::Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await;
+#[derive(Clone, Default)]
+struct Binding {
+    requested: Option<SocketAddr>,
+    state: ListenerState,
 }
 
-fn listen(address: SocketAddr) -> std::io::Result<PollFd<std::net::TcpListener>> {
+// this lock is used only when listeners bind or close, never to accept connections.
+// it also lets port-zero listeners join the same kernel-selected port.
+struct Listeners {
+    bindings: Mutex<Vec<Binding>>,
+    config: routing::Reader,
+    state: watch::Sender<ListenerState>,
+}
+
+impl Listeners {
+    fn bind(&self, worker: usize, requested: SocketAddr) -> std::io::Result<TcpListener> {
+        let mut bindings = self.bindings.lock().unwrap();
+        let address = bindings
+            .iter()
+            .find(|binding| binding.requested == Some(requested) && binding.state.bound.is_some())
+            .and_then(|binding| binding.state.bound)
+            .unwrap_or(requested);
+        let result = listen(address).and_then(|socket| Ok((socket.local_addr()?, socket)));
+        let state = match &result {
+            Ok((address, _)) => ListenerState {
+                bound: Some(*address),
+                error: None,
+            },
+            Err(error) => ListenerState {
+                bound: None,
+                error: Some(error.to_string()),
+            },
+        };
+        bindings[worker] = Binding {
+            requested: Some(requested),
+            state,
+        };
+        self.publish(&bindings);
+        result.map(|(_, socket)| socket)
+    }
+
+    fn clear(&self, worker: usize) {
+        let mut bindings = self.bindings.lock().unwrap();
+        bindings[worker] = Binding::default();
+        self.publish(&bindings);
+    }
+
+    fn publish(&self, bindings: &[Binding]) {
+        let desired = self.config.snapshot().bind;
+        let error = bindings.iter().enumerate().find_map(|(id, binding)| {
+            binding
+                .state
+                .error
+                .as_ref()
+                .map(|error| format!("worker {id}: {error}"))
+        });
+        let bound = bindings[0].state.bound.filter(|address| {
+            desired.is_some()
+                && error.is_none()
+                && bindings.iter().all(|binding| {
+                    binding.requested == desired && binding.state.bound == Some(*address)
+                })
+        });
+        // advertise readiness only when every worker has joined the same listener group.
+        let state = ListenerState { bound, error };
+        self.state.send_if_modified(|old| {
+            if *old == state {
+                false
+            } else {
+                *old = state;
+                true
+            }
+        });
+    }
+}
+
+fn listen(address: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(address),
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    socket.set_reuse_port(true)?;
+    #[cfg(not(target_os = "linux"))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "reuseport workers require Linux",
+    ));
     socket.bind(&address.into())?;
     socket.listen(128)?;
-    PollFd::new(socket.into())
+    TcpListener::from_std(socket.into())
 }
 
-async fn accept(
-    listener: &PollFd<std::net::TcpListener>,
-) -> std::io::Result<(std::net::TcpStream, SocketAddr)> {
-    loop {
-        match listener.accept() {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // the 2026-11-13 single-core comparison exposed extra accept
-                // attempts: compio polls its root future on every I/O turn.
-                // keep waiting here instead of retrying the syscall each poll.
-                listener.accept_ready().await?;
-            }
-            result => return result,
-        }
-    }
-}
-
-/// worker zero accepts and distributes sockets in round-robin order, including itself.
+/// each worker owns a native listener; the kernel distributes new connections.
 pub async fn run(
-    config: routing::Reader,
+    mut config: routing::Reader,
     state: watch::Sender<ListenerState>,
     shutdown: watch::Receiver<bool>,
     workers: usize,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(workers > 0, "at least one data-plane worker is required");
-    let mut local = Worker::new(0, config.clone());
-    let (stop, stopped_rx) = watch::channel(false);
-    let mut threads = Vec::new();
-    let mut senders = Vec::new();
-    let mut completed = FuturesUnordered::new();
+    let listeners = Arc::new(Listeners {
+        bindings: Mutex::new(vec![Binding::default(); workers]),
+        config: config.clone(),
+        state: state.clone(),
+    });
     let total = Arc::new(AtomicUsize::new(0));
+    let (stop, stopped_rx) = watch::channel(false);
+    let local = Worker::new(0, config.clone()).run(total.clone(), listeners.clone(), stop.clone());
+    tokio::pin!(local);
+    let mut local_done = false;
+    let mut threads = Vec::new();
+    let mut completed = FuturesUnordered::new();
     let mut result = async {
         let mut ready = Vec::new();
         for id in 1..workers {
             let config = config.clone();
-            let shutdown = stopped_rx.clone();
-            let (tx, rx) = mpsc::channel(MAX_CONNECTIONS);
+            let stop = stop.clone();
+            let total = total.clone();
+            let listeners = listeners.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
             let (done_tx, done_rx) = oneshot::channel();
             threads.push(thread::Builder::new().name(format!("weiche-worker-{id}")).spawn(move || {
@@ -270,13 +354,11 @@ pub async fn run(
                     runtime.block_on(async {
                         let worker = Worker::new(id, config);
                         let _ = ready_tx.send(Ok(()));
-                        worker.receive(rx, shutdown).await;
-                    });
-                    Ok(())
+                        worker.run(total, listeners, stop).await
+                    })
                 })();
                 let _ = done_tx.send(result);
             }).context("spawn data-plane worker")?);
-            senders.push(tx);
             ready.push((id, ready_rx));
             completed.push(done_rx);
         }
@@ -284,74 +366,25 @@ pub async fn run(
             ready.await.with_context(|| format!("worker {id} failed during startup"))?
                 .with_context(|| format!("create compio runtime for worker {id}"))?;
         }
-        let mut listener = None;
-        let mut bound = None;
-        let mut next = 0;
-        let shutdown = stopped(shutdown);
-        tokio::pin!(shutdown);
-        loop {
-            let desired = local.snapshot.borrow().bind;
-            if desired.is_none() && *state.borrow() != ListenerState::default() {
-                state.send_replace(ListenerState::default());
-            }
-            if desired != bound {
-                listener = None;
-                bound = None;
-                if let Some(address) = desired {
-                    match listen(address) {
-                        Ok(socket) => {
-                            let actual = socket.local_addr()?;
-                            listener = Some(socket);
-                            bound = Some(address);
-                            state.send_replace(ListenerState { bound: Some(actual), error: None });
-                            tracing::info!(address = %actual, workers, "compio HTTP listener ready");
-                        },
-                        Err(error) => {
-                            tracing::error!(%address, %error, "HTTP listener bind failed; retrying");
-                            state.send_replace(ListenerState { bound: None, error: Some(error.to_string()) });
-                        },
-                    }
-                } else {
-                    state.send_replace(ListenerState::default());
-                }
-            }
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => break,
-                result = completed.next(), if !completed.is_empty() => {
-                    result.unwrap().context("worker panicked")??;
-                    anyhow::bail!("data-plane worker stopped unexpectedly");
-                },
-                changed = local.config.changed() => {
-                    if changed.is_err() { break; }
-                    local.refresh();
-                },
-                _ = runtime::time::sleep(Duration::from_millis(250)), if listener.is_none() => {},
-                // readiness has no accepted socket to lose if configuration wakes us.
-                accepted = async { accept(listener.as_ref().unwrap()).await }, if listener.is_some() => {
-                    let (socket, peer) = accepted?;
-                    if total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).is_err() {
-                        yield_to_connections().await;
-                        continue;
-                    }
-                    let accepted = Accepted { socket, peer, permit: Permit(total.clone()) };
-                    let target = next;
-                    next = (next + 1) % workers;
-                    if target == 0 {
-                        local.serve(accepted, stopped_rx.clone());
-                    } else {
-                        senders[target - 1].try_send(accepted).map_err(|_| anyhow::anyhow!("worker queue unavailable"))?;
-                    }
-                    yield_to_connections().await;
-                },
-            }
+        tokio::select! {
+            biased;
+            _ = stopped(shutdown) => Ok(()),
+            _ = stopped(stopped_rx) => Ok(()),
+            _ = async { while config.changed().await.is_ok() {} } => Ok(()),
+            result = &mut local => { local_done = true; result },
+            result = completed.next(), if !completed.is_empty() => {
+                result.unwrap().context("worker panicked")??;
+                anyhow::bail!("data-plane worker stopped unexpectedly");
+            },
         }
-        Ok(())
     }.await;
     stop.send_replace(true);
-    drop(senders);
-    // all workers drain concurrently, including worker zero on the main runtime.
-    local.drain().await;
+    if !local_done {
+        let local_result = local.await;
+        if result.is_ok() {
+            result = local_result;
+        }
+    }
     while let Some(done) = completed.next().await {
         let done = done.context("worker panicked").and_then(|result| result);
         if result.is_ok() {
