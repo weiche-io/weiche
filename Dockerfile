@@ -1,3 +1,4 @@
+# TODO: build in alpine musl instead of debian
 FROM docker.io/library/rust:1.95-slim-trixie AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

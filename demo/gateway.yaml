@@ -45,7 +45,7 @@ kind: GatewayClass
 metadata:
   name: weiche
 spec:
-  controllerName: weiche.adamantye.cc/gateway-controller
+  controllerName: weiche.io/gateway-controller
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

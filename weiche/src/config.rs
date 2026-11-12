@@ -12,7 +12,7 @@ use weiche_gtwapi::v1::{
     httproutes::{HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs},
 };
 
-pub const CONTROLLER_NAME: &str = "weiche.adamantye.cc/gateway-controller";
+pub const CONTROLLER_NAME: &str = "weiche.io/gateway-controller";
 
 #[derive(Clone, Debug)]
 pub struct Selection {
