@@ -22,6 +22,7 @@ use tokio::{
 use weiche::{
     config::{Route, RoutingTable},
     dataplane::{self, ListenerState},
+    routing,
 };
 
 type TestBody = UnsyncBoxBody<Bytes, Infallible>;
@@ -120,13 +121,13 @@ async fn streams_cancels_and_applies_snapshots_on_real_compio_sockets() {
             invalid_backend: false,
         }],
     };
-    let (config_tx, config_rx) = watch::channel(Arc::new(table.clone()));
+    let (mut config_tx, config_rx) = routing::channel(table.clone());
     let (state_tx, mut state_rx) = watch::channel(ListenerState::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker = tokio::task::spawn_blocking(move || {
         compio::runtime::Runtime::new()
             .unwrap()
-            .block_on(dataplane::run(config_rx, state_tx, shutdown_rx))
+            .block_on(dataplane::run(config_rx, state_tx, shutdown_rx, 2))
             .unwrap();
     });
     tokio::time::timeout(Duration::from_secs(5), state_rx.changed())
@@ -169,21 +170,21 @@ async fn streams_cancels_and_applies_snapshots_on_real_compio_sockets() {
     .expect("downstream cancellation must close the upstream SSE stream");
     let mut invalid = table.clone();
     invalid.routes[0].invalid_backend = true;
-    config_tx.send_replace(Arc::new(invalid));
+    config_tx.publish(invalid);
     assert_eq!(
         request(address, "/").await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let mut empty = table.clone();
     empty.routes[0].endpoints.clear();
-    config_tx.send_replace(Arc::new(empty));
+    config_tx.publish(empty);
     assert_eq!(
         request(address, "/").await.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     let mut removed = table;
     removed.routes.clear();
-    config_tx.send_replace(Arc::new(removed));
+    config_tx.publish(removed);
     assert_eq!(request(address, "/").await.status(), StatusCode::NOT_FOUND);
     shutdown_tx.send_replace(true);
     tokio::time::timeout(Duration::from_secs(7), worker)

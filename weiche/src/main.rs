@@ -1,42 +1,24 @@
 use anyhow::Context;
-use kube::Client;
 use tracing_subscriber::EnvFilter;
 use weiche::{config::Selection, gateway};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    // Uses KUBECONFIG/default kubeconfig locally, or the pod's service account.
-    let client = Client::try_default()
-        .await
-        .context("failed to initialize Kubernetes client")?;
-
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        gateway::run(client, Selection::from_env()?, async move {
-            tokio::select! {
-                _ = terminate.recv() => {},
-                _ = interrupt.recv() => {},
-            }
-        })
-        .await?;
-    }
-
-    #[cfg(not(unix))]
-    gateway::run(client, Selection::from_env()?, async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "failed to listen for shutdown signal");
-        }
-    })
-    .await?;
-
-    Ok(())
+    let workers = match std::env::var("WEICHE_WORKERS") {
+        Ok(value) => value
+            .parse::<std::num::NonZeroUsize>()
+            .context("WEICHE_WORKERS must be a positive integer")?
+            .get(),
+        Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()?.get(),
+        Err(error) => return Err(error.into()),
+    };
+    let selection = Selection::from_env()?;
+    let runtime = compio::runtime::Runtime::new().context("create main compio runtime")?;
+    tracing::info!(worker = 0, workers, driver = ?runtime.driver_type(), "starting compio data plane");
+    runtime.block_on(gateway::run(selection, workers))
 }

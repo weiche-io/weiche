@@ -2473,6 +2473,7 @@ dependencies = [
  "kube",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-util",
  "tower",

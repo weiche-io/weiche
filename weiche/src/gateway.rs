@@ -1,8 +1,9 @@
-//! Connect Kubernetes caches, configuration compilation, status and the compio worker.
+//! supervise compio workers and a dedicated Tokio control thread.
 use crate::{
     config::{self, CONTROLLER_NAME, Compiled, Selection},
     controller::{GatewayController, GatewayStores},
     dataplane::{self, ListenerState},
+    routing,
 };
 use anyhow::Context;
 use kube::{
@@ -11,68 +12,127 @@ use kube::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{future::Future, sync::Arc, time::Duration};
-use tokio::sync::watch;
+use std::{thread, time::Duration};
+use tokio::sync::{oneshot, watch};
 use weiche_gtwapi::v1::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute};
 
-pub async fn run(
-    client: Client,
-    selection: Selection,
-    shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
-    let controller = GatewayController::new(client.clone());
-    let stores = controller.stores();
-    let (stop, stopped) = watch::channel(false);
-    let mut controller_stop = stopped.clone();
-    let controller = tokio::spawn(controller.run(async move {
-        let _ = controller_stop.changed().await;
-    }));
-    let (config_tx, config_rx) = watch::channel(Arc::new(config::RoutingTable::default()));
+pub async fn run(selection: Selection, workers: usize) -> anyhow::Result<()> {
+    let (config_tx, config_rx) = routing::channel(config::RoutingTable::default());
     let (listener_tx, listener_rx) = watch::channel(ListenerState::default());
-    let mut worker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let runtime = compio::runtime::Runtime::new()
-            .context("create compio runtime (requires io_uring on Linux)")?;
-        tracing::info!(driver = ?runtime.driver_type(), "starting compio data plane");
-        runtime.block_on(dataplane::run(config_rx, listener_tx, stopped))
-    });
-    let reconcile = async {
-        tokio::try_join!(
-            stores.gateway_classes.wait_until_ready(),
-            stores.gateways.wait_until_ready(),
-            stores.http_routes.wait_until_ready(),
-            stores.services.wait_until_ready(),
-            stores.endpoint_slices.wait_until_ready()
-        )?;
-        tracing::info!(namespace = %selection.namespace, gateway = %selection.gateway, listener = %selection.listener, "Kubernetes caches ready");
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
-        loop {
-            interval.tick().await;
-            let compiled = config::compile(&stores, &selection);
-            if **config_tx.borrow() != compiled.table {
-                tracing::info!(bind = ?compiled.table.bind, routes = compiled.table.routes.len(), "publishing HTTP routing configuration");
-                config_tx.send_replace(Arc::new(compiled.table.clone()));
-            }
-            let state = listener_rx.borrow().clone();
-            if let Err(error) = update_status(&client, &stores, &selection, &compiled, &state).await
-            {
-                tracing::warn!(%error, "failed to update Gateway API status; will retry");
-            }
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    };
-    let mut worker_done = false;
-    let result = tokio::select! {
-        _ = shutdown => Ok(()),
-        result = reconcile => result,
-        result = &mut worker => { worker_done = true; result.context("compio worker panicked").and_then(|result| result) }
+    let (stop, stopped) = watch::channel(false);
+    let control_stop = stopped.clone();
+    let (done_tx, mut done_rx) = oneshot::channel();
+    let control = thread::Builder::new()
+        .name("weiche-control".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create control-plane Tokio runtime")?;
+                runtime.block_on(run_control(selection, config_tx, listener_rx, control_stop))
+            })();
+            let _ = done_tx.send(result);
+        })
+        .context("spawn control-plane thread")?;
+    let data = dataplane::run(config_rx, listener_tx, stopped, workers);
+    tokio::pin!(data);
+    let mut data_done = false;
+    let mut control_done = false;
+    let mut result = tokio::select! {
+        result = &mut data => { data_done = true; result },
+        result = &mut done_rx => {
+            control_done = true;
+            result.context("control thread panicked").and_then(|result| result)
+        },
     };
     stop.send_replace(true);
-    controller.await.context("controller task panicked")?;
-    if !worker_done {
-        worker.await.context("compio worker panicked")??;
+    if !data_done {
+        let data_result = data.await;
+        if result.is_ok() {
+            result = data_result;
+        }
+    }
+    if !control_done {
+        let control_result = done_rx
+            .await
+            .context("control thread panicked")
+            .and_then(|result| result);
+        if result.is_ok() {
+            result = control_result;
+        }
+    }
+    if control.join().is_err() && result.is_ok() {
+        result = Err(anyhow::anyhow!("control thread panicked"));
     }
     result
+}
+
+async fn run_control(
+    selection: Selection,
+    mut config_tx: routing::Writer,
+    listener_rx: watch::Receiver<ListenerState>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let reconcile = async {
+        // initialize the client and all watches on their owning Tokio runtime.
+        let client = Client::try_default()
+            .await
+            .context("initialize Kubernetes client")?;
+        let controller = GatewayController::new(client.clone());
+        let stores = controller.stores();
+        let compile = async {
+            tokio::try_join!(
+                stores.gateway_classes.wait_until_ready(),
+                stores.gateways.wait_until_ready(),
+                stores.http_routes.wait_until_ready(),
+                stores.services.wait_until_ready(),
+                stores.endpoint_slices.wait_until_ready()
+            )?;
+            tracing::info!(namespace = %selection.namespace, gateway = %selection.gateway, listener = %selection.listener, "Kubernetes caches ready");
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let compiled = config::compile(&stores, &selection);
+                if config_tx.publish(compiled.table.clone()) {
+                    tracing::info!(bind = ?compiled.table.bind, routes = compiled.table.routes.len(), "publishing HTTP routing configuration");
+                }
+                let state = listener_rx.borrow().clone();
+                if let Err(error) =
+                    update_status(&client, &stores, &selection, &compiled, &state).await
+                {
+                    tracing::warn!(%error, "failed to update Gateway API status; will retry");
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            _ = controller.run(std::future::pending()) => anyhow::bail!("Kubernetes watches stopped unexpectedly"),
+            result = compile => result,
+        }
+    };
+    tokio::select! {
+        result = shutdown_signal() => result,
+        _ = dataplane::stopped(shutdown) => Ok(()),
+        result = reconcile => result,
+    }
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 fn condition(
