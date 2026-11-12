@@ -1,26 +1,23 @@
 //! Streaming HTTP/1.1 proxy. All traffic sockets and timers run on compio.
-use crate::config::RoutingTable;
+use crate::{
+    config::RoutingTable,
+    upstream::{Pool, io},
+};
 use bytes::Bytes;
 use compio::{
-    io::compat::AsyncStream,
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     runtime::{self, time::timeout},
 };
 use http::{HeaderMap, Request, Response, StatusCode, Uri, Version, header};
-use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::TokioIo;
 use std::{
     cell::Cell, convert::Infallible, net::SocketAddr, pin::Pin, rc::Rc, sync::Arc, time::Duration,
 };
 use tokio::sync::watch;
-use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
-type Body = UnsyncBoxBody<Bytes, hyper::Error>;
-type Io = TokioIo<Compat<Pin<Box<AsyncStream<TcpStream>>>>>;
-fn io(stream: TcpStream) -> Io {
-    TokioIo::new(Box::pin(AsyncStream::new(stream)).compat())
-}
+// response leases stay on the compio worker and must not cross threads.
+type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error>>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListenerState {
@@ -35,10 +32,15 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let cursor = Rc::new(Cell::new(0usize));
     let active = Rc::new(Cell::new(0usize));
+    // the 2026-11-12 benchmark also exhausted ephemeral ports by opening an
+    // upstream connection per request; share reusable connections across clients.
+    let pool = Pool::new();
     let mut listener: Option<TcpListener> = None;
     let mut bound = None;
     loop {
-        let desired = config.borrow_and_update().bind;
+        let snapshot = config.borrow_and_update().clone();
+        pool.configure(&snapshot);
+        let desired = snapshot.bind;
         if desired != bound {
             listener = None;
             bound = None;
@@ -77,11 +79,19 @@ pub async fn run(
                 let (stream, peer) = accepted?;
                 // A small demo limit also bounds idle downstream connections.
                 if active.get() >= 1024 { drop(stream); continue; }
+                // the 2026-11-12 kind benchmark showed ~40 ms gaps between
+                // response headers and bodies on keep-alive connections.
+                // disable Nagle before serving HTTP to avoid delayed-ACK stalls.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer, %error, "failed to enable TCP_NODELAY");
+                    continue;
+                }
                 active.set(active.get() + 1);
                 let config = config.clone(); let cursor = cursor.clone(); let active = active.clone();
+                let pool = pool.clone();
                 let mut shutdown = shutdown.clone();
                 runtime::spawn(async move {
-                    let service = service_fn(move |request| proxy(request, config.clone(), cursor.clone()));
+                    let service = service_fn(move |request| proxy(request, config.clone(), cursor.clone(), pool.clone()));
                     let connection = hyper::server::conn::http1::Builder::new()
                         .max_headers(100).max_buf_size(32 * 1024).serve_connection(io(stream), service);
                     tokio::pin!(connection);
@@ -98,6 +108,7 @@ pub async fn run(
         }
     }
     drop(listener);
+    pool.close();
     // Connection tasks observe shutdown concurrently; cap the total drain time.
     let _ = timeout(Duration::from_secs(6), async {
         while active.get() > 0 {
@@ -113,6 +124,7 @@ async fn proxy(
     mut request: Request<Incoming>,
     config: watch::Receiver<Arc<RoutingTable>>,
     cursor: Rc<Cell<usize>>,
+    pool: Rc<Pool>,
 ) -> Result<Response<Body>, Infallible> {
     if request.method() == http::Method::CONNECT || request.headers().contains_key(header::UPGRADE)
     {
@@ -134,6 +146,8 @@ async fn proxy(
         ));
     };
     let snapshot = config.borrow().clone();
+    // a request can observe a new snapshot before the listener task wakes.
+    pool.configure(&snapshot);
     let Some(route) = snapshot.find(
         &host,
         request.uri().path(),
@@ -167,29 +181,12 @@ async fn proxy(
         .map(|p| p.as_str())
         .unwrap_or("/");
     *request.uri_mut() = path.parse::<Uri>().unwrap();
-    let response = timeout(Duration::from_secs(10), async {
-        let stream = TcpStream::connect(endpoint).await?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io(stream)).await?;
-        // The response body owns a cancellation guard, so downstream cancellation
-        // also drops the upstream driver (including an endless SSE response).
-        let driver = runtime::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::debug!(%error, "upstream connection ended");
-            }
-        });
-        let response = sender.send_request(request).await?;
-        Ok::<_, anyhow::Error>((response, driver))
-    })
-    .await;
+    let response = timeout(Duration::from_secs(10), pool.send(endpoint, request)).await;
     match response {
-        Ok(Ok((response, driver))) => {
+        Ok(Ok(response)) => {
             let (mut parts, body) = response.into_parts();
             strip_hop_headers(&mut parts.headers);
-            let body = DrivenBody {
-                body,
-                _driver: driver,
-            };
-            Ok(Response::from_parts(parts, body.boxed_unsync()))
+            Ok(Response::from_parts(parts, Box::pin(body) as Body))
         }
         Ok(Err(error)) => {
             tracing::warn!(%endpoint, %error, "HTTP backend request failed");
@@ -199,27 +196,6 @@ async fn proxy(
             StatusCode::GATEWAY_TIMEOUT,
             "backend response headers timed out\n",
         )),
-    }
-}
-
-struct DrivenBody {
-    body: Incoming,
-    _driver: runtime::JoinHandle<()>,
-}
-impl hyper::body::Body for DrivenBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
-    }
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.body.size_hint()
     }
 }
 
@@ -253,10 +229,9 @@ fn reply(status: StatusCode, text: &'static str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(
+        .body(Box::pin(
             Full::new(Bytes::from_static(text.as_bytes()))
-                .map_err(|never| match never {})
-                .boxed_unsync(),
-        )
+                .map_err(|never| -> hyper::Error { match never {} }),
+        ) as Body)
         .unwrap()
 }
