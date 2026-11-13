@@ -1,9 +1,12 @@
 //! bounded HTTP/1 connection reuse on the compio worker.
 use crate::config::RoutingTable;
 use bytes::Bytes;
-use compio::{io::compat::AsyncStream, net::TcpStream, runtime};
+#[cfg(not(target_os = "linux"))]
+use compio::io::compat::AsyncStream;
+use compio::{net::TcpStream, runtime};
 use http::{Request, Response};
 use hyper::{body::Incoming, client::conn::http1::SendRequest};
+#[cfg(not(target_os = "linux"))]
 use hyper_util::rt::TokioIo;
 use std::{
     cell::{Cell, RefCell},
@@ -16,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+#[cfg(not(target_os = "linux"))]
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 // match the downstream connection bound; opening, leased and idle sockets
@@ -23,9 +27,16 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 const MAX_CONNECTIONS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(target_os = "linux")]
+pub(crate) fn io(stream: TcpStream) -> std::io::Result<crate::hyper_io::Io> {
+    crate::hyper_io::Io::new(stream)
+}
+
+#[cfg(not(target_os = "linux"))]
 type Io = TokioIo<Compat<Pin<Box<AsyncStream<TcpStream>>>>>;
-pub(crate) fn io(stream: TcpStream) -> Io {
-    TokioIo::new(Box::pin(AsyncStream::new(stream)).compat())
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn io(stream: TcpStream) -> std::io::Result<Io> {
+    Ok(TokioIo::new(Box::pin(AsyncStream::new(stream)).compat()))
 }
 
 #[derive(Default)]
@@ -53,7 +64,7 @@ impl Connection {
     async fn open(address: SocketAddr, slot: Slot) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(address).await?;
         stream.set_nodelay(true)?;
-        let (sender, connection) = hyper::client::conn::http1::handshake(io(stream)).await?;
+        let (sender, connection) = hyper::client::conn::http1::handshake(io(stream)?).await?;
         let driver = runtime::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(%address, %error, "upstream connection ended");

@@ -101,6 +101,13 @@ impl Worker {
             tracing::warn!(%peer, %error, "failed to enable TCP_NODELAY");
             return;
         }
+        let stream = match io(stream) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
+                return;
+            }
+        };
         tracing::debug!(worker = self.id, %peer, "serving HTTP connection");
         self.active.set(self.active.get() + 1);
         let guard = ConnectionGuard {
@@ -115,7 +122,7 @@ impl Worker {
             if *shutdown.borrow() { return; }
             let service = service_fn(move |request| proxy(request, config.clone(), cursor.clone(), pool.clone()));
             let connection = hyper::server::conn::http1::Builder::new()
-                .max_headers(100).max_buf_size(32 * 1024).serve_connection(io(stream), service);
+                .max_headers(100).max_buf_size(32 * 1024).serve_connection(stream, service);
             tokio::pin!(connection);
             tokio::select! {
                 result = &mut connection => {

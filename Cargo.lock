@@ -2471,6 +2471,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "libc",
  "serde",
  "serde_json",
  "socket2",

@@ -31,6 +31,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 weiche-gtwapi = { version = "=1.7.0", path = "../weiche-gtwapi" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 http-body = "1"
 tower = { version = "0.5", features = ["util"] }
