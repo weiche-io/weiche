@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
-use weiche::{config::Selection, gateway};
+use weiche::{config::Selection, gateway, runtime_config::RuntimeConfig};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -9,16 +9,10 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let workers = match std::env::var("WEICHE_WORKERS") {
-        Ok(value) => value
-            .parse::<std::num::NonZeroUsize>()
-            .context("WEICHE_WORKERS must be a positive integer")?
-            .get(),
-        Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()?.get(),
-        Err(error) => return Err(error.into()),
-    };
+    let config = RuntimeConfig::from_env()?;
+    let workers = config.workers.get();
     let selection = Selection::from_env()?;
     let runtime = compio::runtime::Runtime::new().context("create main compio runtime")?;
     tracing::info!(worker = 0, workers, driver = ?runtime.driver_type(), "starting compio data plane");
-    runtime.block_on(gateway::run(selection, workers))
+    runtime.block_on(gateway::run(selection, config))
 }

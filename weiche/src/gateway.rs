@@ -1,9 +1,13 @@
 //! supervise compio workers and a dedicated Tokio control thread.
-use crate::{
+use super::{
     config::{self, CONTROLLER_NAME, Compiled, Selection},
     controller::{GatewayController, GatewayStores},
-    dataplane::{self, ListenerState},
+    dataplane::WorkerGroup,
+    listener::WorkerGroupState,
     routing,
+    runtime_config::RuntimeConfig,
+    snapshot::{GatewaySnapshot, Revision},
+    worker::stopped,
 };
 use anyhow::Context;
 use kube::{
@@ -16,12 +20,13 @@ use std::{thread, time::Duration};
 use tokio::sync::{oneshot, watch};
 use weiche_gtwapi::v1::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute};
 
-pub async fn run(selection: Selection, workers: usize) -> anyhow::Result<()> {
-    let (config_tx, config_rx) = routing::channel(config::RoutingTable::default());
-    let (listener_tx, listener_rx) = watch::channel(ListenerState::default());
+pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result<()> {
+    let (config_tx, config_rx) = routing::channel(GatewaySnapshot::default());
+    let (listener_tx, listener_rx) = watch::channel(WorkerGroupState::default());
     let (stop, stopped) = watch::channel(false);
     let control_stop = stopped.clone();
     let (done_tx, mut done_rx) = oneshot::channel();
+    let group = WorkerGroup::new(runtime, config_rx, listener_tx)?;
     let control = thread::Builder::new()
         .name("weiche-control".into())
         .spawn(move || {
@@ -35,7 +40,7 @@ pub async fn run(selection: Selection, workers: usize) -> anyhow::Result<()> {
             let _ = done_tx.send(result);
         })
         .context("spawn control-plane thread")?;
-    let data = dataplane::run(config_rx, listener_tx, stopped, workers);
+    let data = group.run(stopped);
     tokio::pin!(data);
     let mut data_done = false;
     let mut control_done = false;
@@ -71,7 +76,7 @@ pub async fn run(selection: Selection, workers: usize) -> anyhow::Result<()> {
 async fn run_control(
     selection: Selection,
     mut config_tx: routing::Writer,
-    listener_rx: watch::Receiver<ListenerState>,
+    listener_rx: watch::Receiver<WorkerGroupState>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let reconcile = async {
@@ -89,17 +94,20 @@ async fn run_control(
                 stores.services.wait_until_ready(),
                 stores.endpoint_slices.wait_until_ready()
             )?;
-            tracing::info!(namespace = %selection.namespace, gateway = %selection.gateway, listener = %selection.listener, "Kubernetes caches ready");
+            tracing::info!(namespace = %selection.namespace, gateway = %selection.gateway, listener = %selection.listener, "kubernetes caches ready");
             let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut published = None;
             loop {
                 interval.tick().await;
                 let compiled = config::compile(&stores, &selection);
-                if config_tx.publish(compiled.table.clone()) {
-                    tracing::info!(bind = ?compiled.table.bind, routes = compiled.table.routes.len(), "publishing HTTP routing configuration");
+                let revision = config_tx.publish(compiled.snapshot.clone());
+                if published != Some(revision) {
+                    published = Some(revision);
+                    tracing::info!(revision, bind = ?compiled.snapshot.listener, routes = compiled.snapshot.router.len(), "published gateway snapshot");
                 }
                 let state = listener_rx.borrow().clone();
                 if let Err(error) =
-                    update_status(&client, &stores, &selection, &compiled, &state).await
+                    update_status(&client, &stores, &selection, &compiled, revision, &state).await
                 {
                     tracing::warn!(%error, "failed to update Gateway API status; will retry");
                 }
@@ -114,7 +122,7 @@ async fn run_control(
     };
     tokio::select! {
         result = shutdown_signal() => result,
-        _ = dataplane::stopped(shutdown) => Ok(()),
+        _ = stopped(shutdown) => Ok(()),
         result = reconcile => result,
     }
 }
@@ -141,7 +149,7 @@ fn condition(
         "message": message, "observedGeneration": generation.unwrap_or(1)})
 }
 
-// Keep transition times stable, so reconciliation does not generate status/watch loops.
+// keep transition times stable, so reconciliation does not generate status/watch loops.
 fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     for condition in &mut conditions {
         let previous = old.and_then(Value::as_array).and_then(|old| {
@@ -186,7 +194,8 @@ async fn update_status(
     stores: &GatewayStores,
     selection: &Selection,
     compiled: &Compiled,
-    listener: &ListenerState,
+    revision: Revision,
+    listener: &WorkerGroupState,
 ) -> anyhow::Result<()> {
     let Some(gateway) = stores.gateways.state().into_iter().find(|g| {
         g.namespace().as_deref() == Some(&selection.namespace) && g.name_any() == selection.gateway
@@ -232,12 +241,11 @@ async fn update_status(
         .cloned()
         .map(Value::Object)
         .unwrap_or(json!({}));
-    let programmed =
-        compiled.accepted && listener.bound.is_some() && listener.bound == compiled.table.bind;
+    let programmed = compiled.accepted && listener.programmed(revision, compiled.snapshot.listener);
     let programmed_message = listener.error.as_deref().unwrap_or(if programmed {
-        "compio HTTP listener is bound"
+        "all workers applied the gateway snapshot and bound the listener"
     } else {
-        "waiting for a valid listener to bind"
+        "waiting for all workers to apply the gateway snapshot and bind the listener"
     });
     let conditions = stamp(
         vec![

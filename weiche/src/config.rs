@@ -1,11 +1,15 @@
-//! Compile a deliberately small HTTP Gateway API subset into immutable snapshots.
+//! compile a deliberately small HTTP Gateway API subset into immutable snapshots.
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
-use crate::controller::GatewayStores;
-use http::{HeaderMap, Method};
+use super::{
+    cluster::{ClusterId, ClusterSpec},
+    controller::GatewayStores,
+    router::{Route, RouteAction, Router, hostname_matches},
+    snapshot::GatewaySnapshot,
+};
 use kube::ResourceExt;
 use weiche_gtwapi::v1::{
     gateways::GatewayListeners,
@@ -33,88 +37,6 @@ impl Selection {
                 .parse()?,
         })
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RoutingTable {
-    pub bind: Option<SocketAddr>,
-    pub routes: Vec<Route>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Route {
-    pub hostname: String,
-    pub path: String,
-    pub exact: bool,
-    pub method: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub endpoints: Vec<SocketAddr>,
-    pub invalid_backend: bool,
-    // Earlier entries win ties: creation time, namespace/name, rule and match order.
-}
-
-impl RoutingTable {
-    pub fn find(
-        &self,
-        hostname: &str,
-        path: &str,
-        method: &Method,
-        headers: &HeaderMap,
-    ) -> Option<&Route> {
-        self.routes
-            .iter()
-            .rev()
-            .filter(|r| {
-                hostname_matches(&r.hostname, hostname)
-                    && (if r.exact {
-                        path == r.path
-                    } else {
-                        r.path == "/"
-                            || path == r.path
-                            || path
-                                .strip_prefix(&r.path)
-                                .is_some_and(|tail| tail.starts_with('/'))
-                    })
-                    && r.method.as_deref().is_none_or(|m| m == method.as_str())
-                    && r.headers.iter().all(|(k, v)| {
-                        headers
-                            .get_all(k)
-                            .iter()
-                            .any(|value| value.as_bytes() == v.as_bytes())
-                    })
-            })
-            .max_by_key(|r| {
-                (
-                    host_rank(&r.hostname),
-                    r.exact,
-                    r.path.len(),
-                    r.method.is_some(),
-                    r.headers.len(),
-                )
-            })
-    }
-}
-
-fn host_rank(pattern: &str) -> (u8, usize) {
-    (
-        if pattern.is_empty() {
-            0
-        } else if pattern.starts_with("*.") {
-            1
-        } else {
-            2
-        },
-        pattern.len(),
-    )
-}
-
-pub fn hostname_matches(pattern: &str, host: &str) -> bool {
-    pattern.is_empty()
-        || pattern == host
-        || pattern.strip_prefix("*.").is_some_and(|suffix| {
-            host.strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
-        })
 }
 
 fn intersection(a: &str, b: &str) -> Option<String> {
@@ -156,7 +78,7 @@ pub struct RouteReport {
 }
 
 pub struct Compiled {
-    pub table: RoutingTable,
+    pub snapshot: GatewaySnapshot,
     pub reports: Vec<RouteReport>,
     pub accepted: bool,
     pub reason: &'static str,
@@ -165,7 +87,7 @@ pub struct Compiled {
 
 pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
     let mut result = Compiled {
-        table: RoutingTable::default(),
+        snapshot: GatewaySnapshot::default(),
         reports: vec![],
         accepted: false,
         reason: "Invalid",
@@ -202,12 +124,13 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
             result.accepted = true;
             result.reason = "Accepted";
             result.message = "selected HTTP listener is valid".into();
-            result.table.bind = Some(SocketAddr::new(selection.bind_ip, l.port as u16));
+            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, l.port as u16));
         } else {
             result.reason = "UnsupportedProtocol";
             result.message = "only plaintext HTTP listeners are supported".into();
         }
     }
+    let mut compiled_routes = Vec::new();
     let mut routes = stores.http_routes.state();
     routes.sort_by_key(|r| {
         (
@@ -283,6 +206,21 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                 report.resolved = false;
                                 report.refs_reason = refs_reason;
                             }
+                            let action = if invalid {
+                                RouteAction::RejectInvalidBackend
+                            } else {
+                                let backend = &rule.backend_refs.as_ref().unwrap()[0];
+                                let id = ClusterId {
+                                    namespace: route.namespace().unwrap_or_default(),
+                                    service: backend.name.clone(),
+                                    port: backend.port.unwrap() as u16,
+                                };
+                                result
+                                    .snapshot
+                                    .clusters
+                                    .insert(id.clone(), ClusterSpec { endpoints });
+                                RouteAction::Forward(id)
+                            };
                             let matches = rule.matches.clone().unwrap_or_else(|| {
                                 vec![weiche_gtwapi::v1::httproutes::HttpRouteRulesMatches {
                                     headers: None,
@@ -304,7 +242,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                     raw_path.trim_end_matches('/')
                                 };
                                 for hostname in &hosts {
-                                    result.table.routes.push(Route {
+                                    compiled_routes.push(Route {
                                         hostname: hostname.clone(),
                                         path: if path.is_empty() {
                                             "/".into()
@@ -325,8 +263,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                             .flatten()
                                             .map(|h| (h.name.to_ascii_lowercase(), h.value.clone()))
                                             .collect(),
-                                        endpoints: endpoints.clone(),
-                                        invalid_backend: invalid,
+                                        action: action.clone(),
                                     });
                                 }
                             }
@@ -337,6 +274,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
             result.reports.push(report);
         }
     }
+    result.snapshot.router = Router::compile(compiled_routes);
     result
 }
 

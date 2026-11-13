@@ -1,3 +1,3 @@
 # Weiche
 
-A experimental high performance k8s gateway.
+An experimental high performance k8s gateway.

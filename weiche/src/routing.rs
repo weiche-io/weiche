@@ -1,5 +1,5 @@
 //! publish immutable routing snapshots through two independently locked slots.
-use crate::config::RoutingTable;
+use super::snapshot::{GatewaySnapshot, PublishedSnapshot, Revision};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicUsize, Ordering},
@@ -7,7 +7,7 @@ use std::sync::{
 use tokio::sync::watch;
 
 struct Shared {
-    slots: [RwLock<Arc<RoutingTable>>; 2],
+    slots: [RwLock<Arc<PublishedSnapshot>>; 2],
     generation: AtomicUsize,
 }
 
@@ -23,8 +23,11 @@ pub struct Reader {
     notify: watch::Receiver<()>,
 }
 
-pub fn channel(initial: RoutingTable) -> (Writer, Reader) {
-    let initial = Arc::new(initial);
+pub fn channel(initial: GatewaySnapshot) -> (Writer, Reader) {
+    let initial = Arc::new(PublishedSnapshot {
+        revision: 0,
+        gateway: initial,
+    });
     let shared = Arc::new(Shared {
         slots: [RwLock::new(initial.clone()), RwLock::new(initial)],
         generation: AtomicUsize::new(0),
@@ -40,23 +43,28 @@ pub fn channel(initial: RoutingTable) -> (Writer, Reader) {
 }
 
 impl Writer {
-    pub fn publish(&mut self, table: RoutingTable) -> bool {
+    pub fn publish(&mut self, gateway: GatewaySnapshot) -> Revision {
         let generation = self.shared.generation.load(Ordering::Relaxed);
-        if **self.shared.slots[generation & 1].read().unwrap() == table {
-            return false;
+        if self.shared.slots[generation & 1].read().unwrap().gateway == gateway {
+            return generation;
         }
-        let next = generation.wrapping_add(1);
-        let table = Arc::new(table);
+        let next = generation
+            .checked_add(1)
+            .expect("configuration revision exhausted");
+        let table = Arc::new(PublishedSnapshot {
+            revision: next,
+            gateway,
+        });
         *self.shared.slots[next & 1].write().unwrap() = table;
         // finish the inactive slot before making it visible to readers.
         self.shared.generation.store(next, Ordering::Release);
         self.notify.send_replace(());
-        true
+        next
     }
 }
 
 impl Reader {
-    pub fn snapshot(&self) -> Arc<RoutingTable> {
+    pub fn snapshot(&self) -> Arc<PublishedSnapshot> {
         loop {
             let generation = self.shared.generation.load(Ordering::Acquire);
             let slot = self.shared.slots[generation & 1].read().unwrap();

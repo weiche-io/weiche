@@ -69,7 +69,7 @@ impl GatewayController {
             .take_until(shutdown)
             .for_each(|()| async {})
             .await;
-        tracing::info!("Kubernetes resource watches stopped");
+        tracing::info!("kubernetes resource watches stopped");
     }
 }
 
@@ -85,7 +85,7 @@ where
                 tracing::debug!(kind = %K::kind(&()), namespace = resource.namespace().as_deref().unwrap_or(""), name = %resource.name_any(), "observed resource change");
             }
             Ok(_) => {},
-            Err(error) => tracing::error!(kind = %K::kind(&()), %error, "Kubernetes resource watch failed"),
+            Err(error) => tracing::error!(kind = %K::kind(&()), %error, "kubernetes resource watch failed"),
         }).boxed();
     (reader, stream)
 }
