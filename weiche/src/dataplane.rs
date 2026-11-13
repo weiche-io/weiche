@@ -307,13 +307,7 @@ fn listen(address: SocketAddr) -> std::io::Result<TcpListener> {
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_reuse_address(true)?;
-    #[cfg(target_os = "linux")]
     socket.set_reuse_port(true)?;
-    #[cfg(not(target_os = "linux"))]
-    return Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "reuseport workers require Linux",
-    ));
     socket.bind(&address.into())?;
     socket.listen(128)?;
     TcpListener::from_std(socket.into())

@@ -120,18 +120,13 @@ async fn run_control(
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        tokio::select! {
-            _ = terminate.recv() => {},
-            _ = interrupt.recv() => {},
-        }
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = terminate.recv() => {},
+        _ = interrupt.recv() => {},
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 

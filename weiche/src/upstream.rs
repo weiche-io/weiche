@@ -1,13 +1,10 @@
 //! bounded HTTP/1 connection reuse on the compio worker.
 use crate::config::RoutingTable;
 use bytes::Bytes;
-#[cfg(not(target_os = "linux"))]
-use compio::io::compat::AsyncStream;
 use compio::{net::TcpStream, runtime};
+use cyper_core::HyperStream;
 use http::{Request, Response};
 use hyper::{body::Incoming, client::conn::http1::SendRequest};
-#[cfg(not(target_os = "linux"))]
-use hyper_util::rt::TokioIo;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -19,24 +16,18 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
-#[cfg(not(target_os = "linux"))]
-use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 // match the downstream connection bound; opening, leased and idle sockets
 // share this budget, so slow bodies cannot grow an unbounded upstream pool.
 const MAX_CONNECTIONS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(target_os = "linux")]
-pub(crate) fn io(stream: TcpStream) -> std::io::Result<crate::hyper_io::Io> {
-    crate::hyper_io::Io::new(stream)
-}
-
-#[cfg(not(target_os = "linux"))]
-type Io = TokioIo<Compat<Pin<Box<AsyncStream<TcpStream>>>>>;
-#[cfg(not(target_os = "linux"))]
+type Io = HyperStream<runtime::fd::PollFd<socket2::Socket>>;
 pub(crate) fn io(stream: TcpStream) -> std::io::Result<Io> {
-    Ok(TokioIo::new(Box::pin(AsyncStream::new(stream)).compat()))
+    let socket = stream.into_poll_fd()?;
+    // into_poll_fd does not set O_NONBLOCK; HyperStream polls borrowed buffers.
+    socket.set_nonblocking(true)?;
+    Ok(HyperStream::new_plain(socket))
 }
 
 #[derive(Default)]
