@@ -32,7 +32,8 @@ pub struct Selection {
 impl Selection {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            namespace: std::env::var("WEICHE_NAMESPACE").unwrap_or_else(|_| "weiche-demo".into()),
+            namespace: std::env::var("WEICHE_NAMESPACE")
+                .unwrap_or_else(|_| "weiche-demo".into()),
             gateway: std::env::var("WEICHE_GATEWAY").unwrap_or_else(|_| "weiche".into()),
             listener: std::env::var("WEICHE_LISTENER").unwrap_or_else(|_| "http".into()),
             bind_ip: std::env::var("WEICHE_BIND_IP")
@@ -104,18 +105,15 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
         return result;
     };
     let Some(class) = stores.gateway_classes.state().into_iter().find(|c| {
-        c.name_any() == gateway.spec.gateway_class_name && c.metadata.deletion_timestamp.is_none()
+        c.name_any() == gateway.spec.gateway_class_name
+            && c.metadata.deletion_timestamp.is_none()
     }) else {
         return result;
     };
     if class.spec.controller_name != CONTROLLER_NAME {
         return result;
     }
-    let listener = gateway
-        .spec
-        .listeners
-        .iter()
-        .find(|l| l.name == selection.listener);
+    let listener = gateway.spec.listeners.iter().find(|l| l.name == selection.listener);
     if class.spec.parameters_ref.is_some()
         || gateway.spec.tls.is_some()
         || gateway.spec.listeners.len() != 1
@@ -123,15 +121,11 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
         result.message =
             "demo requires one listener, no class parameters and no Gateway TLS".into();
     } else if let Some(l) = listener {
-        if l.protocol == "HTTP"
-            && l.tls.is_none()
-            && let Ok(port) = u16::try_from(l.port)
-            && port != 0
-        {
+        if l.protocol == "HTTP" && l.tls.is_none() {
             result.accepted = true;
             result.reason = "Accepted";
             result.message = "selected HTTP listener is valid".into();
-            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, port));
+            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, l.port));
         } else {
             result.reason = "UnsupportedProtocol";
             result.message = "only plaintext HTTP listeners are supported".into();
@@ -140,25 +134,15 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
     let mut compiled_routes = Vec::new();
     let mut routes = stores.http_routes.state();
     routes.sort_by_key(|r| {
-        (
-            r.metadata.creation_timestamp.clone(),
-            r.namespace(),
-            r.name_any(),
-        )
+        (r.metadata.creation_timestamp.clone(), r.namespace(), r.name_any())
     });
     for route in routes {
         for parent in route.spec.parent_refs.iter().flatten() {
-            if parent
-                .group
-                .as_deref()
-                .unwrap_or("gateway.networking.k8s.io")
+            if parent.group.as_deref().unwrap_or("gateway.networking.k8s.io")
                 != "gateway.networking.k8s.io"
                 || parent.kind.as_deref().unwrap_or("Gateway") != "Gateway"
                 || parent.name != selection.gateway
-                || parent
-                    .namespace
-                    .as_deref()
-                    .or(route.metadata.namespace.as_deref())
+                || parent.namespace.as_deref().or(route.metadata.namespace.as_deref())
                     != Some(&selection.namespace)
             {
                 continue;
@@ -174,15 +158,13 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
             };
             if result.accepted
                 && let Some(l) = listener
-                && parent
-                    .section_name
-                    .as_deref()
-                    .is_none_or(|name| name == l.name)
+                && parent.section_name.as_deref().is_none_or(|name| name == l.name)
                 && parent.port.is_none_or(|port| port == l.port)
             {
                 if !allows_route(l, &selection.namespace, &route) {
                     report.reason = "NotAllowedByListeners";
-                    report.message = "listener does not allow this route namespace or kind".into();
+                    report.message =
+                        "listener does not allow this route namespace or kind".into();
                 } else {
                     let hosts: Vec<_> = route
                         .spec
@@ -190,11 +172,14 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                         .as_deref()
                         .unwrap_or(&[String::new()])
                         .iter()
-                        .filter_map(|h| intersection(l.hostname.as_deref().unwrap_or(""), h))
+                        .filter_map(|h| {
+                            intersection(l.hostname.as_deref().unwrap_or(""), h)
+                        })
                         .collect();
                     if hosts.is_empty() {
                         report.reason = "NoMatchingListenerHostname";
-                        report.message = "route and listener hostnames do not intersect".into();
+                        report.message =
+                            "route and listener hostnames do not intersect".into();
                     } else if route.spec.rules.iter().flatten().any(unsupported_rule) {
                         report.reason = "UnsupportedValue";
                         report.message = "unsupported rule: use Exact/PathPrefix, exact headers, method and one same-namespace HTTP Service backend".into();
@@ -256,7 +241,12 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                             .headers
                                             .iter()
                                             .flatten()
-                                            .map(|h| (h.name.to_ascii_lowercase(), h.value.clone()))
+                                            .map(|h| {
+                                                (
+                                                    h.name.to_ascii_lowercase(),
+                                                    h.value.clone(),
+                                                )
+                                            })
                                             .collect(),
                                         action: action.clone(),
                                     });
@@ -319,11 +309,7 @@ fn resolve_backend(
     if b.namespace.as_deref().is_some_and(|n| n != ns) {
         return Err("RefNotPermitted");
     }
-    let backend_port = b
-        .port
-        .and_then(|port| u16::try_from(port).ok())
-        .filter(|&port| port != 0)
-        .ok_or("BackendNotFound")?;
+    let backend_port = b.port.ok_or("BackendNotFound")?;
     let service = stores
         .services
         .state()
@@ -340,7 +326,8 @@ fn resolve_backend(
         .and_then(|s| s.ports.as_ref())
         .and_then(|ports| {
             ports.iter().find(|p| {
-                p.port == i32::from(backend_port) && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
+                p.port == i32::from(backend_port)
+                    && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
             })
         })
         .ok_or("BackendNotFound")?;
@@ -394,9 +381,6 @@ fn resolve_backend(
             service: b.name.clone(),
             port: backend_port,
         },
-        ClusterSpec {
-            endpoints,
-            protocol,
-        },
+        ClusterSpec { endpoints, protocol },
     ))
 }

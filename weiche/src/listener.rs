@@ -76,7 +76,8 @@ impl ListenerGroup {
             .find(|worker| worker.requested == Some(requested) && worker.bound.is_some())
             .and_then(|worker| worker.bound)
             .unwrap_or(requested);
-        let result = listen(address).and_then(|socket| Ok((socket.local_addr()?, socket)));
+        let result =
+            listen(address).and_then(|socket| Ok((socket.local_addr()?, socket)));
         let worker = &mut workers[id];
         worker.requested = Some(requested);
         match &result {
@@ -119,13 +120,12 @@ impl ListenerGroup {
         let bound = workers[0].bound.filter(|address| {
             desired.gateway.listener.is_some()
                 && workers.iter().all(|worker| {
-                    worker.requested == desired.gateway.listener && worker.bound == Some(*address)
+                    worker.requested == desired.gateway.listener
+                        && worker.bound == Some(*address)
                 })
         });
         let applied = workers[0].applied.filter(|revision| {
-            workers
-                .iter()
-                .all(|worker| worker.applied == Some(*revision))
+            workers.iter().all(|worker| worker.applied == Some(*revision))
         });
         let next = WorkerGroupState {
             published: desired.revision,

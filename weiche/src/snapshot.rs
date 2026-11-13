@@ -13,9 +13,7 @@ pub struct ForwardingPolicy {
 
 impl Default for ForwardingPolicy {
     fn default() -> Self {
-        Self {
-            response_header_timeout: Duration::from_secs(10),
-        }
+        Self { response_header_timeout: Duration::from_secs(10) }
     }
 }
 

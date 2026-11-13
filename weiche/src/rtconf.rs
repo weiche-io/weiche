@@ -34,9 +34,9 @@ impl RuntimeConfig {
 
     pub fn from_env() -> anyhow::Result<Self> {
         let workers = match std::env::var("WEICHE_WORKERS") {
-            Ok(value) => value
-                .parse()
-                .context("WEICHE_WORKERS must be a positive integer")?,
+            Ok(value) => {
+                value.parse().context("WEICHE_WORKERS must be a positive integer")?
+            }
             Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()?,
             Err(error) => return Err(error.into()),
         };

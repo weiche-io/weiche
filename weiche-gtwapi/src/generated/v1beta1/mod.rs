@@ -1,5 +1,5 @@
 // @generated from Kubernetes Gateway API v1.7.0 (Standard).
-// Generator: kopium 0.24.1.
+// Generator: kopium 0.24.1 with integer range inference.
 
 pub mod gatewayclasses;
 pub mod gateways;

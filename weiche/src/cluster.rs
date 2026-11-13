@@ -51,7 +51,9 @@ impl Clusters {
                         Some(old) if old.spec == *spec => old.clone(),
                         _ => Rc::new(Cluster {
                             spec: spec.clone(),
-                            cursor: Cell::new(old.map_or(0, |cluster| cluster.cursor.get())),
+                            cursor: Cell::new(
+                                old.map_or(0, |cluster| cluster.cursor.get()),
+                            ),
                         }),
                     };
                     (id.clone(), cluster)

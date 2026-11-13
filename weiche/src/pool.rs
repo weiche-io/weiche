@@ -66,10 +66,9 @@ impl Endpoint {
 
     fn put(&self, connection: Connection) {
         if self.enabled.get() && connection.transport.sender.is_ready() {
-            self.idle.borrow_mut().push(Idle {
-                connection,
-                since: Instant::now(),
-            });
+            self.idle
+                .borrow_mut()
+                .push(Idle { connection, since: Instant::now() });
             self.budget.changed.notify_waiters();
         }
     }
@@ -138,9 +137,7 @@ impl ConnectionPool {
             limit: config.upstream_connections_per_worker.get(),
             max_streams: config.http2_max_concurrent_streams as usize,
             idle_timeout: config.upstream_idle_timeout,
-            connector: Connector {
-                max_buffer: config.http_max_buffer,
-            },
+            connector: Connector { max_buffer: config.http_max_buffer },
             budget: Rc::new(Budget::default()),
             closed: Cell::new(false),
             reaper: RefCell::new(None),
@@ -212,24 +209,25 @@ impl ConnectionPool {
         }
     }
 
-    pub async fn acquire(&self, endpoint: Rc<Endpoint>, reuse: bool) -> anyhow::Result<Lease> {
+    pub async fn acquire(
+        &self,
+        endpoint: Rc<Endpoint>,
+        reuse: bool,
+    ) -> anyhow::Result<Lease> {
         loop {
             anyhow::ensure!(
                 !self.closed.get() && endpoint.enabled.get(),
                 "backend was removed or pool closed"
             );
-            let idle = if reuse {
-                endpoint.idle.borrow_mut().pop()
-            } else {
-                None
-            };
+            let idle = if reuse { endpoint.idle.borrow_mut().pop() } else { None };
             if let Some(mut idle) = idle {
                 if idle.since.elapsed() >= self.idle_timeout
                     || idle.connection.transport.sender.is_closed()
                 {
                     continue;
                 }
-                if idle.connection.transport.sender.ready().await.is_ok() && endpoint.enabled.get()
+                if idle.connection.transport.sender.ready().await.is_ok()
+                    && endpoint.enabled.get()
                 {
                     return Ok(Lease {
                         connection: idle.connection,
@@ -253,15 +251,8 @@ impl ConnectionPool {
                     endpoint.enabled.get() && !self.closed.get(),
                     "backend was removed while connecting"
                 );
-                let connection = Connection {
-                    transport,
-                    _slot: slot,
-                };
-                return Ok(Lease {
-                    connection,
-                    endpoint,
-                    reused: false,
-                });
+                let connection = Connection { transport, _slot: slot };
+                return Ok(Lease { connection, endpoint, reused: false });
             }
             // register, then recheck: an idle return retains its slot and is
             // just as important as a slot release for a capacity waiter.
@@ -283,7 +274,10 @@ impl ConnectionPool {
         }
     }
 
-    pub async fn acquire_http2(&self, endpoint: &Rc<Endpoint>) -> anyhow::Result<Http2Lease> {
+    pub async fn acquire_http2(
+        &self,
+        endpoint: &Rc<Endpoint>,
+    ) -> anyhow::Result<Http2Lease> {
         loop {
             let changed = self.budget.changed.notified();
             tokio::pin!(changed);
@@ -437,10 +431,7 @@ impl Http2Lease {
     }
 
     pub fn upload(&self, body: Incoming) -> Upload {
-        Upload {
-            body,
-            _stream: self.stream.clone(),
-        }
+        Upload { body, _stream: self.stream.clone() }
     }
 
     pub fn into_body(self, body: Incoming) -> PooledBody {
@@ -492,10 +483,7 @@ pub struct PooledBody {
 
 impl PooledBody {
     fn new(body: Incoming, lease: ResponseLease) -> Self {
-        let mut body = Self {
-            body,
-            lease: Some(lease),
-        };
+        let mut body = Self { body, lease: Some(lease) };
         // HEAD, 204 and empty bodies may never be polled by the downstream.
         if hyper::body::Body::is_end_stream(&body.body) {
             body.complete();
@@ -526,7 +514,9 @@ impl hyper::body::Body for PooledBody {
                 self.lease.take();
             }
             Poll::Ready(None) => self.complete(),
-            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() || self.body.is_end_stream() => {
+            Poll::Ready(Some(Ok(frame)))
+                if frame.is_trailers() || self.body.is_end_stream() =>
+            {
                 self.complete()
             }
             _ => {}

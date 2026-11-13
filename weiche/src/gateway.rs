@@ -18,7 +18,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{thread, time::Duration};
 use tokio::sync::{oneshot, watch};
-use weiche_gtwapi::v1::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute};
+use weiche_gtwapi::v1::{
+    gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute,
+};
 
 pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result<()> {
     let (config_tx, config_rx) = routing::channel(GatewaySnapshot::default());
@@ -35,7 +37,12 @@ pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result
                     .enable_all()
                     .build()
                     .context("create control-plane Tokio runtime")?;
-                runtime.block_on(run_control(selection, config_tx, listener_rx, control_stop))
+                runtime.block_on(run_control(
+                    selection,
+                    config_tx,
+                    listener_rx,
+                    control_stop,
+                ))
             })();
             let _ = done_tx.send(result);
         })
@@ -81,9 +88,8 @@ async fn run_control(
 ) -> anyhow::Result<()> {
     let reconcile = async {
         // initialize the client and all watches on their owning Tokio runtime.
-        let client = Client::try_default()
-            .await
-            .context("initialize Kubernetes client")?;
+        let client =
+            Client::try_default().await.context("initialize Kubernetes client")?;
         let controller = GatewayController::new(client.clone());
         let stores = controller.stores();
         let compile = async {
@@ -106,8 +112,10 @@ async fn run_control(
                     tracing::info!(revision, bind = ?compiled.snapshot.listener, routes = compiled.snapshot.router.len(), "published gateway snapshot");
                 }
                 let state = listener_rx.borrow().clone();
-                if let Err(error) =
-                    update_status(&client, &stores, &selection, &compiled, revision, &state).await
+                if let Err(error) = update_status(
+                    &client, &stores, &selection, &compiled, revision, &state,
+                )
+                .await
                 {
                     tracing::warn!(%error, "failed to update Gateway API status; will retry");
                 }
@@ -151,14 +159,17 @@ fn condition(
 fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     for condition in &mut conditions {
         let previous = old.and_then(Value::as_array).and_then(|old| {
-            old.iter()
-                .find(|c| c["type"] == condition["type"] && c["status"] == condition["status"])
+            old.iter().find(|c| {
+                c["type"] == condition["type"] && c["status"] == condition["status"]
+            })
         });
         condition["lastTransitionTime"] = previous
             .and_then(|c| c.get("lastTransitionTime"))
             .cloned()
             .unwrap_or_else(|| {
-                json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                json!(
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                )
             });
     }
     json!(conditions)
@@ -171,19 +182,18 @@ async fn patch_status<K>(
     desired: Value,
 ) -> anyhow::Result<()>
 where
-    K: Resource<DynamicType = ()> + Clone + std::fmt::Debug + DeserializeOwned + Serialize,
+    K: Resource<DynamicType = ()>
+        + Clone
+        + std::fmt::Debug
+        + DeserializeOwned
+        + Serialize,
 {
     if old == &desired {
         return Ok(());
     }
-    let patch =
-        json!({"metadata":{"resourceVersion": resource.resource_version()}, "status":desired});
-    api.patch_status(
-        &resource.name_any(),
-        &PatchParams::default(),
-        &Patch::Merge(patch),
-    )
-    .await?;
+    let patch = json!({"metadata":{"resourceVersion": resource.resource_version()}, "status":desired});
+    api.patch_status(&resource.name_any(), &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
     Ok(())
 }
 
@@ -196,12 +206,14 @@ async fn update_status(
     listener: &WorkerGroupState,
 ) -> anyhow::Result<()> {
     let Some(gateway) = stores.gateways.state().into_iter().find(|g| {
-        g.namespace().as_deref() == Some(&selection.namespace) && g.name_any() == selection.gateway
+        g.namespace().as_deref() == Some(&selection.namespace)
+            && g.name_any() == selection.gateway
     }) else {
         return Ok(());
     };
     let Some(class) = stores.gateway_classes.state().into_iter().find(|c| {
-        c.name_any() == gateway.spec.gateway_class_name && c.spec.controller_name == CONTROLLER_NAME
+        c.name_any() == gateway.spec.gateway_class_name
+            && c.spec.controller_name == CONTROLLER_NAME
     }) else {
         return Ok(());
     };
@@ -215,11 +227,7 @@ async fn update_status(
         vec![condition(
             "Accepted",
             class_accepted,
-            if class_accepted {
-                "Accepted"
-            } else {
-                "InvalidParameters"
-            },
+            if class_accepted { "Accepted" } else { "InvalidParameters" },
             "Weiche plaintext HTTP demo",
             class.metadata.generation,
         )],
@@ -237,7 +245,8 @@ async fn update_status(
         .status
         .as_ref()
         .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-    let programmed = compiled.accepted && listener.programmed(revision, compiled.snapshot.listener);
+    let programmed =
+        compiled.accepted && listener.programmed(revision, compiled.snapshot.listener);
     let programmed_message = listener.error.as_deref().unwrap_or(if programmed {
         "all workers applied the gateway snapshot and bound the listener"
     } else {
@@ -272,11 +281,7 @@ async fn update_status(
         .filter(|r| r.accepted)
         .map(|r| (r.route.namespace(), r.route.name_any()))
         .collect();
-    let listeners = if gateway
-        .spec
-        .listeners
-        .iter()
-        .any(|l| l.name == selection.listener)
+    let listeners = if gateway.spec.listeners.iter().any(|l| l.name == selection.listener)
     {
         json!([{
             "name": selection.listener, "attachedRoutes": accepted_routes.len(),
@@ -316,13 +321,11 @@ async fn update_status(
                     .or(route.metadata.namespace.as_deref())
                     == Some(&selection.namespace)
         };
-        let mut parents: Vec<_> = old_parents
-            .iter()
-            .filter(|p| !owned_parent(p))
-            .cloned()
-            .collect();
+        let mut parents: Vec<_> =
+            old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
         for report in compiled.reports.iter().filter(|r| {
-            r.route.name_any() == route.name_any() && r.route.namespace() == route.namespace()
+            r.route.name_any() == route.name_any()
+                && r.route.namespace() == route.namespace()
         }) {
             let parent = serde_json::to_value(&report.parent)?;
             let previous = old_parents
@@ -336,7 +339,10 @@ async fn update_status(
             continue;
         }
         patch_status(
-            Api::<HttpRoute>::namespaced(client.clone(), &route.namespace().unwrap_or_default()),
+            Api::<HttpRoute>::namespaced(
+                client.clone(),
+                &route.namespace().unwrap_or_default(),
+            ),
             route.as_ref(),
             &old,
             json!({"parents":parents}),

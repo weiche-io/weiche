@@ -1,6 +1,7 @@
 //! one runtime's listeners, services and active HTTP connections.
 use super::{
-    connector::io, listener::ListenerGroup, proxy::ProxyService, routing, rtconf::RuntimeConfig,
+    connector::io, listener::ListenerGroup, proxy::ProxyService, routing,
+    rtconf::RuntimeConfig,
 };
 use compio::{
     net::TcpStream,
@@ -28,10 +29,7 @@ pub struct Admission {
 
 impl Admission {
     pub fn new(limit: usize) -> Self {
-        Self {
-            live: AtomicUsize::new(0),
-            limit,
-        }
+        Self { live: AtomicUsize::new(0), limit }
     }
     fn acquire(self: &Arc<Self>) -> Option<Permit> {
         self.live
@@ -120,9 +118,7 @@ impl WorkerState {
             }
         };
         tracing::debug!(worker = self.id, %peer, "serving HTTP connection");
-        self.connections
-            .active
-            .set(self.connections.active.get() + 1);
+        self.connections.active.set(self.connections.active.get() + 1);
         // capture the guard before spawning so cancellation before the first poll releases it.
         let guard = DropGuard::new(
             (self.connections.clone(), permit),

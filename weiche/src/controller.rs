@@ -14,7 +14,9 @@ use kube::{
 };
 use serde::de::DeserializeOwned;
 use std::{fmt::Debug, future::Future};
-use weiche_gtwapi::v1::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute};
+use weiche_gtwapi::v1::{
+    gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute,
+};
 
 /// Live snapshots maintained by kube-runtime, including updates and deletions.
 /// Wait for each store's initial list before reading it. The caches are
@@ -75,7 +77,13 @@ impl GatewayController {
 
 fn cache<K>(api: Api<K>) -> (Store<K>, BoxStream<'static, ()>)
 where
-    K: Resource<DynamicType = ()> + Clone + Debug + DeserializeOwned + Send + Sync + 'static,
+    K: Resource<DynamicType = ()>
+        + Clone
+        + Debug
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
 {
     let (reader, writer) = reflector::store();
     let stream = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()))

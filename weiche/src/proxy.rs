@@ -9,7 +9,9 @@ use super::{
 };
 use bytes::Bytes;
 use compio::runtime::time::timeout;
-use http::{HeaderMap, Request, Response, StatusCode, Uri, Version, header, uri::Authority};
+use http::{
+    HeaderMap, Request, Response, StatusCode, Uri, Version, header, uri::Authority,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::{
@@ -26,7 +28,10 @@ struct WorkerView {
 }
 
 impl WorkerView {
-    fn prepare(snapshot: Arc<PublishedSnapshot>, previous: &Clusters) -> anyhow::Result<Self> {
+    fn prepare(
+        snapshot: Arc<PublishedSnapshot>,
+        previous: &Clusters,
+    ) -> anyhow::Result<Self> {
         let gateway = &snapshot.gateway;
         anyhow::ensure!(
             !gateway.forwarding.response_header_timeout.is_zero(),
@@ -52,7 +57,10 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
-    pub fn new(snapshot: Arc<PublishedSnapshot>, runtime: &RuntimeConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        snapshot: Arc<PublishedSnapshot>,
+        runtime: &RuntimeConfig,
+    ) -> anyhow::Result<Self> {
         let view = WorkerView::prepare(snapshot, &Clusters::default())?;
         // the 2026-11-12 benchmark exhausted ephemeral ports without connection reuse.
         let pool = ConnectionPool::new(runtime);
@@ -114,26 +122,21 @@ impl ProxyService {
             .snapshot
             .gateway
             .router
-            .find(
-                &host,
-                request.uri().path(),
-                request.method(),
-                request.headers(),
-            )
+            .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
         let RouteAction::Forward(id) = action else {
             return Err(ProxyError::InvalidBackend);
         };
         let address = view.clusters.select(id).ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
-        Ok((
-            endpoint,
-            view.snapshot.gateway.forwarding.response_header_timeout,
-        ))
+        Ok((endpoint, view.snapshot.gateway.forwarding.response_header_timeout))
     }
 
     /// routing and forwarding failures become HTTP responses rather than service errors.
-    pub async fn call(&self, mut request: Request<Incoming>) -> Result<Response<Body>, !> {
+    pub async fn call(
+        &self,
+        mut request: Request<Incoming>,
+    ) -> Result<Response<Body>, !> {
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
             Err(error) => return Ok(error.response()),
@@ -192,15 +195,13 @@ impl ProxyError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "HTTPRoute has an invalid backend reference\n",
             ),
-            Self::NoEndpoints => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Service has no ready endpoints\n",
-            ),
+            Self::NoEndpoints => {
+                (StatusCode::SERVICE_UNAVAILABLE, "Service has no ready endpoints\n")
+            }
             Self::Upstream => (StatusCode::BAD_GATEWAY, "backend request failed\n"),
-            Self::HeaderTimeout => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "backend response headers timed out\n",
-            ),
+            Self::HeaderTimeout => {
+                (StatusCode::GATEWAY_TIMEOUT, "backend response headers timed out\n")
+            }
         };
         Response::builder()
             .status(status)
@@ -249,7 +250,11 @@ fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, Pro
     Ok(authority)
 }
 
-fn prepare_request(request: &mut Request<Incoming>, authority: Authority, protocol: Protocol) {
+fn prepare_request(
+    request: &mut Request<Incoming>,
+    authority: Authority,
+    protocol: Protocol,
+) {
     let trailers = request
         .headers()
         .get_all(header::TE)
@@ -268,8 +273,7 @@ fn prepare_request(request: &mut Request<Incoming>, authority: Authority, protoc
         .headers_mut()
         .insert(header::HOST, authority.as_str().parse().unwrap());
     let mut uri = request.uri().clone().into_parts();
-    uri.path_and_query
-        .get_or_insert_with(|| "/".parse().unwrap());
+    uri.path_and_query.get_or_insert_with(|| "/".parse().unwrap());
     match protocol {
         Protocol::Http1 => {
             *request.version_mut() = Version::HTTP_11;

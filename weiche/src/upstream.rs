@@ -29,11 +29,7 @@ impl UpstreamClient {
             Ok(response) => response,
             Err(mut error) => {
                 // retry only an untouched request from a reused connection; never replay a sent POST.
-                let request = if lease.reused() {
-                    error.take_message()
-                } else {
-                    None
-                };
+                let request = if lease.reused() { error.take_message() } else { None };
                 let Some(request) = request else {
                     return Err(error.into_error().into());
                 };

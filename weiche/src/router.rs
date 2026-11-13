@@ -39,12 +39,7 @@ impl Route {
     }
 
     fn rank(&self) -> (bool, usize, bool, usize) {
-        (
-            self.exact,
-            self.path.len(),
-            self.method.is_some(),
-            self.headers.len(),
-        )
+        (self.exact, self.path.len(), self.method.is_some(), self.headers.len())
     }
 }
 
@@ -64,10 +59,7 @@ impl Router {
             for (name, _) in &mut route.headers {
                 name.make_ascii_lowercase();
             }
-            buckets
-                .entry(route.hostname.clone())
-                .or_default()
-                .push(route);
+            buckets.entry(route.hostname.clone()).or_default().push(route);
         }
         let mut router = Self::default();
         for (hostname, mut routes) in buckets {
