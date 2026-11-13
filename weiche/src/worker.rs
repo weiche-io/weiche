@@ -10,6 +10,7 @@ use compio::{
 use hyper::service::service_fn;
 use std::{
     cell::Cell,
+    mem::DropGuard,
     net::SocketAddr,
     rc::Rc,
     sync::{
@@ -33,7 +34,7 @@ impl Admission {
     }
     fn acquire(self: &Arc<Self>) -> Option<Permit> {
         self.live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < self.limit).then_some(n + 1)
             })
             .ok()
@@ -52,20 +53,6 @@ impl Drop for Permit {
 struct Connections {
     active: Cell<usize>,
     changed: Notify,
-}
-
-struct ConnectionGuard {
-    connections: Rc<Connections>,
-    _permit: Permit,
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.connections
-            .active
-            .set(self.connections.active.get() - 1);
-        self.connections.changed.notify_one();
-    }
 }
 
 pub struct WorkerState {
@@ -88,13 +75,8 @@ impl WorkerState {
     ) -> anyhow::Result<()> {
         let snapshot = config.snapshot();
         let revision = snapshot.revision;
-        let service = match ProxyService::new(snapshot, &runtime) {
-            Ok(service) => service,
-            Err(error) => {
-                listeners.failed(id, revision, &error);
-                return Err(error);
-            }
-        };
+        let service = ProxyService::new(snapshot, &runtime)
+            .inspect_err(|error| listeners.failed(id, revision, error))?;
         let worker = Self {
             id,
             config,
@@ -140,10 +122,14 @@ impl WorkerState {
         self.connections
             .active
             .set(self.connections.active.get() + 1);
-        let guard = ConnectionGuard {
-            connections: self.connections.clone(),
-            _permit: permit,
-        };
+        // capture the guard before spawning so cancellation before the first poll releases it.
+        let guard = DropGuard::new(
+            (self.connections.clone(), permit),
+            |(connections, _permit)| {
+                connections.active.set(connections.active.get() - 1);
+                connections.changed.notify_one();
+            },
+        );
         let service = self.service.clone();
         let max_headers = self.runtime.http_max_headers;
         let max_buffer = self.runtime.http_max_buffer;

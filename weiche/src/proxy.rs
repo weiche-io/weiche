@@ -9,11 +9,11 @@ use super::{
 };
 use bytes::Bytes;
 use compio::runtime::time::timeout;
-use http::{HeaderMap, Request, Response, StatusCode, Uri, Version, header};
+use http::{HeaderMap, Request, Response, StatusCode, Uri, Version, header, uri::PathAndQuery};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::{
-    cell::RefCell, convert::Infallible, net::SocketAddr, pin::Pin, rc::Rc, sync::Arc,
+    cell::RefCell, collections::HashSet, net::SocketAddr, pin::Pin, rc::Rc, sync::Arc,
     time::Duration,
 };
 
@@ -72,7 +72,7 @@ impl ProxyService {
         let endpoints = if view.snapshot.gateway.listener.is_some() {
             view.clusters.endpoints()
         } else {
-            Default::default()
+            HashSet::new()
         };
         self.pool.reconcile(&endpoints);
     }
@@ -126,9 +126,8 @@ impl ProxyService {
                 request.headers(),
             )
             .ok_or(ProxyError::NoRoute)?;
-        let id = match action {
-            RouteAction::Forward(id) => id,
-            RouteAction::RejectInvalidBackend => return Err(ProxyError::InvalidBackend),
+        let RouteAction::Forward(id) = action else {
+            return Err(ProxyError::InvalidBackend);
         };
         let address = view.clusters.select(id).ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
@@ -138,7 +137,8 @@ impl ProxyService {
         ))
     }
 
-    pub async fn call(&self, mut request: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+    /// routing and forwarding failures become HTTP responses rather than service errors.
+    pub async fn call(&self, mut request: Request<Incoming>) -> Result<Response<Body>, !> {
         let (endpoint, deadline) = match self.select(&request) {
             Ok(selected) => selected,
             Err(error) => return Ok(error.response()),
@@ -149,8 +149,7 @@ impl ProxyService {
         let path = request
             .uri()
             .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
+            .map_or("/", PathAndQuery::as_str);
         *request.uri_mut() = path.parse::<Uri>().unwrap();
         let address = endpoint.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
@@ -206,7 +205,7 @@ impl ProxyError {
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Box::pin(
                 Full::new(Bytes::from_static(text.as_bytes()))
-                    .map_err(|never| -> hyper::Error { match never {} }),
+                    .map_err(|never| -> hyper::Error { never }),
             ) as Body)
             .unwrap()
     }

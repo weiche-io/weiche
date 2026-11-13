@@ -112,8 +112,6 @@ async fn run_control(
                     tracing::warn!(%error, "failed to update Gateway API status; will retry");
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
         };
         tokio::select! {
             _ = controller.run(std::future::pending()) => anyhow::bail!("Kubernetes watches stopped unexpectedly"),
@@ -207,11 +205,10 @@ async fn update_status(
     }) else {
         return Ok(());
     };
-    let class_old = serde_json::to_value(&class.status)?
-        .as_object()
-        .cloned()
-        .map(Value::Object)
-        .unwrap_or(json!({}));
+    let class_old = class
+        .status
+        .as_ref()
+        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let class_accepted = class.spec.parameters_ref.is_none();
     let mut class_status = class_old.clone();
     class_status["conditions"] = stamp(
@@ -236,11 +233,10 @@ async fn update_status(
     )
     .await?;
 
-    let old = serde_json::to_value(&gateway.status)?
-        .as_object()
-        .cloned()
-        .map(Value::Object)
-        .unwrap_or(json!({}));
+    let old = gateway
+        .status
+        .as_ref()
+        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let programmed = compiled.accepted && listener.programmed(revision, compiled.snapshot.listener);
     let programmed_message = listener.error.as_deref().unwrap_or(if programmed {
         "all workers applied the gateway snapshot and bound the listener"
@@ -304,16 +300,14 @@ async fn update_status(
     .await?;
 
     for route in stores.http_routes.state() {
-        let old = serde_json::to_value(&route.status)?
-            .as_object()
-            .cloned()
-            .map(Value::Object)
-            .unwrap_or(json!({}));
+        let old = route
+            .status
+            .as_ref()
+            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
         let old_parents = old
             .get("parents")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+            .map_or(&[][..], Vec::as_slice);
         let owned_parent = |p: &Value| {
             p["controllerName"] == CONTROLLER_NAME
                 && p["parentRef"]["name"] == selection.gateway

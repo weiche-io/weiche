@@ -12,8 +12,11 @@ use super::{
 };
 use kube::ResourceExt;
 use weiche_gtwapi::v1::{
-    gateways::GatewayListeners,
-    httproutes::{HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs},
+    gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From},
+    httproutes::{
+        HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+        HttpRouteRulesMatches,
+    },
 };
 
 pub const CONTROLLER_NAME: &str = "weiche.io/gateway-controller";
@@ -120,11 +123,15 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
         result.message =
             "demo requires one listener, no class parameters and no Gateway TLS".into();
     } else if let Some(l) = listener {
-        if l.protocol == "HTTP" && l.tls.is_none() && (1..=65535).contains(&l.port) {
+        if l.protocol == "HTTP"
+            && l.tls.is_none()
+            && let Ok(port) = u16::try_from(l.port)
+            && port != 0
+        {
             result.accepted = true;
             result.reason = "Accepted";
             result.message = "selected HTTP listener is valid".into();
-            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, l.port as u16));
+            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, port));
         } else {
             result.reason = "UnsupportedProtocol";
             result.message = "only plaintext HTTP listeners are supported".into();
@@ -177,12 +184,11 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                     report.reason = "NotAllowedByListeners";
                     report.message = "listener does not allow this route namespace or kind".into();
                 } else {
-                    let hosts = route
+                    let hosts: Vec<_> = route
                         .spec
                         .hostnames
-                        .clone()
-                        .unwrap_or_else(|| vec![String::new()]);
-                    let hosts: Vec<_> = hosts
+                        .as_deref()
+                        .unwrap_or(&[String::new()])
                         .iter()
                         .filter_map(|h| intersection(l.hostname.as_deref().unwrap_or(""), h))
                         .collect();
@@ -197,39 +203,28 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                         report.reason = "Accepted";
                         report.message = "route attached to the selected listener".into();
                         for rule in route.spec.rules.iter().flatten() {
-                            let (endpoints, invalid, refs_reason) = resolve_backend(
+                            let action = match resolve_backend(
                                 stores,
                                 &route,
                                 rule.backend_refs.as_ref().and_then(|b| b.first()),
-                            );
-                            if invalid {
-                                report.resolved = false;
-                                report.refs_reason = refs_reason;
-                            }
-                            let action = if invalid {
-                                RouteAction::RejectInvalidBackend
-                            } else {
-                                let backend = &rule.backend_refs.as_ref().unwrap()[0];
-                                let id = ClusterId {
-                                    namespace: route.namespace().unwrap_or_default(),
-                                    service: backend.name.clone(),
-                                    port: backend.port.unwrap() as u16,
-                                };
-                                result
-                                    .snapshot
-                                    .clusters
-                                    .insert(id.clone(), ClusterSpec { endpoints });
-                                RouteAction::Forward(id)
+                            ) {
+                                Ok((id, cluster)) => {
+                                    result.snapshot.clusters.insert(id.clone(), cluster);
+                                    RouteAction::Forward(id)
+                                }
+                                Err(reason) => {
+                                    report.resolved = false;
+                                    report.refs_reason = reason;
+                                    RouteAction::RejectInvalidBackend
+                                }
                             };
-                            let matches = rule.matches.clone().unwrap_or_else(|| {
-                                vec![weiche_gtwapi::v1::httproutes::HttpRouteRulesMatches {
-                                    headers: None,
-                                    method: None,
-                                    path: None,
-                                    query_params: None,
-                                }]
-                            });
-                            for m in matches {
+                            let default_matches = [HttpRouteRulesMatches {
+                                headers: None,
+                                method: None,
+                                path: None,
+                                query_params: None,
+                            }];
+                            for m in rule.matches.as_deref().unwrap_or(&default_matches) {
                                 let exact = m.path.as_ref().and_then(|p| p.r#type.as_ref()).is_some_and(|t| matches!(t, weiche_gtwapi::v1::httproutes::HttpRouteRulesMatchesPathType::Exact));
                                 let raw_path = m
                                     .path
@@ -291,7 +286,6 @@ fn allows_route(l: &GatewayListeners, namespace: &str, route: &HttpRoute) -> boo
     }) {
         return false;
     }
-    use weiche_gtwapi::v1::gateways::GatewayListenersAllowedRoutesNamespacesFrom as From;
     match allowed.namespaces.as_ref().and_then(|n| n.from.as_ref()) {
         Some(From::All) => true,
         Some(From::Selector) => false,
@@ -309,48 +303,53 @@ fn unsupported_rule(rule: &HttpRouteRules) -> bool {
         })
 }
 
+/// resolve a Service backend into a validated cluster or a Gateway API status reason.
 fn resolve_backend(
     stores: &GatewayStores,
     route: &HttpRoute,
     backend: Option<&HttpRouteRulesBackendRefs>,
-) -> (Vec<SocketAddr>, bool, &'static str) {
-    let Some(b) = backend else {
-        return (vec![], true, "BackendNotFound");
-    };
+) -> Result<(ClusterId, ClusterSpec), &'static str> {
+    let b = backend.ok_or("BackendNotFound")?;
     if !b.group.as_deref().unwrap_or("").is_empty()
         || b.kind.as_deref().unwrap_or("Service") != "Service"
     {
-        return (vec![], true, "InvalidKind");
+        return Err("InvalidKind");
     }
     let ns = route.namespace().unwrap_or_default();
     if b.namespace.as_deref().is_some_and(|n| n != ns) {
-        return (vec![], true, "RefNotPermitted");
+        return Err("RefNotPermitted");
     }
-    let Some(service) = stores.services.state().into_iter().find(|s| {
-        s.namespace().as_deref() == Some(&ns)
-            && s.name_any() == b.name
-            && s.metadata.deletion_timestamp.is_none()
-    }) else {
-        return (vec![], true, "BackendNotFound");
-    };
-    let Some(port) = service
+    let backend_port = b
+        .port
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|&port| port != 0)
+        .ok_or("BackendNotFound")?;
+    let service = stores
+        .services
+        .state()
+        .into_iter()
+        .find(|s| {
+            s.namespace().as_deref() == Some(&ns)
+                && s.name_any() == b.name
+                && s.metadata.deletion_timestamp.is_none()
+        })
+        .ok_or("BackendNotFound")?;
+    let port = service
         .spec
         .as_ref()
         .and_then(|s| s.ports.as_ref())
         .and_then(|ports| {
-            ports
-                .iter()
-                .find(|p| Some(p.port) == b.port && p.protocol.as_deref().unwrap_or("TCP") == "TCP")
+            ports.iter().find(|p| {
+                p.port == i32::from(backend_port) && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
+            })
         })
-    else {
-        return (vec![], true, "BackendNotFound");
-    };
+        .ok_or("BackendNotFound")?;
     if port
         .app_protocol
         .as_deref()
         .is_some_and(|p| p != "http" && p != "kubernetes.io/http")
     {
-        return (vec![], true, "UnsupportedProtocol");
+        return Err("UnsupportedProtocol");
     }
     let mut endpoints = vec![];
     for slice in stores.endpoint_slices.state() {
@@ -365,7 +364,11 @@ fn resolve_backend(
             p.name.as_deref().unwrap_or("") == port.name.as_deref().unwrap_or("")
                 && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
         }) {
-            let Some(endpoint_port) = p.port.filter(|p| (1..=65535).contains(p)) else {
+            let Some(endpoint_port) = p
+                .port
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|&port| port != 0)
+            else {
                 continue;
             };
             for endpoint in slice.endpoints.iter().flatten() {
@@ -379,13 +382,20 @@ fn resolve_backend(
                 }
                 for address in &endpoint.addresses {
                     if let Ok(ip) = address.parse::<IpAddr>() {
-                        endpoints.push(SocketAddr::new(ip, endpoint_port as u16));
+                        endpoints.push(SocketAddr::new(ip, endpoint_port));
                     }
                 }
             }
         }
     }
-    endpoints.sort();
+    endpoints.sort_unstable();
     endpoints.dedup();
-    (endpoints, false, "ResolvedRefs")
+    Ok((
+        ClusterId {
+            namespace: ns,
+            service: b.name.clone(),
+            port: backend_port,
+        },
+        ClusterSpec { endpoints },
+    ))
 }
