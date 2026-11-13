@@ -5,7 +5,7 @@ use super::{
     dataplane::WorkerGroup,
     listener::WorkerGroupState,
     routing,
-    runtime_config::RuntimeConfig,
+    rtconf::RuntimeConfig,
     snapshot::{GatewaySnapshot, Revision},
     worker::stopped,
 };

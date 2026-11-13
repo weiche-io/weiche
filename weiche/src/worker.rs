@@ -1,13 +1,14 @@
 //! one runtime's listeners, services and active HTTP connections.
 use super::{
-    connector::io, listener::ListenerGroup, proxy::ProxyService, routing,
-    runtime_config::RuntimeConfig,
+    connector::io, listener::ListenerGroup, proxy::ProxyService, routing, rtconf::RuntimeConfig,
 };
 use compio::{
     net::TcpStream,
     runtime::{self, time::timeout},
 };
+use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::service::service_fn;
+use hyper_util::server::conn::auto::Builder;
 use std::{
     cell::Cell,
     mem::DropGuard,
@@ -133,6 +134,7 @@ impl WorkerState {
         let service = self.service.clone();
         let max_headers = self.runtime.http_max_headers;
         let max_buffer = self.runtime.http_max_buffer;
+        let max_streams = self.runtime.http2_max_concurrent_streams;
         let drain_timeout = self.runtime.connection_drain_timeout;
         runtime::spawn(async move {
             let _guard = guard;
@@ -141,8 +143,13 @@ impl WorkerState {
                 let service = service.clone();
                 async move { service.call(request).await }
             });
-            let connection = hyper::server::conn::http1::Builder::new()
-                .max_headers(max_headers).max_buf_size(max_buffer).serve_connection(stream, service);
+            let mut builder = Builder::new(CompioExecutor);
+            builder.http1().max_headers(max_headers).max_buf_size(max_buffer);
+            builder.http2().timer(CompioTimer)
+                .max_concurrent_streams(max_streams)
+                .max_send_buf_size(max_buffer)
+                .max_header_list_size(max_buffer as u32);
+            let connection = builder.serve_connection(stream, service);
             tokio::pin!(connection);
             tokio::select! {
                 result = &mut connection => {

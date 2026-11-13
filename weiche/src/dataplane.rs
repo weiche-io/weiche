@@ -2,7 +2,7 @@
 use super::{
     listener::{ListenerGroup, WorkerGroupState},
     routing,
-    runtime_config::RuntimeConfig,
+    rtconf::RuntimeConfig,
     worker::{Admission, WorkerState, stopped},
 };
 use anyhow::Context;

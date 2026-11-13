@@ -14,7 +14,7 @@ pub mod pool;
 pub mod proxy;
 pub mod router;
 pub mod routing;
-pub mod runtime_config;
+pub mod rtconf;
 pub mod snapshot;
 pub mod upstream;
 pub mod worker;

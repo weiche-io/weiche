@@ -1,5 +1,7 @@
 # rust
 
+IPv6 must be considered
+
 weiche is an application binary. so just write pub instead of pub(crate), which
 is only acceptable for libray.
 

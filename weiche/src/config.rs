@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{
-    cluster::{ClusterId, ClusterSpec},
+    cluster::{ClusterId, ClusterSpec, Protocol},
     controller::GatewayStores,
     router::{Route, RouteAction, Router, hostname_matches},
     snapshot::GatewaySnapshot,
@@ -36,7 +36,7 @@ impl Selection {
             gateway: std::env::var("WEICHE_GATEWAY").unwrap_or_else(|_| "weiche".into()),
             listener: std::env::var("WEICHE_LISTENER").unwrap_or_else(|_| "http".into()),
             bind_ip: std::env::var("WEICHE_BIND_IP")
-                .unwrap_or_else(|_| "0.0.0.0".into())
+                .unwrap_or_else(|_| "::".into())
                 .parse()?,
         })
     }
@@ -344,13 +344,11 @@ fn resolve_backend(
             })
         })
         .ok_or("BackendNotFound")?;
-    if port
-        .app_protocol
-        .as_deref()
-        .is_some_and(|p| p != "http" && p != "kubernetes.io/http")
-    {
-        return Err("UnsupportedProtocol");
-    }
+    let protocol = match port.app_protocol.as_deref() {
+        None | Some("http" | "kubernetes.io/http") => Protocol::Http1,
+        Some("kubernetes.io/h2c") => Protocol::Http2,
+        _ => return Err("UnsupportedProtocol"),
+    };
     let mut endpoints = vec![];
     for slice in stores.endpoint_slices.state() {
         if slice.namespace().as_deref() != Some(&ns)
@@ -396,6 +394,9 @@ fn resolve_backend(
             service: b.name.clone(),
             port: backend_port,
         },
-        ClusterSpec { endpoints },
+        ClusterSpec {
+            endpoints,
+            protocol,
+        },
     ))
 }

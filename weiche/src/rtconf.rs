@@ -13,6 +13,7 @@ pub struct RuntimeConfig {
     pub listener_retry_interval: Duration,
     pub http_max_headers: usize,
     pub http_max_buffer: usize,
+    pub http2_max_concurrent_streams: u32,
 }
 
 impl RuntimeConfig {
@@ -27,6 +28,7 @@ impl RuntimeConfig {
             listener_retry_interval: Duration::from_millis(250),
             http_max_headers: 100,
             http_max_buffer: 32 * 1024,
+            http2_max_concurrent_streams: 128,
         }
     }
 
@@ -44,7 +46,9 @@ impl RuntimeConfig {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.http_max_headers > 0 && self.http_max_buffer >= 8192,
+            self.http_max_headers > 0
+                && (8192..=u32::MAX as usize).contains(&self.http_max_buffer)
+                && self.http2_max_concurrent_streams > 0,
             "invalid HTTP parser limits"
         );
         anyhow::ensure!(

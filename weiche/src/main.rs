@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
-use weiche::{config::Selection, gateway, runtime_config::RuntimeConfig};
+use weiche::{config::Selection, gateway, rtconf::RuntimeConfig};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
