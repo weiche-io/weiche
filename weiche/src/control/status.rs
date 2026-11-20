@@ -1,6 +1,6 @@
 //! report gateway and route conditions for the applied worker revision.
 use super::{
-    super::{ir::Revision, stream::r#in::WorkerGroupState},
+    super::{ir::Revision, stream::down::WorkerGroupState},
     CONTROLLER_NAME, Compiled, GatewayStores, Selection,
 };
 use kube::{

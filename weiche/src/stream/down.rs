@@ -1,7 +1,9 @@
 //! downstream listener transports and per-worker application reports.
+mod http;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod tcp;
+mod tls;
 pub mod udp;
 
 use super::super::{ir::Revision, routing};
@@ -89,6 +91,7 @@ impl ListenerGroup {
             Ok((address, _)) => {
                 worker.bound = Some(*address);
                 worker.listener_error = None;
+                tracing::info!(worker = id, %address, "compio reuseport listener ready");
             }
             Err(error) => {
                 worker.bound = None;

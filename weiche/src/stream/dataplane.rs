@@ -2,8 +2,8 @@
 use super::{
     super::{routing, rtconf::RuntimeConfig},
     core::tcp::Admission,
-    r#in::{ListenerGroup, WorkerGroupState},
-    worker::{WorkerState, stopped},
+    down::{ListenerGroup, WorkerGroupState, tcp},
+    stopped,
 };
 use anyhow::Context;
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -36,7 +36,7 @@ impl WorkerGroup {
         let admission =
             Arc::new(Admission::new(runtime.downstream_connections_global.get()));
         let (stop, stopped_rx) = watch::channel(false);
-        let local = WorkerState::start(
+        let local = tcp::run(
             0,
             config.clone(),
             runtime.clone(),
@@ -60,7 +60,7 @@ impl WorkerGroup {
                     let result = (|| -> anyhow::Result<()> {
                         let runtime = compio::runtime::Runtime::new().context("create worker compio runtime")?;
                         tracing::info!(worker = id, driver = ?runtime.driver_type(), "starting compio worker");
-                        runtime.block_on(WorkerState::start(id, config, runtime_config, admission, listeners, stop))
+                        runtime.block_on(tcp::run(id, config, runtime_config, admission, listeners, stop))
                     })().with_context(|| format!("worker {id}"));
                     let _ = done_tx.send(result);
                 }).context("spawn data-plane worker")?);

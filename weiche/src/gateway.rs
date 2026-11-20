@@ -4,7 +4,7 @@ use super::{
     ir::GatewaySnapshot,
     routing,
     rtconf::RuntimeConfig,
-    stream::{WorkerGroup, r#in::WorkerGroupState},
+    stream::{WorkerGroup, down::WorkerGroupState},
 };
 use anyhow::Context;
 use std::thread;

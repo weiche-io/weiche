@@ -2,7 +2,7 @@
 use super::{
     super::{
         routing,
-        stream::{r#in::WorkerGroupState, stopped},
+        stream::{down::WorkerGroupState, stopped},
     },
     GatewayController, Selection, compile,
     status::update_status,

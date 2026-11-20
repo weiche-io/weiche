@@ -7,7 +7,7 @@ use super::{
             ir::{Protocol, PublishedSnapshot, Revision, Route, RouteAction},
             rtconf::RuntimeConfig,
         },
-        out::{ConnectionPool, Endpoint, UpstreamClient},
+        up::{ConnectionPool, Endpoint, UpstreamClient},
     },
     Cluster, EndpointKey, tcp,
 };
