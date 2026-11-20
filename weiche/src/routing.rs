@@ -1,5 +1,5 @@
 //! publish immutable routing snapshots through two independently locked slots.
-use super::snapshot::{GatewaySnapshot, PublishedSnapshot, Revision};
+use super::ir::{GatewaySnapshot, PublishedSnapshot, Revision};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicUsize, Ordering},

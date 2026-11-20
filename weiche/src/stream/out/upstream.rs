@@ -1,6 +1,6 @@
 //! request dispatch and conservative retry over the worker's connection pool.
 use super::{
-    cluster::Protocol,
+    super::super::ir::Protocol,
     pool::{ConnectionPool, Endpoint, PooledBody, Upload},
 };
 use http::{Request, Response};

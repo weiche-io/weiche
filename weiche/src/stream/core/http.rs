@@ -1,11 +1,15 @@
 //! worker-local service composition; keep-alive requests borrow the current view.
+mod router;
+
 use super::{
-    cluster::{Clusters, Protocol},
-    pool::{ConnectionPool, Endpoint},
-    router::RouteAction,
-    rtconf::RuntimeConfig,
-    snapshot::{PublishedSnapshot, Revision},
-    upstream::UpstreamClient,
+    super::{
+        super::{
+            ir::{Protocol, PublishedSnapshot, Revision, Route, RouteAction},
+            rtconf::RuntimeConfig,
+        },
+        out::{ConnectionPool, Endpoint, UpstreamClient},
+    },
+    Cluster, EndpointKey, tcp,
 };
 use bytes::Bytes;
 use compio::runtime::time::timeout;
@@ -14,8 +18,14 @@ use http::{
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use router::Router;
 use std::{
-    cell::RefCell, collections::HashSet, net::SocketAddr, pin::Pin, rc::Rc, sync::Arc,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    pin::Pin,
+    rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,30 +33,63 @@ use std::{
 pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error>>>;
 
 struct WorkerView {
-    snapshot: Arc<PublishedSnapshot>,
-    clusters: Clusters,
+    revision: Revision,
+    deadline: Duration,
+    route: Option<tcp::Route<Router>>,
 }
 
 impl WorkerView {
     fn prepare(
-        snapshot: Arc<PublishedSnapshot>,
-        previous: &Clusters,
-    ) -> anyhow::Result<Self> {
+        snapshot: &PublishedSnapshot,
+        previous: Option<&tcp::Route<Router>>,
+    ) -> anyhow::Result<(Self, HashSet<EndpointKey>)> {
         let gateway = &snapshot.gateway;
         anyhow::ensure!(
             !gateway.forwarding.response_header_timeout.is_zero(),
             "response header timeout must be positive"
         );
-        for route in gateway.router.routes() {
-            if let RouteAction::Forward(id) = &route.action {
-                anyhow::ensure!(
-                    gateway.clusters.contains_key(id),
-                    "route references missing cluster {id:?}"
-                );
+        let mut clusters: HashMap<_, _> = previous
+            .into_iter()
+            .flat_map(|route| route.target.routes())
+            .filter_map(|route| match &route.action {
+                RouteAction::Forward(cluster) => {
+                    Some((cluster.spec.clone(), cluster.clone()))
+                }
+                RouteAction::RejectInvalidBackend => None,
+            })
+            .collect();
+        let mut endpoints = HashSet::new();
+        let router = Router::compile(gateway.routes.iter().map(|route| {
+            let action = match &route.action {
+                RouteAction::Forward(spec) => {
+                    if gateway.listener.is_some() {
+                        endpoints.extend(spec.endpoints.iter().map(|&address| {
+                            EndpointKey { address, protocol: spec.protocol }
+                        }));
+                    }
+                    let cluster = clusters
+                        .entry(spec.clone())
+                        .or_insert_with(|| Rc::new(Cluster::new(spec.clone())));
+                    RouteAction::Forward(cluster.clone())
+                }
+                RouteAction::RejectInvalidBackend => RouteAction::RejectInvalidBackend,
+            };
+            Route {
+                hostname: route.hostname.clone(),
+                http: route.http.clone(),
+                action,
             }
-        }
-        let clusters = Clusters::prepare(&gateway.clusters, previous);
-        Ok(Self { snapshot, clusters })
+        }));
+        Ok((
+            Self {
+                revision: snapshot.revision,
+                deadline: gateway.forwarding.response_header_timeout,
+                route: gateway
+                    .listener
+                    .map(|listener| tcp::Route { listener, target: router }),
+            },
+            endpoints,
+        ))
     }
 }
 
@@ -61,42 +104,32 @@ impl ProxyService {
         snapshot: Arc<PublishedSnapshot>,
         runtime: &RuntimeConfig,
     ) -> anyhow::Result<Self> {
-        let view = WorkerView::prepare(snapshot, &Clusters::default())?;
+        let (view, endpoints) = WorkerView::prepare(&snapshot, None)?;
         // the 2026-11-12 benchmark exhausted ephemeral ports without connection reuse.
         let pool = ConnectionPool::new(runtime);
-        let service = Self {
+        pool.reconcile(&endpoints);
+        Ok(Self {
             view: RefCell::new(view),
             upstream: UpstreamClient::new(pool.clone()),
             pool,
-        };
-        service.reconcile_pool(&service.view.borrow());
-        Ok(service)
-    }
-
-    fn reconcile_pool(&self, view: &WorkerView) {
-        let endpoints = if view.snapshot.gateway.listener.is_some() {
-            view.clusters.endpoints()
-        } else {
-            HashSet::new()
-        };
-        self.pool.reconcile(&endpoints);
+        })
     }
 
     pub fn apply(&self, snapshot: Arc<PublishedSnapshot>) -> anyhow::Result<Revision> {
-        if self.view.borrow().snapshot.revision == snapshot.revision {
+        if self.view.borrow().revision == snapshot.revision {
             return Ok(snapshot.revision);
         }
         // preparation cannot mutate the live view or retire its connections.
-        let next = WorkerView::prepare(snapshot, &self.view.borrow().clusters)?;
-        let revision = next.snapshot.revision;
+        let (next, endpoints) =
+            WorkerView::prepare(&snapshot, self.view.borrow().route.as_ref())?;
         // commit has no await or fallible operation; requests observe one complete local view.
-        self.reconcile_pool(&next);
+        self.pool.reconcile(&endpoints);
         *self.view.borrow_mut() = next;
-        Ok(revision)
+        Ok(snapshot.revision)
     }
 
     pub fn listener(&self) -> Option<SocketAddr> {
-        self.view.borrow().snapshot.gateway.listener
+        self.view.borrow().route.as_ref().map(|route| route.listener)
     }
     pub fn close(&self) {
         self.pool.close();
@@ -104,6 +137,7 @@ impl ProxyService {
 
     fn select(
         &self,
+        listener: SocketAddr,
         request: &Request<Incoming>,
         authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
@@ -115,33 +149,33 @@ impl ProxyService {
         let host = authority.host().to_ascii_lowercase();
         // no shared locks or Arc clones on requests; release this borrow before I/O.
         let view = self.view.borrow();
-        if view.snapshot.gateway.listener.is_none() {
-            return Err(ProxyError::NoRoute);
-        }
-        let action = view
-            .snapshot
-            .gateway
-            .router
+        let router = view
+            .route
+            .as_ref()
+            .and_then(|route| route.find(listener))
+            .ok_or(ProxyError::NoRoute)?;
+        let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
-        let RouteAction::Forward(id) = action else {
+        let RouteAction::Forward(cluster) = action else {
             return Err(ProxyError::InvalidBackend);
         };
-        let address = view.clusters.select(id).ok_or(ProxyError::NoEndpoints)?;
+        let address = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
-        Ok((endpoint, view.snapshot.gateway.forwarding.response_header_timeout))
+        Ok((endpoint, view.deadline))
     }
 
     /// routing and forwarding failures become HTTP responses rather than service errors.
     pub async fn call(
         &self,
+        listener: SocketAddr,
         mut request: Request<Incoming>,
     ) -> Result<Response<Body>, !> {
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
             Err(error) => return Ok(error.response()),
         };
-        let (endpoint, deadline) = match self.select(&request, &authority) {
+        let (endpoint, deadline) = match self.select(listener, &request, &authority) {
             Ok(selected) => selected,
             Err(error) => return Ok(error.response()),
         };

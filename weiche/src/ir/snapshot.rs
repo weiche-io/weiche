@@ -1,9 +1,6 @@
 //! immutable data-plane input, independent of Kubernetes objects and worker state.
-use super::{
-    cluster::{ClusterId, ClusterSpec},
-    router::Router,
-};
-use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+use super::Route;
+use std::{net::SocketAddr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardingPolicy {
@@ -20,8 +17,7 @@ impl Default for ForwardingPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewaySnapshot {
     pub listener: Option<SocketAddr>,
-    pub router: Router,
-    pub clusters: BTreeMap<ClusterId, ClusterSpec>,
+    pub routes: Vec<Route>,
     pub forwarding: ForwardingPolicy,
 }
 

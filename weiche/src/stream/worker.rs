@@ -1,7 +1,12 @@
 //! one runtime's listeners, services and active HTTP connections.
 use super::{
-    connector::io, listener::ListenerGroup, proxy::ProxyService, routing,
-    rtconf::RuntimeConfig,
+    super::{routing, rtconf::RuntimeConfig},
+    core::{
+        http::ProxyService,
+        tcp::{Admission, Permit},
+    },
+    r#in::ListenerGroup,
+    out::io,
 };
 use compio::{
     net::TcpStream,
@@ -10,43 +15,8 @@ use compio::{
 use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::service::service_fn;
 use hyper_util::server::conn::auto::Builder;
-use std::{
-    cell::Cell,
-    mem::DropGuard,
-    net::SocketAddr,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{cell::Cell, mem::DropGuard, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::{Notify, watch};
-
-pub struct Admission {
-    live: AtomicUsize,
-    limit: usize,
-}
-
-impl Admission {
-    pub fn new(limit: usize) -> Self {
-        Self { live: AtomicUsize::new(0), limit }
-    }
-    fn acquire(self: &Arc<Self>) -> Option<Permit> {
-        self.live
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < self.limit).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Permit(self.clone()))
-    }
-}
-
-struct Permit(Arc<Admission>);
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.0.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
 
 #[derive(Default)]
 struct Connections {
@@ -104,6 +74,7 @@ impl WorkerState {
 
     fn serve(
         &self,
+        listener: SocketAddr,
         stream: TcpStream,
         peer: SocketAddr,
         permit: Permit,
@@ -137,7 +108,7 @@ impl WorkerState {
             if *shutdown.borrow() { return; }
             let service = service_fn(move |request| {
                 let service = service.clone();
-                async move { service.call(request).await }
+                async move { service.call(listener, request).await }
             });
             let mut builder = Builder::new(CompioExecutor);
             builder.http1().max_headers(max_headers).max_buf_size(max_buffer);
@@ -224,8 +195,8 @@ impl WorkerState {
                         _ = runtime::time::sleep(self.runtime.listener_retry_interval), if listener.is_none() => continue 'listen,
                         result = &mut accepted, if listener.is_some() => {
                             let (stream, peer) = result?;
-                            if let Some(permit) = admission.acquire() {
-                                self.serve(stream, peer, permit, shutdown.clone());
+                            if let (Some(address), Some(permit)) = (bound, admission.acquire()) {
+                                self.serve(address, stream, peer, permit, shutdown.clone());
                             }
                             continue 'listen;
                         }

@@ -1,20 +1,11 @@
-//! kubernetes control plane for Weiche.
+//! gateway configuration, control plane and worker-local data plane.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("weiche supports only Linux");
 
-pub mod cluster;
-pub mod config;
-pub mod connector;
-pub mod controller;
-pub mod dataplane;
+pub mod control;
 pub mod gateway;
-pub mod listener;
-pub mod pool;
-pub mod proxy;
-pub mod router;
+pub mod ir;
 pub mod routing;
 pub mod rtconf;
-pub mod snapshot;
-pub mod upstream;
-pub mod worker;
+pub mod stream;

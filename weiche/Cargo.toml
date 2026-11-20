@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.99"
 description = "A Kubernetes networking gateway"
 
+[features]
+quic = ["compio/quic", "compio/ring"]
+
 [dependencies]
 anyhow = "1"
 bytes = "1"

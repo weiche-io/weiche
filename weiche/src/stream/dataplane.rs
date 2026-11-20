@@ -1,9 +1,9 @@
 //! supervise a group of compio workers; worker zero runs on the caller's runtime.
 use super::{
-    listener::{ListenerGroup, WorkerGroupState},
-    routing,
-    rtconf::RuntimeConfig,
-    worker::{Admission, WorkerState, stopped},
+    super::{routing, rtconf::RuntimeConfig},
+    core::tcp::Admission,
+    r#in::{ListenerGroup, WorkerGroupState},
+    worker::{WorkerState, stopped},
 };
 use anyhow::Context;
 use futures::{StreamExt, stream::FuturesUnordered};

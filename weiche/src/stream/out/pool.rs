@@ -1,8 +1,10 @@
 //! bounded physical connections, HTTP/1 leases and multiplexed HTTP/2 streams.
 use super::{
-    cluster::{EndpointKey, Protocol},
+    super::{
+        super::{ir::Protocol, rtconf::RuntimeConfig},
+        core::EndpointKey,
+    },
     connector::{Connected, Connector},
-    rtconf::RuntimeConfig,
 };
 use bytes::Bytes;
 use compio::runtime;
@@ -155,7 +157,7 @@ impl ConnectionPool {
         pool
     }
 
-    /// membership is supplied by the cluster manager; no routing knowledge lives here.
+    /// retain connections only for endpoints reachable through active routes.
     pub fn reconcile(&self, allowed: &HashSet<EndpointKey>) {
         let mut endpoints = self.endpoints.borrow_mut();
         endpoints.retain(|address, endpoint| {

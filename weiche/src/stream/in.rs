@@ -1,5 +1,10 @@
-//! listener-group coordination and per-worker configuration application reports.
-use super::{routing, snapshot::Revision};
+//! downstream listener transports and per-worker application reports.
+#[cfg(feature = "quic")]
+pub mod quic;
+pub mod tcp;
+pub mod udp;
+
+use super::super::{ir::Revision, routing};
 use compio::net::TcpListener;
 use std::{net::SocketAddr, sync::Mutex};
 use tokio::sync::watch;
@@ -77,7 +82,7 @@ impl ListenerGroup {
             .and_then(|worker| worker.bound)
             .unwrap_or(requested);
         let result =
-            listen(address).and_then(|socket| Ok((socket.local_addr()?, socket)));
+            tcp::listen(address).and_then(|socket| Ok((socket.local_addr()?, socket)));
         let worker = &mut workers[id];
         worker.requested = Some(requested);
         match &result {
@@ -145,15 +150,18 @@ impl ListenerGroup {
     }
 }
 
-fn listen(address: SocketAddr) -> std::io::Result<TcpListener> {
+fn bind_socket(
+    address: SocketAddr,
+    kind: socket2::Type,
+    protocol: socket2::Protocol,
+) -> std::io::Result<socket2::Socket> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(address),
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
+        kind,
+        Some(protocol),
     )?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
     socket.bind(&address.into())?;
-    socket.listen(128)?;
-    TcpListener::from_std(socket.into())
+    Ok(socket)
 }

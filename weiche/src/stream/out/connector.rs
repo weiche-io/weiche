@@ -1,4 +1,4 @@
-//! plaintext HTTP transport creation on the owning compio runtime.
+//! plaintext HTTP client handshakes and connections on the owning compio runtime.
 use bytes::Bytes;
 use compio::{net::TcpStream, runtime};
 use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
@@ -20,7 +20,7 @@ pub fn io(stream: TcpStream) -> std::io::Result<Io> {
 pub struct Connected<S = http1::SendRequest<Incoming>> {
     pub sender: S,
     // cancelling a lease also cancels its driver on the owning runtime.
-    pub driver: runtime::JoinHandle<()>,
+    _driver: runtime::JoinHandle<()>,
 }
 
 pub struct Connector {
@@ -35,7 +35,7 @@ impl Connector {
                 tracing::debug!(%address, %error, "upstream connection ended");
             }
         });
-        Ok(Connected { sender, driver })
+        Ok(Connected { sender, _driver: driver })
     }
 
     pub async fn connect_http2<B>(
@@ -56,7 +56,7 @@ impl Connector {
                 tracing::debug!(%address, %error, "upstream HTTP/2 connection ended");
             }
         });
-        Ok(Connected { sender, driver })
+        Ok(Connected { sender, _driver: driver })
     }
 
     async fn open(&self, address: SocketAddr) -> std::io::Result<Io> {

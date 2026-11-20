@@ -1,25 +1,12 @@
-//! compiled hostname buckets with stable Gateway API match precedence.
-use super::cluster::ClusterId;
-use http::{HeaderMap, Method};
-use std::collections::BTreeMap;
+//! HTTP hostname, path, method and header filters in route precedence order.
+use super::super::{
+    super::super::ir::{Http, Route, RouteAction, hostname_matches},
+    Cluster,
+};
+use ::http::{HeaderMap, Method};
+use std::{collections::BTreeMap, rc::Rc};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteAction {
-    Forward(ClusterId),
-    RejectInvalidBackend,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Route {
-    pub hostname: String,
-    pub path: String,
-    pub exact: bool,
-    pub method: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub action: RouteAction,
-}
-
-impl Route {
+impl Http {
     fn matches(&self, path: &str, method: &Method, headers: &HeaderMap) -> bool {
         (if self.exact {
             path == self.path
@@ -43,20 +30,20 @@ impl Route {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Router {
-    exact: BTreeMap<String, Vec<Route>>,
-    wildcard: Vec<(String, Vec<Route>)>,
-    fallback: Vec<Route>,
+    exact: BTreeMap<String, Vec<Route<Rc<Cluster>>>>,
+    wildcard: Vec<(String, Vec<Route<Rc<Cluster>>>)>,
+    fallback: Vec<Route<Rc<Cluster>>>,
 }
 
 impl Router {
     /// input order resolves ties: creation time, namespace/name, rule and match order.
-    pub fn compile(routes: Vec<Route>) -> Self {
-        let mut buckets: BTreeMap<String, Vec<Route>> = BTreeMap::new();
+    pub fn compile(routes: impl IntoIterator<Item = Route<Rc<Cluster>>>) -> Self {
+        let mut buckets: BTreeMap<String, Vec<_>> = BTreeMap::new();
         for mut route in routes {
             route.hostname.make_ascii_lowercase();
-            for (name, _) in &mut route.headers {
+            for (name, _) in &mut route.http.headers {
                 name.make_ascii_lowercase();
             }
             buckets.entry(route.hostname.clone()).or_default().push(route);
@@ -64,7 +51,7 @@ impl Router {
         let mut router = Self::default();
         for (hostname, mut routes) in buckets {
             // stable sorting preserves compiler-established tie order.
-            routes.sort_by_key(|route| std::cmp::Reverse(route.rank()));
+            routes.sort_by_key(|route| std::cmp::Reverse(route.http.rank()));
             if hostname.is_empty() {
                 router.fallback = routes;
             } else if hostname.starts_with("*.") {
@@ -85,7 +72,7 @@ impl Router {
         path: &str,
         method: &Method,
         headers: &HeaderMap,
-    ) -> Option<&RouteAction> {
+    ) -> Option<&RouteAction<Rc<Cluster>>> {
         self.exact
             .get(hostname)
             .into_iter()
@@ -97,31 +84,15 @@ impl Router {
             )
             .chain(std::iter::once(&self.fallback))
             .flat_map(|routes| routes.iter())
-            .find(|route| route.matches(path, method, headers))
+            .find(|route| route.http.matches(path, method, headers))
             .map(|route| &route.action)
     }
 
-    pub fn len(&self) -> usize {
-        self.routes().count()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn routes(&self) -> impl Iterator<Item = &Route> {
+    pub fn routes(&self) -> impl Iterator<Item = &Route<Rc<Cluster>>> {
         self.exact
             .values()
             .chain(self.wildcard.iter().map(|(_, routes)| routes))
             .chain(std::iter::once(&self.fallback))
             .flatten()
     }
-}
-
-pub fn hostname_matches(pattern: &str, host: &str) -> bool {
-    pattern.is_empty()
-        || pattern == host
-        || pattern.strip_prefix("*.").is_some_and(|suffix| {
-            host.strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
-        })
 }
