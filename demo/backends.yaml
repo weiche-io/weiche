@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-a
+  namespace: weiche-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo-a
+  template:
+    metadata:
+      labels:
+        app: echo-a
+    spec:
+      containers:
+        - name: echo
+          image: localhost/weiche-echo:demo
+          imagePullPolicy: Never
+          args: [-u, /app/backend.py]
+          env:
+            - name: BACKEND_NAME
+              value: echo-a
+          ports:
+            - name: http
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 1
+          volumeMounts:
+            - name: script
+              mountPath: /app
+      volumes:
+        - name: script
+          configMap:
+            name: echo-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-a
+  namespace: weiche-demo
+spec:
+  selector:
+    app: echo-a
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-b
+  namespace: weiche-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-b
+  template:
+    metadata:
+      labels:
+        app: echo-b
+    spec:
+      containers:
+        - name: echo
+          image: localhost/weiche-echo:demo
+          imagePullPolicy: Never
+          args: [-u, /app/backend.py]
+          env:
+            - name: BACKEND_NAME
+              value: echo-b
+          ports:
+            - name: http
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 1
+          volumeMounts:
+            - name: script
+              mountPath: /app
+      volumes:
+        - name: script
+          configMap:
+            name: echo-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-b
+  namespace: weiche-demo
+spec:
+  selector:
+    app: echo-b
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: echo
+  namespace: weiche-demo
+spec:
+  parentRefs:
+    - name: weiche
+      sectionName: http
+  hostnames: [echo.demo.local]
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: echo-a
+          port: 80
+    - matches:
+        - path:
+            type: Exact
+            value: /api/special
+      backendRefs:
+        - name: echo-b
+          port: 80

@@ -30,20 +30,14 @@ fn roundtrips_v1_7_standard_retry_fields_and_status() {
         }
     });
     let route: HttpRoute = serde_json::from_value(document.clone()).unwrap();
-    let retry = route.spec.rules.as_ref().unwrap()[0]
-        .retry
-        .as_ref()
-        .unwrap();
+    let retry = route.spec.rules.as_ref().unwrap()[0].retry.as_ref().unwrap();
     assert_eq!(retry.attempts, Some(0));
     assert_eq!(retry.backoff.as_deref(), Some("100ms"));
     assert_eq!(retry.codes.as_deref(), Some(&[500, 503][..]));
 
     let serialized = serde_json::to_value(route).unwrap();
     for field in ["apiVersion", "kind", "spec", "status"] {
-        assert_eq!(
-            serialized[field], document[field],
-            "roundtrip changed {field}"
-        );
+        assert_eq!(serialized[field], document[field], "roundtrip changed {field}");
     }
     assert_eq!(GATEWAY_API_VERSION, "v1.7.0");
 }

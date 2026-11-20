@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: weiche-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weiche
+  namespace: weiche-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weiche-demo
+rules:
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses, gateways, httproutes]
+    verbs: [get, list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses/status, gateways/status, httproutes/status]
+    verbs: [get, patch]
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: weiche-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: weiche-demo
+subjects:
+  - kind: ServiceAccount
+    name: weiche
+    namespace: weiche-demo
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: weiche
+spec:
+  controllerName: weiche.io/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: weiche
+  namespace: weiche-demo
+spec:
+  gatewayClassName: weiche
+  listeners:
+    - name: http
+      port: 8080
+      protocol: HTTP
+      hostname: '*.demo.local'
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weiche
+  namespace: weiche-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weiche
+  template:
+    metadata:
+      labels:
+        app: weiche
+    spec:
+      serviceAccountName: weiche
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: weiche
+          image: localhost/weiche:demo
+          imagePullPolicy: Never
+          env:
+            - name: WEICHE_NAMESPACE
+              value: weiche-demo
+            - name: WEICHE_GATEWAY
+              value: weiche
+            - name: WEICHE_LISTENER
+              value: http
+            - name: RUST_LOG
+              value: info,weiche::controller=warn
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            # Local demo: common default profiles deny io_uring syscalls.
+            seccompProfile:
+              type: Unconfined
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weiche
+  namespace: weiche-demo
+spec:
+  selector:
+    app: weiche
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
