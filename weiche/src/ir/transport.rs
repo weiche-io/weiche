@@ -44,6 +44,16 @@ pub struct StreamRoute {
     pub backends: Vec<(u32, Result<Vec<SocketAddr>, RefError>)>,
 }
 impl StreamRoute {
+    /// enumerate addresses still reachable through resolved, positive-weight backends.
+    pub fn targets(&self) -> impl Iterator<Item = SocketAddr> {
+        self.backends
+            .iter()
+            .filter(|(weight, _)| *weight > 0)
+            .filter_map(|(_, target)| target.as_ref().ok())
+            .flatten()
+            .copied()
+    }
+
     pub fn select(&self) -> Option<SocketAddr> {
         let endpoints = weighted(&self.backends)?.as_ref().ok()?;
         fastrand::choice(endpoints).copied()
