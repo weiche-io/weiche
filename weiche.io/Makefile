@@ -12,8 +12,6 @@ MINIFY ?= n
 PORT   ?= 8000
 
 MINIFY_CMD := minify --html-keep-quotes --html-keep-end-tags --html-keep-document-tags
-BUILD_MODE := $(if $(filter y,$(MINIFY)),minified,plain)
-MODE_STAMP := build/.mode-$(BUILD_MODE)
 
 INSTALL := install -D -m 0644
 MKDIR_P := mkdir -p
@@ -41,7 +39,7 @@ assets: css $(addprefix build/,$(ASSET_STATIC))
 css: $(addprefix build/,$(ASSET_CSS))
 fonts: $(addprefix build/,$(ASSET_FONTS))
 
-build/nav.typ: $(SRC_META) src Makefile
+build/nav.typ: $(SRC_META) src
 	$(call log,NAV,$@)
 	$(Q)$(MKDIR_P) $(@D)
 	$(Q){ \
@@ -62,12 +60,6 @@ build/nav.typ: $(SRC_META) src Makefile
 		printf ').flatten()\n'; \
 	} > "$@.tmp" && mv "$@.tmp" "$@" || { rm -f "$@.tmp"; exit 1; }
 
-$(MODE_STAMP):
-	$(call log,MODE,$(BUILD_MODE))
-	$(Q)$(MKDIR_P) $(@D)
-	$(Q)rm -f build/.mode-plain build/.mode-minified
-	$(Q)touch $@
-
 build/%/index.typ: src/%/index.typ src/%/meta.typ src/%
 	$(call log,COPY,$(@D))
 	$(Q)$(MKDIR_P) $(@D)
@@ -80,7 +72,7 @@ serve: build
 
 clean:
 	$(Q)if [ -d build ]; then \
-		$(FIND) build \( -name '*.bib' -o -name '*.typ' -o -name '.mode-*' \) | sort | while IFS= read -r f; do \
+		$(FIND) build \( -name '*.bib' -o -name '*.typ' \) | sort | while IFS= read -r f; do \
 			printf '%-6s %s\n' RM "$$f"; \
 			rm -f "$$f"; \
 		done; \

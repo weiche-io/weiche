@@ -14,7 +14,7 @@ CURL ?= curl
 PLEX_SANS_TARBALL    := https://registry.npmjs.org/@fontsource-variable/ibm-plex-sans/-/ibm-plex-sans-5.3.0.tgz
 CHAKRA_PETCH_TARBALL := https://registry.npmjs.org/@fontsource/chakra-petch/-/chakra-petch-5.3.0.tgz
 
-build/%.css: assets/%.css $(MODE_STAMP)
+build/%.css: assets/%.css
 	$(call log,ASSET,$@)
 	$(Q)$(INSTALL) $< $@
 ifeq ($(MINIFY),y)

@@ -35,10 +35,11 @@
   4.4-only syntax such as `.WAIT`).
 - stage each `src/<page>/` directory into `build/<page>/` before compiling so
   sibling assets (images, svgs, data) resolve identically in Typst and HTML,
-  then strip intermediate `*.typ`, `*.bib`, and `.mode-*` files in `clean` /
-  `full` so `build/` only holds deployable output.
-- support `V=y` for verbose recipes and `MINIFY=y` for production minification,
-  tracking the output mode so switching `MINIFY` invalidates stale html/css.
+  then strip intermediate `*.typ` and `*.bib` files in `clean` / `full` so
+  `build/` only holds deployable output.
+- support `V=y` for verbose recipes and `MINIFY=y` for production minification;
+  keep target prerequisites limited to real source/template inputs (do not add
+  Makefiles or mode stamp files as prerequisites).
 
 ## typst templates and pages
 
