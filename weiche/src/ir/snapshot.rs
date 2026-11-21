@@ -38,6 +38,7 @@ pub struct SocketRoutes {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewaySnapshot {
     pub sockets: BTreeMap<SocketAddr, SocketRoutes>,
+    pub streams: BTreeMap<(super::Transport, SocketAddr), super::StreamListener>,
     pub forwarding: ForwardingPolicy,
 }
 

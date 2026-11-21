@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
     gateways::Gateway, httproutes::HttpRoute, referencegrants::ReferenceGrant,
+    tcproutes::TcpRoute, udproutes::UdpRoute,
 };
 
 /// Live snapshots maintained by kube-runtime, including updates and deletions.
@@ -41,6 +42,8 @@ use weiche_gtwapi::v1::{
 pub struct GatewayStores {
     pub gateway_classes: Store<GatewayClass>,
     pub gateways: Store<Gateway>,
+    pub tcp_routes: Store<TcpRoute>,
+    pub udp_routes: Store<UdpRoute>,
     pub http_routes: Store<HttpRoute>,
     pub secrets: Store<Secret>,
     pub namespaces: Store<Namespace>,
@@ -63,6 +66,8 @@ impl GatewayController {
         let (gateway_classes, classes_watch) =
             cache(Api::all(client.clone()), defaults());
         let (gateways, gateways_watch) = cache(Api::all(client.clone()), defaults());
+        let (tcp_routes, tcp_watch) = cache(Api::all(client.clone()), defaults());
+        let (udp_routes, udp_watch) = cache(Api::all(client.clone()), defaults());
         let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
         let (secrets, secrets_watch) =
             cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
@@ -77,6 +82,8 @@ impl GatewayController {
                 gateway_classes,
                 gateways,
                 http_routes,
+                tcp_routes,
+                udp_routes,
                 secrets,
                 namespaces,
                 grants,
@@ -89,6 +96,8 @@ impl GatewayController {
                 classes_watch,
                 gateways_watch,
                 routes_watch,
+                tcp_watch,
+                udp_watch,
                 secrets_watch,
                 namespaces_watch,
                 grants_watch,

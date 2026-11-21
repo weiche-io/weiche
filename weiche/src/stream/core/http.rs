@@ -230,24 +230,7 @@ impl ProxyService {
                 }
             }
         }
-        let target = match action.backends.as_slice() {
-            [(w, target)] if *w > 0 => Some(target),
-            weights => {
-                let total: u64 = weights.iter().map(|(w, _)| u64::from(*w)).sum();
-                if total == 0 {
-                    return Err(ProxyError::InvalidBackend);
-                }
-                let mut slot = fastrand::u64(0..total);
-                weights.iter().find_map(|(w, target)| {
-                    if slot < u64::from(*w) {
-                        Some(target)
-                    } else {
-                        slot -= u64::from(*w);
-                        None
-                    }
-                })
-            }
-        };
+        let target = super::super::super::ir::weighted(&action.backends);
         let cluster = target
             .and_then(|t| t.as_ref().ok())
             .ok_or(ProxyError::InvalidBackend)?;

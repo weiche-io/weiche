@@ -15,10 +15,10 @@ metadata:
   name: weiche-demo
 rules:
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses, gateways, httproutes, referencegrants, backendtlspolicies]
+    resources: [gatewayclasses, gateways, httproutes, tcproutes, udproutes, referencegrants, backendtlspolicies]
     verbs: [get, list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses/status, gateways/status, httproutes/status, backendtlspolicies/status]
+    resources: [gatewayclasses/status, gateways/status, httproutes/status, tcproutes/status, udproutes/status, backendtlspolicies/status]
     verbs: [get, patch]
   - apiGroups: ['']
     resources: [services, namespaces]

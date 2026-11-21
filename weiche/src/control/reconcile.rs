@@ -32,6 +32,8 @@ pub async fn run(
                 stores.gateway_classes.wait_until_ready(),
                 stores.gateways.wait_until_ready(),
                 stores.http_routes.wait_until_ready(),
+                stores.tcp_routes.wait_until_ready(),
+                stores.udp_routes.wait_until_ready(),
                 stores.secrets.wait_until_ready(),
                 stores.namespaces.wait_until_ready(),
                 stores.grants.wait_until_ready(),
