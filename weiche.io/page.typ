@@ -26,28 +26,25 @@
       html.header(class: "site-header wrap", {
         html.a(href: root, class: "brand", aria-label: "Weiche home", {
           html.img(
-            src: root + "weiche.svg#dark",
-            width: 48,
-            height: 48,
+            src: root + "weiche.svg",
+            width: 34,
+            height: 34,
             alt: "",
           )
-          [weiche]
+          [Weiche]
         })
         html.nav(aria-label: "Main navigation", {
           nav-link(root + "guide/", [Guide], current: path == "guide/")
           nav-link(site.repository, [GitHub])
         })
       })
-      html.main(id: "main", class: "wrap", body)
+      html.main(id: "main", class: if body-class == "home" { "landing" } else { "wrap reader" }, body)
       html.footer(class: "site-footer wrap", {
-        html.p()[#html.strong()[Weiche]]
-        if body-class != "home" {
-          html.nav(aria-label: "Project links", {
-            html.a(href: root + "weiche.svg")[Logo (SVG)]
-            html.a(href: root + "guide/#current-scope")[Current scope]
-            html.a(href: site.repository + "/issues")[Issues]
-          })
-        }
+        html.a(class: "footer-brand", href: root)[Weiche]
+        html.nav(aria-label: "Project links", {
+          html.a(href: root + "weiche.svg")[Project logo]
+          html.a(href: site.repository + "/issues")[Issues]
+        })
       })
     })
   })

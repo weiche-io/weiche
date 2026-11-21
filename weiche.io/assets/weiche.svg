@@ -1,6 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" id="dark"
      role="img" aria-label="weiche" color="#0F2942" stroke="#F95725">
   <style>
+    @media (prefers-color-scheme: dark) {
+      :root { color: #ece9e3; stroke: #ff8451 }
+    }
     #dark:target { color: #F1F5F9; stroke: #FF6B35 }
     #mono:target { stroke: currentColor }
   </style>

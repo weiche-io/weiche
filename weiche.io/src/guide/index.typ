@@ -9,12 +9,17 @@
 )
 
 #html.header(class: "page-intro", {
+  html.nav(class: "crumbs", aria-label: "Breadcrumb", {
+    html.a(href: "../")[Weiche]
+    html.span[Guide]
+  })
   html.h1()[Test Weiche on kind]
   html.p(class: "lede")[Run the same Gateway API conformance tests used on pull requests.]
 })
 
 #html.aside(class: "toc", {
-  html.nav(aria-label: "On this page", {
+  html.p(id: "contents")[On this page]
+  html.nav(aria-labelledby: "contents", {
     html.a(href: "#prerequisites")[Prerequisites]
     html.a(href: "#run")[Run the suite]
     html.a(href: "#report")[Read the report]
