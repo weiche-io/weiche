@@ -7,6 +7,7 @@ use kube::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
 use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
 };
@@ -112,8 +113,8 @@ pub async fn update_status(
     }
     for plan in plans {
         update_gateway(client, plan).await?;
-        update_policies(client, stores, plan).await?;
     }
+    update_policies(client, stores, plans).await?;
 
     macro_rules! routes {
         ($store:expr) => {
@@ -345,14 +346,26 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
     .await
 }
 
-/// reconcile this gateway's ancestor entry without overwriting other controllers' reports.
+/// publish all gateway ancestors for a policy against a single observed resource version.
 async fn update_policies(
     client: &Client,
     stores: &GatewayStores,
-    plan: &Plan,
+    plans: &[Plan],
 ) -> anyhow::Result<()> {
-    let namespace = plan.gateway.namespace().unwrap_or_default();
-    let name = plan.gateway.name_any();
+    let mut reports = HashMap::<_, BTreeMap<_, _>>::new();
+    for plan in plans {
+        let gateway =
+            (plan.gateway.namespace().unwrap_or_default(), plan.gateway.name_any());
+        for listener in &plan.listeners {
+            for (policy, report) in &listener.policies.reports {
+                reports
+                    .entry(policy)
+                    .or_default()
+                    .entry(gateway.clone())
+                    .or_insert(report);
+            }
+        }
+    }
     for policy in stores.tls_policies.state() {
         let old = policy
             .status
@@ -362,20 +375,22 @@ async fn update_policies(
         let owned = |p: &Value| {
             let ancestor = &p["ancestorRef"];
             p["controllerName"] == CONTROLLER_NAME
-                && ancestor["name"] == name
-                && ancestor["namespace"] == namespace
                 && ancestor["kind"] == "Gateway"
                 && ancestor["group"] == "gateway.networking.k8s.io"
         };
-        let previous = entries.iter().find(|entry| owned(entry));
-        let key = ObjectRef::from_obj(policy.as_ref());
-        let report = plan.listeners.iter().find_map(|l| l.policies.reports.get(&key));
-        if previous.is_none() && report.is_none() {
-            continue;
-        }
         let mut ancestors: Vec<_> =
             entries.iter().filter(|entry| !owned(entry)).cloned().collect();
-        if let Some(report) = report {
+        let key = ObjectRef::from_obj(policy.as_ref());
+        let reports = reports.remove(&key).unwrap_or_default();
+        if reports.is_empty() && ancestors.len() == entries.len() {
+            continue;
+        }
+        for ((namespace, name), report) in reports {
+            let previous = entries.iter().find(|entry| {
+                owned(entry)
+                    && entry["ancestorRef"]["name"] == name
+                    && entry["ancestorRef"]["namespace"] == namespace
+            });
             let error = report.as_ref().err();
             let refs_error = error.filter(|e| {
                 matches!(

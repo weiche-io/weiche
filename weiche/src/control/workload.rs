@@ -102,7 +102,9 @@ impl Applied {
                 "{} {namespace}/{name} has another owner",
                 kind.kind
             );
-            fields["metadata"]["resourceVersion"] = json!(old.resource_version());
+            // pin the checked object across replacement while allowing other field managers
+            // to update their own fields, including the proxy's ConfigMap acknowledgements.
+            fields["metadata"]["uid"] = json!(old.uid().context("missing workload uid")?);
             api.patch(name, &PatchParams::apply("weiche").force(), &Patch::Apply(fields))
                 .await?;
         } else {
