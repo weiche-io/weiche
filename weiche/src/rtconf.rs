@@ -7,6 +7,8 @@ pub struct RuntimeConfig {
     pub workers: NonZeroUsize,
     pub downstream_connections_global: NonZeroUsize,
     pub upstream_connections_per_worker: NonZeroUsize,
+    /// deadline for opening a raw TCP backend connection.
+    pub tcp_connect_timeout: Duration,
     pub upstream_idle_timeout: Duration,
     /// maximum time a downstream socket may occupy a permit before TLS completes.
     pub tls_handshake_timeout: Duration,
@@ -24,6 +26,7 @@ impl RuntimeConfig {
             workers,
             downstream_connections_global: NonZeroUsize::new(1024).unwrap(),
             upstream_connections_per_worker: NonZeroUsize::new(1024).unwrap(),
+            tcp_connect_timeout: Duration::from_secs(10),
             upstream_idle_timeout: Duration::from_secs(30),
             tls_handshake_timeout: Duration::from_secs(10),
             connection_drain_timeout: Duration::from_secs(5),
@@ -57,6 +60,10 @@ impl RuntimeConfig {
         anyhow::ensure!(
             !self.listener_retry_interval.is_zero(),
             "listener retry interval must be positive"
+        );
+        anyhow::ensure!(
+            !self.tcp_connect_timeout.is_zero(),
+            "tcp connect timeout must be positive"
         );
         anyhow::ensure!(
             self.worker_drain_timeout >= self.connection_drain_timeout,

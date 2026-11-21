@@ -122,6 +122,7 @@ pub async fn run(
                         s,
                         rx,
                         admission.clone(),
+                        runtime.tcp_connect_timeout,
                         runtime.connection_drain_timeout,
                     )
                     .boxed_local()
