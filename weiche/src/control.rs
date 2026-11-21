@@ -2,15 +2,15 @@
 mod cleanup;
 mod compile;
 mod reconcile;
+mod resolve;
 mod service;
 mod status;
 mod tls;
-mod tryfrom;
 mod workload;
 
 pub use compile::{CONTROLLER_NAME, Compiled, compile};
 pub use reconcile::run;
-pub use tryfrom::{Resolve, ResolveError};
+pub use resolve::ResolveError;
 
 use futures::{
     StreamExt,

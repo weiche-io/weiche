@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use super::super::ir::{Route, StreamRoute, Transport, hostname_matches};
 use super::{
-    GatewayStores, Resolve, ResolveError,
+    GatewayStores, ResolveError,
     tls::{Policies, TlsError, listener_tls},
 };
 use kube::{Resource, ResourceExt};
@@ -255,7 +255,7 @@ impl Routed for HttpRoute {
             );
             return Ok(());
         }
-        for rule in stores.resolve_http(self, &mut result.policies)?.rules {
+        for rule in stores.resolve_http(self, &mut result.policies)? {
             report.references(&rule.action.backends);
             for http in rule.matches {
                 for hostname in &hosts {
@@ -271,7 +271,7 @@ impl Routed for HttpRoute {
     }
 }
 macro_rules! stream_route {
-    ($route:ty,$parent:ty) => {
+    ($route:ty,$parent:ty,$resolve:ident) => {
         impl Routed for $route {
             parents!($parent);
             fn bind(
@@ -281,7 +281,7 @@ macro_rules! stream_route {
                 result: &mut Compiled,
                 report: &mut RouteReport,
             ) -> Result<(), ResolveError> {
-                let backend = stores.resolve(self)?;
+                let backend = stores.$resolve(self)?;
                 report.references(&backend.backends);
                 // routes arrive oldest first. every allowed parent receives a status entry.
                 result.stream.get_or_insert(backend);
@@ -290,8 +290,8 @@ macro_rules! stream_route {
         }
     };
 }
-stream_route!(TcpRoute, TcpRouteParentRefs);
-stream_route!(UdpRoute, UdpRouteParentRefs);
+stream_route!(TcpRoute, TcpRouteParentRefs, resolve_tcp);
+stream_route!(UdpRoute, UdpRouteParentRefs, resolve_udp);
 
 fn collect<R: Routed>(
     mut routes: Vec<Arc<R>>,

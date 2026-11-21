@@ -1,20 +1,7 @@
-//! resolved routing rules and upstreams, independent of the configuration source.
+//! resolved HTTP match predicates and upstream cluster metadata.
 use super::BackendTls;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
-
-/// rules contributed by one route, in declaration order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Backend<P> {
-    pub rules: Vec<Rule<P>>,
-}
-
-/// an invalid upstream rejects traffic matching this rule, not its siblings.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rule<P> {
-    pub matches: Vec<P>,
-    pub action: super::RouteAction,
-}
 
 /// one HTTP match; predicates within a match are combined with AND.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

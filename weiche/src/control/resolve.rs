@@ -1,9 +1,8 @@
 //! translate watched route resources against the controller's local stores.
-use super::super::ir::{StreamRoute, Transport};
 use super::{
     super::ir::{
-        Backend, ClusterSpec, HeaderChange, Http, Protocol, Redirect, RefError,
-        RouteAction, Rule,
+        ClusterSpec, HeaderChange, Http, Protocol, Redirect, RefError, RouteAction,
+        StreamRoute, Transport,
     },
     GatewayStores,
     tls::Policies,
@@ -24,52 +23,42 @@ use weiche_gtwapi::v1::{
     udproutes::{UdpRoute, UdpRouteRulesBackendRefs},
 };
 
-/// resolve a route using the resources visible to this controller.
-pub trait Resolve<Route> {
-    type Output;
-
-    fn resolve(&self, route: &Route) -> Result<Self::Output, ResolveError>;
-}
-
 /// errors which prevent the route itself from being accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     UnsupportedValue,
 }
 
-impl Resolve<HttpRoute> for GatewayStores {
-    type Output = Backend<Http>;
-
-    fn resolve(&self, route: &HttpRoute) -> Result<Self::Output, ResolveError> {
-        self.resolve_http(route, &mut Policies::default())
-    }
+/// resolved matches and action for one HTTPRoute rule.
+pub struct HttpRule {
+    pub matches: Vec<Http>,
+    pub action: RouteAction,
 }
 
 impl GatewayStores {
     /// retain policy status for the Service ports used by accepted routes.
-    pub(super) fn resolve_http(
+    pub fn resolve_http(
         &self,
         route: &HttpRoute,
         policies: &mut Policies,
-    ) -> Result<Backend<Http>, ResolveError> {
+    ) -> Result<Vec<HttpRule>, ResolveError> {
         let rules = route.spec.rules.as_deref().unwrap_or_default();
         if rules.iter().any(unsupported_rule) {
             return Err(ResolveError::UnsupportedValue);
         }
 
         let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        let rules = rules
+        rules
             .iter()
             .map(|rule| {
                 let mut action = filters(rule)?;
                 for backend in rule.backend_refs.iter().flatten() {
                     action.backends.push((
                         backend.weight.unwrap_or(1),
-                        resolve_backend(self, policies, namespace, backend)
-                            .map(std::sync::Arc::new),
+                        resolve_backend(self, policies, namespace, backend).map(Arc::new),
                     ));
                 }
-                Ok(Rule {
+                Ok(HttpRule {
                     matches: rule.matches.as_ref().map_or_else(
                         || vec![Http::default()],
                         |m| m.iter().map(http_match).collect(),
@@ -77,8 +66,7 @@ impl GatewayStores {
                     action,
                 })
             })
-            .collect::<Result<_, ResolveError>>()?;
-        Ok(Backend { rules })
+            .collect()
     }
 }
 
@@ -360,29 +348,47 @@ impl ServiceRef<'_> {
     }
 }
 
-macro_rules! stream_backend {
-    ($route:ty,$transport:expr) => {
-        impl Resolve<$route> for GatewayStores {
-            type Output = StreamRoute;
-            fn resolve(&self, route: &$route) -> Result<StreamRoute, ResolveError> {
-                let [rule] = route.spec.rules.as_slice() else {
-                    return Err(ResolveError::UnsupportedValue);
-                };
-                let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-                let backends = rule
-                    .backend_refs
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.weight.unwrap_or(1),
-                            ServiceRef::from(r).stream(self, namespace, $transport),
-                        )
-                    })
-                    .collect();
-                Ok(StreamRoute { backends })
-            }
+impl GatewayStores {
+    fn resolve_stream<'a>(
+        &self,
+        namespace: &str,
+        transport: Transport,
+        backends: impl Iterator<Item = (u32, ServiceRef<'a>)>,
+    ) -> StreamRoute {
+        StreamRoute {
+            backends: backends
+                .map(|(w, r)| (w, r.stream(self, namespace, transport)))
+                .collect(),
         }
-    };
+    }
+
+    /// resolve a TCPRoute into weighted backend endpoint sets.
+    pub fn resolve_tcp(&self, route: &TcpRoute) -> Result<StreamRoute, ResolveError> {
+        let [rule] = route.spec.rules.as_slice() else {
+            return Err(ResolveError::UnsupportedValue);
+        };
+        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
+        Ok(self.resolve_stream(
+            namespace,
+            Transport::Tcp,
+            rule.backend_refs
+                .iter()
+                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
+        ))
+    }
+
+    /// resolve a UDPRoute into weighted backend endpoint sets.
+    pub fn resolve_udp(&self, route: &UdpRoute) -> Result<StreamRoute, ResolveError> {
+        let [rule] = route.spec.rules.as_slice() else {
+            return Err(ResolveError::UnsupportedValue);
+        };
+        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
+        Ok(self.resolve_stream(
+            namespace,
+            Transport::Udp,
+            rule.backend_refs
+                .iter()
+                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
+        ))
+    }
 }
-stream_backend!(TcpRoute, Transport::Tcp);
-stream_backend!(UdpRoute, Transport::Udp);

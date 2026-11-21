@@ -7,7 +7,7 @@ mod transport;
 pub mod wire;
 pub use transport::{StreamListener, StreamRoute, Transport, weighted};
 
-pub use backend::{Backend, ClusterSpec, Http, Protocol, RefError, Rule};
+pub use backend::{ClusterSpec, Http, Protocol, RefError};
 pub use route::{HeaderChange, Redirect, Route, RouteAction, hostname_matches};
 pub use snapshot::{
     ForwardingPolicy, GatewaySnapshot, Listener, PublishedSnapshot, Revision,
