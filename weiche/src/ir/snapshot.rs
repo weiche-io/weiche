@@ -16,7 +16,16 @@ impl Default for ForwardingPolicy {
     }
 }
 
-/// socket and transport identity applied together by each worker.
+/// identity shared by the socket, its live connections and the active router.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub address: SocketAddr,
+    pub port: u16,
+    pub gateway_uid: String,
+    pub tls: bool,
+}
+
+/// listener configuration carried in the gateway snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listener {
     pub address: SocketAddr,
@@ -26,6 +35,18 @@ pub struct Listener {
     pub gateway_uid: String,
     /// ordered from most to least specific SNI hostname.
     pub tls: Vec<Arc<ServerTls>>,
+}
+
+impl Listener {
+    /// certificate updates apply to new handshakes on the same binding.
+    pub fn binding(&self) -> Binding {
+        Binding {
+            address: self.address,
+            port: self.port,
+            gateway_uid: self.gateway_uid.clone(),
+            tls: !self.tls.is_empty(),
+        }
+    }
 }
 
 /// resolved HTTP routes sharing one transport socket.

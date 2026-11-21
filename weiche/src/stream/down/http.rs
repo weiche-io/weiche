@@ -1,6 +1,9 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::{ir::Listener, rtconf::RuntimeConfig},
+    super::{
+        ir::{Binding, ServerTls},
+        rtconf::RuntimeConfig,
+    },
     core::{http::ProxyService, tcp::Permit},
     io::socket,
 };
@@ -9,7 +12,7 @@ use compio::{net::TcpStream, runtime::time::timeout};
 use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
 use hyper::service::service_fn;
 use hyper_util::server::conn::auto::Builder;
-use std::{net::SocketAddr, rc::Rc, time::Duration};
+use std::{net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 /// downstream HTTP/1 and HTTP/2 server configured for one worker.
@@ -43,7 +46,8 @@ impl Server {
 
     pub async fn serve(
         self: Rc<Self>,
-        listener: Listener,
+        listener: Rc<Binding>,
+        certs: Rc<[Arc<ServerTls>]>,
         stream: TcpStream,
         peer: SocketAddr,
         _permit: Permit,
@@ -59,19 +63,19 @@ impl Server {
                 return;
             }
         };
-        let (stream, builder) = if !listener.tls.is_empty() {
+        let (stream, builder) = if listener.tls {
             let handshake = tokio::select! {
                 _ = shutdown.changed() => return,
-                result = timeout(self.handshake_timeout, tls::accept(stream, &listener.tls)) => result,
+                result = timeout(self.handshake_timeout, tls::accept(stream, &certs)) => result,
             };
             let stream = match handshake {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
-                    tracing::debug!(%peer, %error, "TLS handshake failed");
+                    tracing::debug!(%peer, %error, "tls handshake failed");
                     return;
                 }
                 Err(_) => {
-                    tracing::debug!(%peer, "TLS handshake timed out");
+                    tracing::debug!(%peer, "tls handshake timed out");
                     return;
                 }
             };
@@ -85,7 +89,7 @@ impl Server {
         } else {
             (HyperStream::new_plain(stream), self.builder.clone())
         };
-        let listener = Rc::new(listener);
+        drop(certs);
         let service = service_fn(|request| {
             let server = self.clone();
             let listener = listener.clone();

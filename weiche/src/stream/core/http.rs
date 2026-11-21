@@ -5,7 +5,7 @@ use super::{
     super::{
         super::{
             ir::{
-                HeaderChange, Listener, Protocol, PublishedSnapshot, Revision, Route,
+                Binding, HeaderChange, Protocol, PublishedSnapshot, Revision, Route,
                 RouteAction,
             },
             rtconf::RuntimeConfig,
@@ -108,7 +108,7 @@ impl WorkerView {
             }));
             routes.insert(
                 *address,
-                tcp::Route { listener: socket.listener.clone(), target: router },
+                tcp::Route { binding: socket.listener.binding(), target: router },
             );
         }
         Ok((
@@ -163,7 +163,7 @@ impl ProxyService {
 
     fn select(
         &self,
-        listener: &Listener,
+        listener: &Binding,
         request: &mut Request<Incoming>,
         authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
@@ -184,7 +184,7 @@ impl ProxyService {
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
         if let Some(redirect) = &action.redirect {
-            let scheme = if !listener.tls.is_empty() { "https" } else { "http" };
+            let scheme = if listener.tls { "https" } else { "http" };
             let host = redirect.hostname.as_deref().unwrap_or_else(|| authority.host());
             let port = listener.port;
             let suffix = if (scheme == "http" && port == 80)
@@ -225,7 +225,7 @@ impl ProxyService {
     /// routing and forwarding failures become HTTP responses rather than service errors.
     pub async fn call(
         &self,
-        listener: &Listener,
+        listener: &Binding,
         mut request: Request<Incoming>,
     ) -> Result<Response<Body>, !> {
         let authority = match normalize_authority(&mut request) {
@@ -237,12 +237,7 @@ impl ProxyService {
             Err(error) => return Ok(error.response()),
         };
         let downstream_version = request.version();
-        prepare_request(
-            &mut request,
-            authority,
-            endpoint.key.protocol,
-            !listener.tls.is_empty(),
-        );
+        prepare_request(&mut request, authority, endpoint.key.protocol, listener.tls);
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
             Ok(Ok(response)) => {

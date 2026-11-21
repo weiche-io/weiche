@@ -2,7 +2,7 @@
 use super::{
     super::{
         super::{
-            ir::{StreamRoute, Transport},
+            ir::{Binding, ServerTls, StreamRoute, Transport},
             routing,
             rtconf::RuntimeConfig,
         },
@@ -42,10 +42,8 @@ pub async fn run(
     let snapshot = config.snapshot();
     let service = ProxyService::new(snapshot, &runtime)?;
     let server = Rc::new(Server::new(service, &runtime));
-    let mut sockets = BTreeMap::<
-        SocketAddr,
-        (super::super::super::ir::Listener, watch::Sender<bool>),
-    >::new();
+    let mut sockets =
+        BTreeMap::<SocketAddr, (Rc<Binding>, watch::Sender<Rc<[Arc<ServerTls>]>>)>::new();
     let mut streams = BTreeMap::<
         (Transport, SocketAddr),
         (String, watch::Sender<Arc<StreamRoute>>),
@@ -56,18 +54,21 @@ pub async fn run(
     loop {
         let snapshot = config.snapshot();
         server.service.apply(snapshot.clone())?;
-        sockets.retain(|address, (old, closing)| {
-            if snapshot
-                .gateway
-                .sockets
-                .get(address)
-                .is_some_and(|s| &s.listener == old)
-            {
-                true
-            } else {
-                closing.send_replace(true);
-                false
+        sockets.retain(|address, (binding, certs)| {
+            let Some(socket) = snapshot.gateway.sockets.get(address) else {
+                return false;
+            };
+            if socket.listener.binding() != **binding {
+                return false;
             }
+            certs.send_if_modified(|current| {
+                if current.as_ref() == socket.listener.tls.as_slice() {
+                    return false;
+                }
+                *current = Rc::from(socket.listener.tls.as_slice());
+                true
+            });
+            true
         });
         for (address, routes) in &snapshot.gateway.sockets {
             if sockets.contains_key(address) {
@@ -75,13 +76,15 @@ pub async fn run(
             }
             match listen(*address) {
                 Ok(socket) => {
-                    let (close, rx) = watch::channel(false);
-                    sockets.insert(*address, (routes.listener.clone(), close));
+                    let binding = Rc::new(routes.listener.binding());
+                    let (certs, rx) =
+                        watch::channel(Rc::from(routes.listener.tls.as_slice()));
+                    sockets.insert(*address, (binding.clone(), certs));
                     serving.push(
                         accept(
                             socket,
                             server.clone(),
-                            routes.listener.clone(),
+                            binding,
                             admission.clone(),
                             rx,
                             runtime.worker_drain_timeout,
@@ -164,9 +167,7 @@ pub async fn run(
             _=sleep(runtime.listener_retry_interval),if retry=>{}
         }
     }
-    for (_, (_, close)) in sockets {
-        close.send_replace(true);
-    }
+    drop(sockets);
     drop(streams);
     while serving.next().await.is_some() {}
     listeners.report(id, WorkerStatus::default());
@@ -178,21 +179,34 @@ pub async fn run(
 async fn accept(
     socket: TcpListener,
     server: Rc<Server>,
-    listener: super::super::super::ir::Listener,
+    binding: Rc<Binding>,
     admission: Arc<Admission>,
-    mut closing: watch::Receiver<bool>,
+    mut certs: watch::Receiver<Rc<[Arc<ServerTls>]>>,
     drain: std::time::Duration,
 ) -> io::Result<()> {
     let (connections, _) = watch::channel(false);
-    loop {
-        tokio::select! {
-            biased;
-            _=closing.changed()=>break,
-            accepted=socket.accept()=>{
-                let (stream,peer)=accepted?;
-                if let Some(permit)=admission.acquire() {
-                    runtime::spawn(server.clone().serve(listener.clone(),stream,peer,permit,connections.subscribe())).detach();
+    {
+        let mut accepting = std::pin::pin!(socket.accept());
+        loop {
+            let (stream, peer) = tokio::select! {
+                biased;
+                changed = certs.changed() => {
+                    if changed.is_err() { break }
+                    continue;
                 }
+                accepted = &mut accepting => accepted?,
+            };
+            accepting.set(socket.accept());
+            if let Some(permit) = admission.acquire() {
+                runtime::spawn(server.clone().serve(
+                    binding.clone(),
+                    certs.borrow().clone(),
+                    stream,
+                    peer,
+                    permit,
+                    connections.subscribe(),
+                ))
+                .detach();
             }
         }
     }

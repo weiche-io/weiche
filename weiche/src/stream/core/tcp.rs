@@ -1,5 +1,5 @@
 //! TCP admission and listener selection; neither filter inspects application bytes.
-use super::super::super::ir::Listener;
+use super::super::super::ir::Binding;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -7,14 +7,14 @@ use std::sync::{
 
 /// target attached to a configured listener, before any protocol-specific matching.
 pub struct Route<T> {
-    pub listener: Listener,
+    pub binding: Binding,
     pub target: T,
 }
 
 impl<T> Route<T> {
     /// keep existing connections bound to their original socket and TLS identity.
-    pub fn find(&self, listener: &Listener) -> Option<&T> {
-        (&self.listener == listener).then_some(&self.target)
+    pub fn find(&self, binding: &Binding) -> Option<&T> {
+        (&self.binding == binding).then_some(&self.target)
     }
 }
 
