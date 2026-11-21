@@ -58,10 +58,10 @@ impl Server {
                 return;
             }
         };
-        let (stream, builder) = if let Some(tls) = &listener.tls {
+        let (stream, builder) = if !listener.tls.is_empty() {
             let handshake = tokio::select! {
                 _ = shutdown.changed() => return,
-                result = timeout(self.handshake_timeout, tls::accept(stream, tls)) => result,
+                result = timeout(self.handshake_timeout, tls::accept(stream, &listener.tls)) => result,
             };
             let stream = match handshake {
                 Ok(Ok(stream)) => stream,

@@ -1,6 +1,6 @@
 //! immutable data-plane input, independent of Kubernetes objects and worker state.
 use super::{Route, ServerTls};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use std::{net::SocketAddr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,23 +19,26 @@ impl Default for ForwardingPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listener {
     pub address: SocketAddr,
-    /// present when the listener terminates HTTPS.
-    pub tls: Option<Arc<ServerTls>>,
+    /// advertised port may differ from the local port behind a Kubernetes Service.
+    pub port: u16,
+    /// prevents established connections from following a reallocated socket to another Gateway.
+    pub gateway_uid: String,
+    /// ordered from most to least specific SNI hostname.
+    pub tls: Vec<Arc<ServerTls>>,
 }
 
-/// configuration produced by one compilation of the watched resources.
+/// logical hostname listeners sharing one transport socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocketRoutes {
+    pub listener: Listener,
+    pub hosts: BTreeMap<String, Vec<Route>>,
+}
+
+/// all sockets published together at a resource revision.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewaySnapshot {
-    pub listener: Option<Listener>,
-    pub routes: Vec<Route>,
+    pub sockets: BTreeMap<SocketAddr, SocketRoutes>,
     pub forwarding: ForwardingPolicy,
-}
-
-impl GatewaySnapshot {
-    /// address reported by socket binding and readiness checks.
-    pub fn address(&self) -> Option<SocketAddr> {
-        self.listener.as_ref().map(|listener| listener.address)
-    }
 }
 
 pub type Revision = usize;

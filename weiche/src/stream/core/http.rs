@@ -24,7 +24,8 @@ use hyper::body::Incoming;
 use router::Router;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    net::SocketAddr,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -37,7 +38,7 @@ pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error
 struct WorkerView {
     revision: Revision,
     deadline: Duration,
-    route: Option<tcp::Route<Router>>,
+    routes: BTreeMap<SocketAddr, tcp::Route<Vec<(String, Router)>>>,
 }
 
 impl WorkerView {
@@ -47,7 +48,7 @@ impl WorkerView {
     )]
     fn prepare(
         snapshot: &PublishedSnapshot,
-        previous: Option<&tcp::Route<Router>>,
+        previous: Option<&WorkerView>,
     ) -> anyhow::Result<(Self, HashSet<EndpointKey>)> {
         let gateway = &snapshot.gateway;
         anyhow::ensure!(
@@ -56,60 +57,76 @@ impl WorkerView {
         );
         let mut clusters: HashMap<_, _> = previous
             .into_iter()
-            .flat_map(|route| route.target.routes())
+            .flat_map(|view| view.routes.values())
+            .flat_map(|socket| &socket.target)
+            .flat_map(|(_, router)| router.routes())
             .flat_map(|route| &route.action.backends)
             .filter_map(|(_, target)| target.as_ref().ok())
             .map(|c| (c.spec.clone(), c.clone()))
             .collect();
         let mut endpoints = HashSet::new();
-        let router = Router::compile(gateway.routes.iter().map(|route| {
-            let backends = route
-                .action
-                .backends
-                .iter()
-                .map(|(weight, target)| {
-                    (
-                        *weight,
-                        target
-                            .as_ref()
-                            .map(|spec| {
-                                endpoints.extend(spec.endpoints.iter().map(|&address| {
-                                    EndpointKey {
-                                        address,
-                                        protocol: spec.protocol,
-                                        tls: spec.tls.clone(),
-                                    }
-                                }));
-                                clusters
-                                    .entry(spec.clone())
-                                    .or_insert_with(|| {
-                                        Rc::new(Cluster::new(spec.clone()))
+        let mut routes = BTreeMap::new();
+        for (address, socket) in &gateway.sockets {
+            let mut hosts = Vec::new();
+            for (hostname, rules) in &socket.hosts {
+                let router = Router::compile(rules.iter().map(|route| {
+                    let backends = route
+                        .action
+                        .backends
+                        .iter()
+                        .map(|(weight, target)| {
+                            (
+                                *weight,
+                                target
+                                    .as_ref()
+                                    .map(|spec| {
+                                        endpoints.extend(spec.endpoints.iter().map(
+                                            |&address| EndpointKey {
+                                                address,
+                                                protocol: spec.protocol,
+                                                tls: spec.tls.clone(),
+                                            },
+                                        ));
+                                        clusters
+                                            .entry(spec.clone())
+                                            .or_insert_with(|| {
+                                                Rc::new(Cluster::new(spec.clone()))
+                                            })
+                                            .clone()
                                     })
-                                    .clone()
-                            })
-                            .map_err(|e| *e),
-                    )
-                })
-                .collect();
-            let action = RouteAction {
-                backends,
-                headers: route.action.headers.clone(),
-                redirect: route.action.redirect.clone(),
-            };
-            Route {
-                hostname: route.hostname.clone(),
-                http: route.http.clone(),
-                action,
+                                    .map_err(|e| *e),
+                            )
+                        })
+                        .collect();
+                    let action = RouteAction {
+                        backends,
+                        headers: route.action.headers.clone(),
+                        redirect: route.action.redirect.clone(),
+                    };
+                    Route {
+                        hostname: route.hostname.clone(),
+                        http: route.http.clone(),
+                        action,
+                    }
+                }));
+                hosts.push((hostname.clone(), router));
             }
-        }));
+            hosts.sort_by_key(|(name, _)| {
+                std::cmp::Reverse((
+                    !name.is_empty() && !name.starts_with("*."),
+                    name.len(),
+                ))
+            });
+            routes.insert(
+                *address,
+                tcp::Route { listener: socket.listener.clone(), target: hosts },
+            );
+        }
         Ok((
             Self {
                 revision: snapshot.revision,
                 deadline: gateway.forwarding.response_header_timeout,
-                route: gateway
-                    .listener
-                    .clone()
-                    .map(|listener| tcp::Route { listener, target: router }),
+                routes,
             },
             endpoints,
         ))
@@ -144,16 +161,11 @@ impl ProxyService {
         }
         // preparation cannot mutate the live view or retire its connections.
         let (next, endpoints) =
-            WorkerView::prepare(&snapshot, self.view.borrow().route.as_ref())?;
+            WorkerView::prepare(&snapshot, Some(&self.view.borrow()))?;
         // commit has no await or fallible operation; requests observe one complete local view.
         self.pool.reconcile(&endpoints);
         *self.view.borrow_mut() = next;
         Ok(snapshot.revision)
-    }
-
-    /// capture the complete listener at TCP accept, before the first handshake poll.
-    pub fn listener(&self) -> Option<Listener> {
-        self.view.borrow().route.as_ref().map(|route| route.listener.clone())
     }
 
     pub fn close(&self) {
@@ -175,17 +187,23 @@ impl ProxyService {
         // release the worker-local routing view before starting I/O.
         let view = self.view.borrow();
         let router = view
-            .route
-            .as_ref()
+            .routes
+            .get(&listener.address)
             .and_then(|route| route.find(listener))
+            .and_then(|hosts| {
+                hosts.iter().find(|(name, _)| {
+                    super::super::super::ir::hostname_matches(name, &host)
+                })
+            })
+            .map(|(_, router)| router)
             .ok_or(ProxyError::NoRoute)?;
         let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
         if let Some((status, hostname)) = &action.redirect {
-            let scheme = if listener.tls.is_some() { "https" } else { "http" };
+            let scheme = if !listener.tls.is_empty() { "https" } else { "http" };
             let host = hostname.as_deref().unwrap_or_else(|| authority.host());
-            let port = listener.address.port();
+            let port = listener.port;
             let suffix = if (scheme == "http" && port == 80)
                 || (scheme == "https" && port == 443)
             {
@@ -257,7 +275,7 @@ impl ProxyService {
             &mut request,
             authority,
             endpoint.key.protocol,
-            listener.tls.is_some(),
+            !listener.tls.is_empty(),
         );
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
