@@ -16,7 +16,11 @@ use k8s_openapi::api::{
 use kube::{
     Api, Client, ResourceExt,
     api::{Patch, PatchParams},
-    runtime::{WatchStreamExt, watcher},
+    runtime::{
+        WatchStreamExt,
+        reflector::{self, ObjectRef},
+        watcher,
+    },
 };
 use serde_json::json;
 use std::{collections::BTreeSet, fs, io, net::SocketAddr, time::Duration};
@@ -105,17 +109,21 @@ pub async fn run(
     ensure!(authorized(&bindings).await?, "gateway namespace authorization withdrawn");
     let reports = Api::<ConfigMap>::namespaced(client.clone(), ns);
     let secrets = Api::<Secret>::namespaced(client.clone(), ns);
-    let stream = watcher(
-        secrets,
-        watcher::Config::default().fields(&format!("metadata.name={name}")),
+    let (store, writer) = reflector::store();
+    let stream = reflector::reflector(
+        writer,
+        watcher(
+            secrets,
+            watcher::Config::default().fields(&format!("metadata.name={name}")),
+        ),
     )
     .default_backoff();
     pin_mut!(stream);
+    let secret_ref = ObjectRef::new(&name).within(ns);
     let mut desired: Option<Desired> = None;
     let mut local = None;
     let mut reported = None;
     let mut refresh_due = false;
-    let mut relisted = false;
     let mut refresh = tokio::time::interval(Duration::from_secs(15));
     let shutdown = super::shutdown();
     let stop = stopped(stop);
@@ -157,24 +165,26 @@ pub async fn run(
                 }
             }
             event = stream.next() => match event.context("snapshot watch stopped")? {
-                Ok(watcher::Event::Apply(s) | watcher::Event::InitApply(s)) => {
-                    relisted = true;
-                    match Desired::apply(&s, &mut tx) {
-                        Ok(next) => { desired = Some(next); }
+                Ok(
+                    watcher::Event::Apply(_)
+                    | watcher::Event::Delete(_)
+                    | watcher::Event::InitDone,
+                ) => match store.get(&secret_ref) {
+                    Some(secret) => match Desired::apply(&secret, &mut tx) {
+                        Ok(next) => desired = Some(next),
                         Err(e) => {
-                            tracing::error!(error=%e, secret=%s.name_any(), "invalid proxy snapshot");
+                            tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot");
                             desired = None;
                             tx.publish(GatewaySnapshot::default());
                         }
+                    },
+                    None => {
+                        desired = None;
+                        tx.publish(GatewaySnapshot::default());
                     }
-                }
-                Ok(watcher::Event::Init) => relisted = false,
-                Ok(watcher::Event::InitDone) if relisted => {}
-                Ok(watcher::Event::Delete(_) | watcher::Event::InitDone) => {
-                    desired = None;
-                    tx.publish(GatewaySnapshot::default());
-                }
-                Err(e) => tracing::warn!(error=%e, "snapshot watch interrupted"),
+                },
+                Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
+                Err(e) => tracing::warn!(error = %e, "snapshot watch interrupted"),
             }
         }
     }
