@@ -3,10 +3,10 @@ TYPST_CMD := $(TYPST) c --root . --features html
 
 SITE_TMPLS := page.typ meta.typ nav.typ
 
-build/index.html: index.typ $(SITE_TMPLS) mk/typst.mk $(MODE_STAMP)
+build/index.html: src/index.typ $(SITE_TMPLS) mk/typst.mk $(MODE_STAMP)
 	$(call log,TYP,$<)
 	$(Q)$(MKDIR_P) $(@D)
-	$(Q)$(call run,$(TYPST_CMD) --input src=index.typ $< $@)
+	$(Q)$(call run,$(TYPST_CMD) --input src=$< $< $@)
 ifeq ($(MINIFY),y)
 	$(call log,MINI,$@)
 	$(Q)$(call run,$(MINIFY_CMD) -o $@ $@)

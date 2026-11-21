@@ -1,5 +1,5 @@
-#import "page.typ": page
-#import "meta.typ": site
+#import "/page.typ": page
+#import "/meta.typ": site
 #show: page.with(
   title: site.name + " — A Kubernetes gateway, built in Rust",
   main-class: "landing",

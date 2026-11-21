@@ -21,7 +21,7 @@ CP_R    := cp -r
 RM_RF   := rm -rf
 FIND    := find
 
-SRC_PAGES    := $(shell find src -type f -name index.typ | sort)
+SRC_PAGES    := $(shell find src -mindepth 2 -type f -name index.typ | sort)
 SRC_SECTIONS := $(patsubst src/%/index.typ,%,$(SRC_PAGES))
 STAGED_PAGES := $(addprefix build/,$(addsuffix /index.typ,$(SRC_SECTIONS)))
 TARGET_PAGES := $(addprefix build/,$(addsuffix /index.html,$(SRC_SECTIONS)))

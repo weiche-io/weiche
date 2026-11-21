@@ -2,9 +2,11 @@
 #import "nav.typ": banner, breadcrumbs, contents, footer
 
 #let source-path = sys.inputs.at("src", default: none)
-#let derived-path = if source-path == none or source-path == "index.typ" {
-  ""
-} else if source-path.starts-with("src/") and source-path.ends-with("index.typ") {
+#let derived-path = if (
+  source-path != none
+    and source-path.starts-with("src/")
+    and source-path.ends-with("index.typ")
+) {
   // Strip the leading "src/" (4 chars) and trailing "index.typ" (9 chars).
   source-path.slice(4, source-path.len() - 9)
 } else {

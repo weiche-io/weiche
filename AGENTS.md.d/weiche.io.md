@@ -42,12 +42,13 @@
 
 ## typst templates and pages
 
-- keep site-wide metadata in `meta.typ`, shared chrome and `context query` TOC
-  in `nav.typ`, and the shared html shell plus helpers (`page`, `article`,
-  `canvas`, lazy `html-image`) in `page.typ`.
+- keep only shared templates at `weiche.io/` root (`meta.typ` for site-wide
+  metadata, `nav.typ` for shared chrome and `context query` TOC, and `page.typ`
+  for the html shell plus `page`, `article`, `canvas`, and lazy `html-image`).
+- put all page content under `weiche.io/src/` — `src/index.typ` for the landing
+  page and `src/<section>/{index.typ, meta.typ}` alongside page-local media for
+  subpages — importing templates via root paths (`"/page.typ"`, `"/meta.typ"`)
+  and using Typst `#image(...)` so `html-image` emits lazy `<img>` tags.
 - pass `--input src=...` from `mk/typst.mk` so `page.typ` derives page URL
   paths, relative root links (`root-for`), canonical/og URLs, and GitHub source
   links automatically instead of repeating `path` in every page's `meta.typ`.
-- place each subpage under `src/<section>/{index.typ, meta.typ}` alongside any
-  page-local media, and use Typst `#image(...)` so `html-image` emits lazy
-  `<img>` tags.
