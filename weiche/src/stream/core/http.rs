@@ -200,9 +200,9 @@ impl ProxyService {
         let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
-        if let Some((status, hostname)) = &action.redirect {
+        if let Some(redirect) = &action.redirect {
             let scheme = if !listener.tls.is_empty() { "https" } else { "http" };
-            let host = hostname.as_deref().unwrap_or_else(|| authority.host());
+            let host = redirect.hostname.as_deref().unwrap_or_else(|| authority.host());
             let port = listener.port;
             let suffix = if (scheme == "http" && port == 80)
                 || (scheme == "https" && port == 443)
@@ -213,7 +213,7 @@ impl ProxyService {
             };
             let path = request.uri().path_and_query().map_or("/", |p| p.as_str());
             return Err(ProxyError::Redirect(
-                *status,
+                redirect.status,
                 format!("{scheme}://{host}{suffix}{path}"),
             ));
         }

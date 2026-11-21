@@ -1,9 +1,21 @@
 //! raw transport routing shared by TCP connections and UDP flows.
 use super::RefError;
+use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 
 /// socket namespace and Kubernetes Service port protocol.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
 pub enum Transport {
     Tcp,
     Udp,
@@ -27,7 +39,7 @@ impl Transport {
 }
 
 /// invalid targets retain their share of connection or packet rejections.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRoute {
     pub backends: Vec<(u32, Result<Vec<SocketAddr>, RefError>)>,
 }
@@ -39,7 +51,7 @@ impl StreamRoute {
 }
 
 /// keep the listener identity separate from the target set when endpoints change.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamListener {
     pub gateway_uid: String,
     pub route: Arc<StreamRoute>,

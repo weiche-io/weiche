@@ -2,7 +2,8 @@
 use super::super::ir::{StreamRoute, Transport};
 use super::{
     super::ir::{
-        Backend, ClusterSpec, HeaderChange, Http, Protocol, RefError, RouteAction, Rule,
+        Backend, ClusterSpec, HeaderChange, Http, Protocol, Redirect, RefError,
+        RouteAction, Rule,
     },
     GatewayStores,
     tls::Policies,
@@ -144,7 +145,7 @@ fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
                     302 => http::StatusCode::FOUND,
                     _ => return Err(invalid),
                 };
-                action.redirect = Some((status, r.hostname.clone()));
+                action.redirect = Some(Redirect { status, hostname: r.hostname.clone() });
             }
             _ => return Err(invalid),
         }

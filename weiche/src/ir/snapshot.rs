@@ -1,9 +1,10 @@
 //! immutable data-plane input, independent of Kubernetes objects and worker state.
 use super::{Route, ServerTls};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use std::{net::SocketAddr, time::Duration};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardingPolicy {
     /// includes pool admission, TCP connect and response headers; excludes body streaming.
     pub response_header_timeout: Duration,
@@ -16,7 +17,7 @@ impl Default for ForwardingPolicy {
 }
 
 /// socket and transport identity applied together by each worker.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listener {
     pub address: SocketAddr,
     /// advertised port may differ from the local port behind a Kubernetes Service.
@@ -28,14 +29,14 @@ pub struct Listener {
 }
 
 /// logical hostname listeners sharing one transport socket.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketRoutes {
     pub listener: Listener,
     pub hosts: BTreeMap<String, Vec<Route>>,
 }
 
 /// all sockets published together at a resource revision.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewaySnapshot {
     pub sockets: BTreeMap<SocketAddr, SocketRoutes>,
     pub streams: BTreeMap<(super::Transport, SocketAddr), super::StreamListener>,

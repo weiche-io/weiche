@@ -1,5 +1,6 @@
 //! resolved routing rules and upstreams, independent of the configuration source.
 use super::BackendTls;
+use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 
 /// rules contributed by one route, in declaration order.
@@ -16,7 +17,7 @@ pub struct Rule<P> {
 }
 
 /// one HTTP match; predicates within a match are combined with AND.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Http {
     pub path: String,
     pub exact: bool,
@@ -36,7 +37,7 @@ impl Default for Http {
 }
 
 /// membership and wire protocol shared by rules targeting the same upstream.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterSpec {
     pub endpoints: Vec<SocketAddr>,
     pub protocol: Protocol,
@@ -44,7 +45,7 @@ pub struct ClusterSpec {
 }
 
 /// supported upstream HTTP wire protocols.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Protocol {
     #[default]
     Http1,
@@ -52,7 +53,7 @@ pub enum Protocol {
 }
 
 /// why a rule cannot forward to its configured upstream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefError {
     InvalidKind,
     RefNotPermitted,

@@ -4,10 +4,11 @@ mod route;
 mod snapshot;
 mod tls;
 mod transport;
+pub mod wire;
 pub use transport::{StreamListener, StreamRoute, Transport, weighted};
 
 pub use backend::{Backend, ClusterSpec, Http, Protocol, RefError, Rule};
-pub use route::{HeaderChange, Route, RouteAction, hostname_matches};
+pub use route::{HeaderChange, Redirect, Route, RouteAction, hostname_matches};
 pub use snapshot::{
     ForwardingPolicy, GatewaySnapshot, Listener, PublishedSnapshot, Revision,
     SocketRoutes,
