@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use super::super::ir::{GatewaySnapshot, Listener, Route, RouteAction, hostname_matches};
+use super::super::ir::{GatewaySnapshot, Listener, Route, hostname_matches};
 use super::{
     GatewayStores, ResolveError,
     tls::{Policies, TlsError, listener_tls},
@@ -208,16 +208,13 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                 report.message =
                                     "route attached to the selected listener".into();
                                 for rule in backend.rules {
-                                    let action = match rule.upstream {
-                                        Ok(cluster) => {
-                                            RouteAction::Forward(Arc::new(cluster))
-                                        }
-                                        Err(error) => {
+                                    let action = rule.action;
+                                    for (_, target) in &action.backends {
+                                        if let Err(error) = target {
                                             report.resolved = false;
                                             report.refs_reason = error.reason();
-                                            RouteAction::RejectInvalidBackend
                                         }
-                                    };
+                                    }
                                     for http in rule.matches {
                                         for hostname in &hosts {
                                             result.snapshot.routes.push(Route {

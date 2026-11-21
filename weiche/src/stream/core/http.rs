@@ -4,7 +4,10 @@ mod router;
 use super::{
     super::{
         super::{
-            ir::{Listener, Protocol, PublishedSnapshot, Revision, Route, RouteAction},
+            ir::{
+                HeaderChange, Listener, Protocol, PublishedSnapshot, Revision, Route,
+                RouteAction,
+            },
             rtconf::RuntimeConfig,
         },
         up::{ConnectionPool, Endpoint, UpstreamClient},
@@ -54,32 +57,44 @@ impl WorkerView {
         let mut clusters: HashMap<_, _> = previous
             .into_iter()
             .flat_map(|route| route.target.routes())
-            .filter_map(|route| match &route.action {
-                RouteAction::Forward(cluster) => {
-                    Some((cluster.spec.clone(), cluster.clone()))
-                }
-                RouteAction::RejectInvalidBackend => None,
-            })
+            .flat_map(|route| &route.action.backends)
+            .filter_map(|(_, target)| target.as_ref().ok())
+            .map(|c| (c.spec.clone(), c.clone()))
             .collect();
         let mut endpoints = HashSet::new();
         let router = Router::compile(gateway.routes.iter().map(|route| {
-            let action = match &route.action {
-                RouteAction::Forward(spec) => {
-                    if gateway.listener.is_some() {
-                        endpoints.extend(spec.endpoints.iter().map(|&address| {
-                            EndpointKey {
-                                address,
-                                protocol: spec.protocol,
-                                tls: spec.tls.clone(),
-                            }
-                        }));
-                    }
-                    let cluster = clusters
-                        .entry(spec.clone())
-                        .or_insert_with(|| Rc::new(Cluster::new(spec.clone())));
-                    RouteAction::Forward(cluster.clone())
-                }
-                RouteAction::RejectInvalidBackend => RouteAction::RejectInvalidBackend,
+            let backends = route
+                .action
+                .backends
+                .iter()
+                .map(|(weight, target)| {
+                    (
+                        *weight,
+                        target
+                            .as_ref()
+                            .map(|spec| {
+                                endpoints.extend(spec.endpoints.iter().map(|&address| {
+                                    EndpointKey {
+                                        address,
+                                        protocol: spec.protocol,
+                                        tls: spec.tls.clone(),
+                                    }
+                                }));
+                                clusters
+                                    .entry(spec.clone())
+                                    .or_insert_with(|| {
+                                        Rc::new(Cluster::new(spec.clone()))
+                                    })
+                                    .clone()
+                            })
+                            .map_err(|e| *e),
+                    )
+                })
+                .collect();
+            let action = RouteAction {
+                backends,
+                headers: route.action.headers.clone(),
+                redirect: route.action.redirect.clone(),
             };
             Route {
                 hostname: route.hostname.clone(),
@@ -148,7 +163,7 @@ impl ProxyService {
     fn select(
         &self,
         listener: &Listener,
-        request: &Request<Incoming>,
+        request: &mut Request<Incoming>,
         authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
         if request.method() == http::Method::CONNECT
@@ -167,9 +182,57 @@ impl ProxyService {
         let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
-        let RouteAction::Forward(cluster) = action else {
-            return Err(ProxyError::InvalidBackend);
+        if let Some((status, hostname)) = &action.redirect {
+            let scheme = if listener.tls.is_some() { "https" } else { "http" };
+            let host = hostname.as_deref().unwrap_or_else(|| authority.host());
+            let port = listener.address.port();
+            let suffix = if (scheme == "http" && port == 80)
+                || (scheme == "https" && port == 443)
+            {
+                String::new()
+            } else {
+                format!(":{port}")
+            };
+            let path = request.uri().path_and_query().map_or("/", |p| p.as_str());
+            return Err(ProxyError::Redirect(
+                *status,
+                format!("{scheme}://{host}{suffix}{path}"),
+            ));
+        }
+        for change in &action.headers {
+            match change {
+                HeaderChange::Remove(k) => {
+                    request.headers_mut().remove(k);
+                }
+                HeaderChange::Add(k, v) => {
+                    request.headers_mut().append(k, v.clone());
+                }
+                HeaderChange::Set(k, v) => {
+                    request.headers_mut().insert(k, v.clone());
+                }
+            }
+        }
+        let target = match action.backends.as_slice() {
+            [(w, target)] if *w > 0 => Some(target),
+            weights => {
+                let total: u64 = weights.iter().map(|(w, _)| u64::from(*w)).sum();
+                if total == 0 {
+                    return Err(ProxyError::InvalidBackend);
+                }
+                let mut slot = fastrand::u64(0..total);
+                weights.iter().find_map(|(w, target)| {
+                    if slot < u64::from(*w) {
+                        Some(target)
+                    } else {
+                        slot -= u64::from(*w);
+                        None
+                    }
+                })
+            }
         };
+        let cluster = target
+            .and_then(|t| t.as_ref().ok())
+            .ok_or(ProxyError::InvalidBackend)?;
         let address = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
         Ok((endpoint, view.deadline))
@@ -185,7 +248,7 @@ impl ProxyService {
             Ok(authority) => authority,
             Err(error) => return Ok(error.response()),
         };
-        let (endpoint, deadline) = match self.select(listener, &request, &authority) {
+        let (endpoint, deadline) = match self.select(listener, &mut request, &authority) {
             Ok(selected) => selected,
             Err(error) => return Ok(error.response()),
         };
@@ -219,6 +282,7 @@ impl ProxyService {
 }
 
 enum ProxyError {
+    Redirect(StatusCode, String),
     UnsupportedUpgrade,
     InvalidHost,
     NoRoute,
@@ -231,6 +295,16 @@ enum ProxyError {
 impl ProxyError {
     fn response(self) -> Response<Body> {
         let (status, text) = match self {
+            Self::Redirect(status, location) => {
+                return Response::builder()
+                    .status(status)
+                    .header(header::LOCATION, location)
+                    .body(Box::pin(
+                        Full::new(Bytes::new())
+                            .map_err(|never| -> hyper::Error { never }),
+                    ) as Body)
+                    .unwrap();
+            }
             Self::UnsupportedUpgrade => (
                 StatusCode::NOT_IMPLEMENTED,
                 "HTTP upgrades and CONNECT are unsupported\n",

@@ -2673,6 +2673,7 @@ dependencies = [
  "chrono",
  "compio",
  "cyper-core",
+ "fastrand",
  "futures",
  "http",
  "http-body",

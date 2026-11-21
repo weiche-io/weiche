@@ -1,6 +1,8 @@
 //! translate watched route resources against the controller's local stores.
 use super::{
-    super::ir::{Backend, ClusterSpec, Http, Protocol, RefError, Rule},
+    super::ir::{
+        Backend, ClusterSpec, HeaderChange, Http, Protocol, RefError, RouteAction, Rule,
+    },
     GatewayStores,
     tls::Policies,
 };
@@ -48,34 +50,36 @@ impl GatewayStores {
         let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
         let rules = rules
             .iter()
-            .map(|rule| Rule {
-                matches: match &rule.matches {
-                    Some(matches) => matches.iter().map(http_match).collect(),
-                    None => vec![Http::default()],
-                },
-                upstream: resolve_backend(
-                    self,
-                    policies,
-                    namespace,
-                    rule.backend_refs.as_ref().and_then(|refs| refs.first()),
-                ),
+            .map(|rule| {
+                let mut action = filters(rule)?;
+                for backend in rule.backend_refs.iter().flatten() {
+                    action.backends.push((
+                        backend.weight.unwrap_or(1),
+                        resolve_backend(self, policies, namespace, backend)
+                            .map(std::sync::Arc::new),
+                    ));
+                }
+                Ok(Rule {
+                    matches: rule.matches.as_ref().map_or_else(
+                        || vec![Http::default()],
+                        |m| m.iter().map(http_match).collect(),
+                    ),
+                    action,
+                })
             })
-            .collect();
+            .collect::<Result<_, ResolveError>>()?;
         Ok(Backend { rules })
     }
 }
 
 fn unsupported_rule(rule: &HttpRouteRules) -> bool {
-    rule.filters.as_ref().is_some_and(|filters| !filters.is_empty())
-        || rule.retry.is_some()
+    rule.retry.is_some()
         || rule.timeouts.is_some()
-        || rule.backend_refs.as_ref().is_some_and(|refs| {
-            refs.len() > 1
-                || refs.iter().any(|backend| {
-                    backend.filters.as_ref().is_some_and(|filters| !filters.is_empty())
-                        || backend.weight.is_some_and(|weight| weight != 1)
-                })
-        })
+        || rule
+            .backend_refs
+            .iter()
+            .flatten()
+            .any(|b| b.filters.as_ref().is_some_and(|f| !f.is_empty()))
         || rule.matches.iter().flatten().any(|predicate| {
             predicate
                 .query_params
@@ -89,6 +93,54 @@ fn unsupported_rule(rule: &HttpRouteRules) -> bool {
                     matches!(header.r#type, Some(HeaderType::RegularExpression))
                 })
         })
+}
+
+fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
+    use weiche_gtwapi::v1::httproutes::HttpRouteRulesFiltersType as Kind;
+    let invalid = ResolveError::UnsupportedValue;
+    let mut action = RouteAction {
+        backends: Vec::new(),
+        headers: Vec::new(),
+        redirect: None,
+    };
+    for filter in rule.filters.iter().flatten() {
+        match filter.r#type {
+            Kind::RequestHeaderModifier => {
+                let h = filter.request_header_modifier.as_ref().ok_or(invalid)?;
+                for entry in h.set.iter().flatten() {
+                    action.headers.push(HeaderChange::Set(
+                        entry.name.parse().map_err(|_| invalid)?,
+                        entry.value.parse().map_err(|_| invalid)?,
+                    ));
+                }
+                for entry in h.add.iter().flatten() {
+                    action.headers.push(HeaderChange::Add(
+                        entry.name.parse().map_err(|_| invalid)?,
+                        entry.value.parse().map_err(|_| invalid)?,
+                    ));
+                }
+                for name in h.remove.iter().flatten() {
+                    action
+                        .headers
+                        .push(HeaderChange::Remove(name.parse().map_err(|_| invalid)?));
+                }
+            }
+            Kind::RequestRedirect => {
+                let r = filter.request_redirect.as_ref().ok_or(invalid)?;
+                if r.path.is_some() || r.scheme.is_some() || r.port.is_some() {
+                    return Err(invalid);
+                }
+                let status = match r.status_code.unwrap_or(302) {
+                    301 => http::StatusCode::MOVED_PERMANENTLY,
+                    302 => http::StatusCode::FOUND,
+                    _ => return Err(invalid),
+                };
+                action.redirect = Some((status, r.hostname.clone()));
+            }
+            _ => return Err(invalid),
+        }
+    }
+    Ok(action)
 }
 
 fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
@@ -141,9 +193,8 @@ fn resolve_backend(
     stores: &GatewayStores,
     policies: &mut Policies,
     namespace: &str,
-    backend: Option<&HttpRouteRulesBackendRefs>,
+    backend: &HttpRouteRulesBackendRefs,
 ) -> Result<ClusterSpec, RefError> {
-    let backend = backend.ok_or(RefError::BackendNotFound)?;
     if !backend.group.as_deref().unwrap_or("").is_empty()
         || backend.kind.as_deref().unwrap_or("Service") != "Service"
     {

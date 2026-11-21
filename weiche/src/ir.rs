@@ -5,7 +5,7 @@ mod snapshot;
 mod tls;
 
 pub use backend::{Backend, ClusterSpec, Http, Protocol, RefError, Rule};
-pub use route::{Route, RouteAction, hostname_matches};
+pub use route::{HeaderChange, Route, RouteAction, hostname_matches};
 pub use snapshot::{
     ForwardingPolicy, GatewaySnapshot, Listener, PublishedSnapshot, Revision,
 };

@@ -14,6 +14,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 compio = { version = "0.20.0-beta.1", features = ["net", "time", "ring"] }
 cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "dde9bdc7787effd98c4dff18b8b58970ec10b5f6", default-features = false }
+fastrand = "2"
 futures = "0.3"
 http = "1"
 http-body-util = "0.1"

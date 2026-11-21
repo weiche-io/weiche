@@ -12,7 +12,7 @@ pub struct Backend<P> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule<P> {
     pub matches: Vec<P>,
-    pub upstream: Result<ClusterSpec, RefError>,
+    pub action: super::RouteAction,
 }
 
 /// one HTTP match; predicates within a match are combined with AND.

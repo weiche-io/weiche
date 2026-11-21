@@ -1,12 +1,22 @@
 //! route definitions shared by the control plane and protocol filters.
-use super::{ClusterSpec, Http};
+use super::{ClusterSpec, Http, RefError};
+use http::{HeaderName, HeaderValue, StatusCode};
 use std::sync::Arc;
 
 /// action selected after a route matches.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteAction<T = Arc<ClusterSpec>> {
-    Forward(T),
-    RejectInvalidBackend,
+pub struct RouteAction<T = Arc<ClusterSpec>> {
+    pub backends: Vec<(u32, Result<T, RefError>)>,
+    pub headers: Vec<HeaderChange>,
+    pub redirect: Option<(StatusCode, Option<String>)>,
+}
+
+/// validated request transformations in rule order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderChange {
+    Set(HeaderName, HeaderValue),
+    Add(HeaderName, HeaderValue),
+    Remove(HeaderName),
 }
 
 /// resolved HTTP match and its forwarding action.
