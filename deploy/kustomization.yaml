@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../demo
+  - services.yaml
+patches:
+  - target:
+      kind: Deployment
+      name: weiche
+    patch: |-
+      - op: add
+        path: /spec/strategy
+        value: {type: Recreate}
+      - op: remove
+        path: /spec/template/spec/containers/0/readinessProbe
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: WEICHE_MANAGE_GATEWAYS
+            value: "true"
+          - name: WEICHE_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+  - patch: |-
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: weiche
+        namespace: weiche-demo
+      $patch: delete
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: weiche
+        namespace: weiche-demo
+      $patch: delete
