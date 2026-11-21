@@ -15,9 +15,15 @@
   })
 }
 
-#let footer(root) = html.footer(class: "site-footer wrap", {
+#let footer(root, source-path: none) = html.footer(class: "site-footer wrap", {
   html.a(class: "footer-brand", href: root, site.name)
   html.nav(aria-label: "Project links", {
+    let source = if source-path == none {
+      site.repository
+    } else {
+      site.repository + "/blob/" + site.source-ref + "/weiche.io/" + source-path
+    }
+    html.a(href: source)[Source]
     html.a(href: root + "weiche.svg")[Project logo]
     html.a(href: site.repository + "/issues")[Issues]
   })
