@@ -46,7 +46,7 @@ jobs:
           kind load docker-image localhost/weiche:spec
           kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
           kubectl wait --for=condition=Established crd --all --timeout=2m
-          kubectl apply -f test/spec
+          kubectl apply -f test/weiche.yaml
           kubectl -n weiche-spec rollout status deployment/weiche --timeout=2m
           kubectl wait --for=condition=Accepted gatewayclass/weiche --timeout=2m
       - name: Run Gateway API Core profiles
