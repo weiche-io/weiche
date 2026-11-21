@@ -162,12 +162,12 @@ impl ProxyService {
         self.pool.close();
     }
 
-    fn select(
+    fn route_request(
         &self,
         listener: &Binding,
         request: &mut Request<Incoming>,
-        authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
+        let authority = normalize_authority(request)?;
         if request.method() == http::Method::CONNECT
             || request.headers().contains_key(header::UPGRADE)
         {
@@ -216,12 +216,18 @@ impl ProxyService {
                 }
             }
         }
+        let authority = if action.headers.is_empty() {
+            authority
+        } else {
+            host_authority(request.headers())?
+        };
         let target = super::super::super::ir::weighted(&action.backends);
         let cluster = target
             .and_then(|t| t.as_ref().ok())
             .ok_or(ProxyError::InvalidBackend)?;
         let address = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
+        prepare_request(request, authority, endpoint.key.protocol, listener.tls)?;
         Ok((endpoint, view.deadline))
     }
 
@@ -231,20 +237,11 @@ impl ProxyService {
         listener: &Binding,
         mut request: Request<Incoming>,
     ) -> Result<Response<Body>, !> {
-        let authority = match normalize_authority(&mut request) {
-            Ok(authority) => authority,
-            Err(error) => return Ok(error.response()),
-        };
-        let (endpoint, deadline) = match self.select(listener, &mut request, &authority) {
+        let downstream_version = request.version();
+        let (endpoint, deadline) = match self.route_request(listener, &mut request) {
             Ok(selected) => selected,
             Err(error) => return Ok(error.response()),
         };
-        let downstream_version = request.version();
-        if let Err(error) =
-            prepare_request(&mut request, authority, endpoint.key.protocol, listener.tls)
-        {
-            return Ok(error.response());
-        }
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
             Ok(Ok(response)) => {
@@ -325,40 +322,38 @@ fn full_body(bytes: Bytes) -> Body {
     Box::pin(Full::new(bytes).map_err(|never| -> hyper::Error { never }))
 }
 
-fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, ProxyError> {
-    let mut hosts = request.headers().get_all(header::HOST).iter();
-    let host = hosts
-        .next()
-        .map(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|host| host.parse::<Authority>().ok())
-                .ok_or(ProxyError::InvalidHost)
-        })
-        .transpose()?;
-    if hosts.next().is_some() {
+/// parse the single Host field used by HTTP/1 or supplied by a route filter.
+fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let value = hosts.next().ok_or(ProxyError::InvalidHost)?;
+    let authority =
+        Authority::try_from(value.as_bytes()).map_err(|_| ProxyError::InvalidHost)?;
+    let host = authority.host();
+    let port = authority.as_str().strip_prefix(host).ok_or(ProxyError::InvalidHost)?;
+    if hosts.next().is_some()
+        || host.is_empty()
+        || authority.as_str().contains(['@', ','])
+        || (!port.is_empty() && (!port.starts_with(':') || authority.port().is_none()))
+    {
         return Err(ProxyError::InvalidHost);
     }
-    let authority = match (request.uri().authority(), host) {
-        (Some(authority), host) => {
-            if host.as_ref().is_some_and(|host| host != authority) {
-                return Err(ProxyError::InvalidHost);
-            }
-            authority.clone()
-        }
-        (None, Some(host)) => host,
-        (None, None) => return Err(ProxyError::InvalidHost),
-    };
-    if authority.host().is_empty() || authority.as_str().contains('@') {
-        return Err(ProxyError::InvalidHost);
-    }
-    // expose the same Host field to HTTPRoute header matches for both protocols.
-    request
-        .headers_mut()
-        .entry(header::HOST)
-        .or_insert_with(|| authority.as_str().parse().unwrap());
     Ok(authority)
+}
+
+/// expose :authority to header matches and reject conflicting downstream identities.
+fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, ProxyError> {
+    if !request.headers().contains_key(header::HOST)
+        && let Some(authority) = request.uri().authority()
+    {
+        let value = HeaderValue::from_str(authority.as_str())
+            .map_err(|_| ProxyError::InvalidHost)?;
+        request.headers_mut().insert(header::HOST, value);
+    }
+    let host = host_authority(request.headers())?;
+    if request.uri().authority().is_some_and(|authority| authority != &host) {
+        return Err(ProxyError::InvalidHost);
+    }
+    Ok(host)
 }
 
 fn prepare_request(
@@ -380,16 +375,18 @@ fn prepare_request(
             .headers_mut()
             .insert(header::TE, http::HeaderValue::from_static("trailers"));
     }
-    // the route and both wire formats use the same authority; never substitute the backend IP.
-    request
-        .headers_mut()
-        .insert(header::HOST, authority.as_str().parse().unwrap());
     let mut uri = request.uri().clone().into_parts();
     uri.path_and_query
         .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
     match protocol {
         Protocol::Http1 => {
             *request.version_mut() = Version::HTTP_11;
+            // restore the filtered Host even if Connection nominated it for removal.
+            if !request.headers().contains_key(header::HOST) {
+                let host = HeaderValue::from_str(authority.as_str())
+                    .map_err(|_| ProxyError::InvalidHost)?;
+                request.headers_mut().insert(header::HOST, host);
+            }
             uri.scheme = None;
             uri.authority = None;
             if trailers {
