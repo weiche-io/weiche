@@ -283,7 +283,7 @@ async fn update_gateway(
             condition("Accepted",report.accepted,report.reason,&report.message,generation),
             condition("Programmed",bound,if bound {"Programmed"}else{"Pending"},"worker socket programming",generation),
             condition("ResolvedRefs",error.is_none(),error.map_or("ResolvedRefs",|e|e.reason),error.map_or("listener references resolved",|e| &e.message),generation),
-            condition("Conflicted",report.reason=="Conflicted",if report.reason=="Conflicted" {"HostnameConflict"}else{"NoConflicts"},"listener distinctness",generation)
+            condition("Conflicted",report.conflict.is_some(),report.conflict.unwrap_or("NoConflicts"),"listener distinctness",generation)
         ],previous.and_then(|v|v.get("conditions")))}));
     }
     desired["listeners"] = json!(statuses);

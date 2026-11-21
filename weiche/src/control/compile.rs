@@ -1,4 +1,4 @@
-//! compile attached HTTP routes independently for each listener.
+//! compile attached routes independently for each listener.
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -93,6 +93,7 @@ pub struct Compiled {
     pub certificate_error: Option<TlsError>,
     pub address: SocketAddr,
     pub tls: Option<Arc<super::super::ir::ServerTls>>,
+    pub conflict: Option<&'static str>,
     pub supported_kind: Option<&'static str>,
     pub stream: Option<StreamRoute>,
     pub transport: Transport,
@@ -131,6 +132,7 @@ pub fn compile(
         certificate_error: None,
         address,
         tls: None,
+        conflict: None,
         supported_kind,
         transport,
         stream: None,
@@ -140,13 +142,22 @@ pub fn compile(
         reason: "Invalid",
         message: "selected Gateway or listener is unavailable".into(),
     };
-    let conflict = gateway.spec.listeners.iter().any(|other| {
-        other.name != l.name
-            && other.port == l.port
-            && Transport::for_protocol(&other.protocol) == transport
-            && (other.protocol != l.protocol || other.hostname == l.hostname)
+    result.conflict = gateway.spec.listeners.iter().find_map(|other| {
+        if other.name == l.name
+            || other.port != l.port
+            || Transport::for_protocol(&other.protocol) != transport
+        {
+            return None;
+        }
+        if other.protocol != l.protocol || raw {
+            Some("ProtocolConflict")
+        } else if other.hostname == l.hostname {
+            Some("HostnameConflict")
+        } else {
+            None
+        }
     });
-    if conflict && route_kind.is_some() {
+    if result.conflict.is_some() && route_kind.is_some() {
         result.reason = "Conflicted";
         result.message =
             "listeners have conflicting protocols or hostnames on this port".into();
@@ -158,7 +169,7 @@ pub fn compile(
             result.reason = "Accepted";
             result.message = format!("{} listener is valid", l.protocol);
         } else {
-            result.message="raw transport listeners require an empty hostname and no TLS configuration".into();
+            result.message = "raw transport listeners require an empty hostname and no TLS configuration".into();
         }
     } else {
         match listener_tls(stores, &namespace, l) {
