@@ -26,7 +26,6 @@ SRC_SECTIONS := $(patsubst src/%/index.typ,%,$(SRC_PAGES))
 SRC_META     := $(patsubst %,src/%/meta.typ,$(SRC_SECTIONS))
 STAGED_PAGES := $(addprefix build/,$(addsuffix /index.typ,$(SRC_SECTIONS)))
 TARGET_PAGES := $(addprefix build/,$(addsuffix /index.html,$(SRC_SECTIONS)))
-TRASH_COUNT  = $(words $(shell [ -d build ] && find build \( -name '*.bib' -o -name '*.typ' -o -name '.mode-*' \) 2>/dev/null))
 
 include mk/assets.mk
 include mk/typst.mk
@@ -80,8 +79,12 @@ serve: build
 	$(Q)python3 -m http.server -b ::1 $(PORT) --directory build
 
 clean:
-	$(call log,RM,$(TRASH_COUNT) intermediates)
-	$(Q)if [ -d build ]; then $(FIND) build \( -name '*.bib' -o -name '*.typ' -o -name '.mode-*' \) -delete; fi
+	$(Q)if [ -d build ]; then \
+		$(FIND) build \( -name '*.bib' -o -name '*.typ' -o -name '.mode-*' \) | sort | while IFS= read -r f; do \
+			printf '%-6s %s\n' RM "$$f"; \
+			rm -f "$$f"; \
+		done; \
+	fi
 
 distclean:
 	$(call log,RM,build)
