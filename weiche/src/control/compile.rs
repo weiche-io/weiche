@@ -1,17 +1,19 @@
-//! compile a deliberately small HTTP Gateway API subset into immutable snapshots.
+//! compile attached HTTP routes independently for each listener.
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
-use super::super::ir::{GatewaySnapshot, Listener, Route, hostname_matches};
+use super::super::ir::{Route, hostname_matches};
 use super::{
     GatewayStores, ResolveError,
     tls::{Policies, TlsError, listener_tls},
 };
 use kube::ResourceExt;
 use weiche_gtwapi::v1::{
-    gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From},
+    gateways::{
+        Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From,
+    },
     httproutes::{HttpRoute, HttpRouteParentRefs},
 };
 
@@ -23,7 +25,7 @@ pub const CONTROLLER_NAME: &str = "weiche.io/gateway-controller";
 pub struct Selection {
     pub namespace: String,
     pub gateway: String,
-    pub listener: String,
+    pub managed: bool,
     pub bind_ip: IpAddr,
 }
 
@@ -34,7 +36,8 @@ impl Selection {
             namespace: std::env::var("WEICHE_NAMESPACE")
                 .unwrap_or_else(|_| "weiche-demo".into()),
             gateway: std::env::var("WEICHE_GATEWAY").unwrap_or_else(|_| "weiche".into()),
-            listener: std::env::var("WEICHE_LISTENER").unwrap_or_else(|_| "http".into()),
+            managed: std::env::var("WEICHE_MANAGE_GATEWAYS")
+                .map_or(Ok(false), |v| v.parse())?,
             bind_ip: std::env::var("WEICHE_BIND_IP")
                 .unwrap_or_else(|_| "::".into())
                 .parse()?,
@@ -85,7 +88,10 @@ pub struct RouteReport {
 pub struct Compiled {
     pub policies: Policies,
     pub certificate_error: Option<TlsError>,
-    pub snapshot: GatewaySnapshot,
+    pub address: SocketAddr,
+    pub tls: Option<Arc<super::super::ir::ServerTls>>,
+    pub supported_http: bool,
+    pub routes: Vec<Route>,
     pub reports: Vec<RouteReport>,
     pub accepted: bool,
     pub reason: &'static str,
@@ -93,50 +99,52 @@ pub struct Compiled {
 }
 
 /// bind resolved routes to the selected listener and assemble the next snapshot.
-pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
+pub fn compile(
+    stores: &GatewayStores,
+    gateway: &Gateway,
+    l: &GatewayListeners,
+    address: SocketAddr,
+) -> Compiled {
+    let namespace = gateway.namespace().unwrap_or_default();
+    let kinds = l.allowed_routes.as_ref().and_then(|r| r.kinds.as_ref());
+    let supports = |group: Option<&str>, kind: &str| {
+        group.unwrap_or("gateway.networking.k8s.io") == "gateway.networking.k8s.io"
+            && kind == "HTTPRoute"
+    };
+    let http = matches!(l.protocol.as_str(), "HTTP" | "HTTPS");
+    let supported_http = http
+        && kinds
+            .is_none_or(|ks| ks.iter().any(|k| supports(k.group.as_deref(), &k.kind)));
     let mut result = Compiled {
         policies: Policies::default(),
         certificate_error: None,
-        snapshot: GatewaySnapshot::default(),
+        address,
+        tls: None,
+        supported_http,
+        routes: vec![],
         reports: vec![],
         accepted: false,
         reason: "Invalid",
         message: "selected Gateway or listener is unavailable".into(),
     };
-    let Some(gateway) = stores.gateways.state().into_iter().find(|g| {
-        g.namespace().as_deref() == Some(&selection.namespace)
-            && g.name_any() == selection.gateway
-            && g.metadata.deletion_timestamp.is_none()
-    }) else {
-        return result;
-    };
-    let Some(class) = stores.gateway_classes.state().into_iter().find(|c| {
-        c.name_any() == gateway.spec.gateway_class_name
-            && c.metadata.deletion_timestamp.is_none()
-    }) else {
-        return result;
-    };
-    if class.spec.controller_name != CONTROLLER_NAME {
-        return result;
-    }
-    let listener = gateway.spec.listeners.iter().find(|l| l.name == selection.listener);
-    if class.spec.parameters_ref.is_some()
-        || gateway.spec.tls.is_some()
-        || gateway.spec.listeners.len() != 1
-    {
+    let conflict = gateway.spec.listeners.iter().any(|other| {
+        other.name != l.name
+            && other.port == l.port
+            && (other.protocol != l.protocol || other.hostname == l.hostname)
+    });
+    if conflict && http {
+        result.reason = "Conflicted";
         result.message =
-            "expected one listener without class parameters or gateway-wide TLS options"
-                .into();
-    } else if let Some(l) = listener {
-        match listener_tls(stores, &selection.namespace, l) {
+            "listeners have conflicting protocols or hostnames on this port".into();
+    } else if gateway.spec.tls.is_some() {
+        result.message = "unsupported gateway-wide TLS options".into();
+    } else {
+        match listener_tls(stores, &namespace, l) {
             Ok(tls) => {
                 result.accepted = true;
                 result.reason = "Accepted";
                 result.message = format!("selected {} listener is valid", l.protocol);
-                result.snapshot.listener = Some(Listener {
-                    address: SocketAddr::new(selection.bind_ip, l.port),
-                    tls,
-                });
+                result.tls = tls;
             }
             Err(error) => {
                 result.message = error.message.clone();
@@ -148,6 +156,15 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
             }
         }
     }
+    if http
+        && kinds
+            .is_some_and(|ks| ks.iter().any(|k| !supports(k.group.as_deref(), &k.kind)))
+    {
+        result.certificate_error = Some(TlsError {
+            reason: "InvalidRouteKinds",
+            message: "listener contains unsupported Route kinds".into(),
+        });
+    }
     let mut routes = stores.http_routes.state();
     routes.sort_by_key(|r| {
         (r.metadata.creation_timestamp.clone(), r.namespace(), r.name_any())
@@ -157,9 +174,9 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
             if parent.group.as_deref().unwrap_or("gateway.networking.k8s.io")
                 != "gateway.networking.k8s.io"
                 || parent.kind.as_deref().unwrap_or("Gateway") != "Gateway"
-                || parent.name != selection.gateway
+                || parent.name != gateway.name_any()
                 || parent.namespace.as_deref().or(route.metadata.namespace.as_deref())
-                    != Some(&selection.namespace)
+                    != Some(&namespace)
             {
                 continue;
             }
@@ -172,12 +189,11 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                 refs_reason: "ResolvedRefs",
                 message: "selected listener does not match parentRef".into(),
             };
-            if result.accepted
-                && let Some(l) = listener
+            if http
                 && parent.section_name.as_deref().is_none_or(|name| name == l.name)
                 && parent.port.is_none_or(|port| port == l.port)
             {
-                if !allows_route(stores, l, &selection.namespace, &route) {
+                if !allows_route(stores, l, &namespace, &route) {
                     report.reason = "NotAllowedByListeners";
                     report.message =
                         "listener does not allow this route namespace or kind".into();
@@ -200,7 +216,8 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                         match stores.resolve_http(&route, &mut result.policies) {
                             Err(ResolveError::UnsupportedValue) => {
                                 report.reason = "UnsupportedValue";
-                                report.message = "unsupported rule: use Exact/PathPrefix, exact headers, method and one same-namespace HTTP Service backend".into();
+                                report.message =
+                                    "unsupported HTTPRoute rule field or filter".into();
                             }
                             Ok(backend) => {
                                 report.accepted = true;
@@ -217,7 +234,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                                     }
                                     for http in rule.matches {
                                         for hostname in &hosts {
-                                            result.snapshot.routes.push(Route {
+                                            result.routes.push(Route {
                                                 hostname: hostname.clone(),
                                                 http: http.clone(),
                                                 action: action.clone(),

@@ -4,7 +4,8 @@ use super::{
         routing,
         stream::{down::WorkerGroupState, stopped},
     },
-    GatewayController, Selection, compile,
+    GatewayController, Selection,
+    service::plans,
     status::update_status,
 };
 use anyhow::Context;
@@ -39,16 +40,12 @@ pub async fn run(
                 stores.services.wait_until_ready(),
                 stores.endpoint_slices.wait_until_ready()
             )?;
-            tracing::info!(namespace = %selection.namespace, gateway = %selection.gateway, listener = %selection.listener, "kubernetes caches ready");
-            let mut published = None;
+            tracing::info!(managed = selection.managed, "kubernetes caches ready");
             loop {
                 changes_rx.mark_unchanged();
-                let compiled = compile(&stores, &selection);
-                let revision = config_tx.publish(compiled.snapshot.clone());
-                if published != Some(revision) {
-                    published = Some(revision);
-                    tracing::info!(revision, bind = ?compiled.snapshot.address(), routes = compiled.snapshot.routes.len(), "published gateway snapshot");
-                }
+                let (snapshot, compiled, retry) =
+                    plans(&client, &stores, &selection).await;
+                let revision = config_tx.publish(snapshot);
                 loop {
                     let state = listener_rx.borrow_and_update().clone();
                     let status = update_status(
@@ -67,7 +64,7 @@ pub async fn run(
                         changed = listener_rx.changed() => {
                             changed.context("worker status channel closed")?;
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(500)), if status.is_err() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)), if status.is_err() || retry => break
                     }
                 }
             }

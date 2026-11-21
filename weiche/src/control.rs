@@ -1,6 +1,7 @@
 //! Kubernetes watches and their live resource caches.
 mod compile;
 mod reconcile;
+mod service;
 mod status;
 mod tls;
 mod tryfrom;
