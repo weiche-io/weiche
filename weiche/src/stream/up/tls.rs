@@ -20,5 +20,5 @@ pub async fn connect(
         protocol != Protocol::Http2 || stream.negotiated_alpn().as_deref() == Some(b"h2"),
         "backend did not negotiate h2"
     );
-    Ok(HyperStream::new_tls(stream))
+    Ok(Io::Tls(Box::new(HyperStream::new_tls(stream))))
 }

@@ -22,5 +22,7 @@ pub async fn accept(
         .iter()
         .find(|tls| hostname_matches(&tls.hostname, &host))
         .ok_or_else(|| io::Error::other("SNI does not match a listener hostname"))?;
-    Ok(HyperStream::new_tls(handshake.into_stream(tls.config()).await?))
+    Ok(Io::Tls(Box::new(HyperStream::new_tls(
+        handshake.into_stream(tls.config()).await?,
+    ))))
 }

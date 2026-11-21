@@ -5,11 +5,11 @@ use super::super::{
         rtconf::RuntimeConfig,
     },
     core::{http::ProxyService, tcp::Permit},
-    io::socket,
+    io::{Io, socket},
 };
 use super::tls;
 use compio::{net::TcpStream, runtime::time::timeout};
-use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
+use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::service::service_fn;
 use hyper_util::server::conn::auto::Builder;
 use std::{net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
@@ -56,14 +56,14 @@ impl Server {
         if *shutdown.borrow() || shutdown.has_changed().unwrap_or(true) {
             return;
         }
-        let stream = match socket(stream) {
-            Ok(stream) => stream,
-            Err(error) => {
-                tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
-                return;
-            }
-        };
         let (stream, builder) = if listener.tls {
+            let stream = match socket(stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
+                    return;
+                }
+            };
             let handshake = tokio::select! {
                 _ = shutdown.changed() => return,
                 result = timeout(self.handshake_timeout, tls::accept(stream, &certs)) => result,
@@ -87,7 +87,14 @@ impl Server {
             };
             (stream, builder)
         } else {
-            (HyperStream::new_plain(stream), self.builder.clone())
+            let stream = match Io::plain(stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
+                    return;
+                }
+            };
+            (stream, self.builder.clone())
         };
         drop(certs);
         let service = service_fn(|request| {

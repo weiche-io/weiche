@@ -8,7 +8,7 @@ use super::{
 };
 use bytes::Bytes;
 use compio::{net::TcpStream, runtime};
-use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
+use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::{
     body::{Body, Incoming},
     client::conn::{http1, http2},
@@ -62,10 +62,12 @@ impl Connector {
     }
 
     async fn open(&self, endpoint: &EndpointKey) -> anyhow::Result<Io> {
-        let socket = socket(TcpStream::connect(endpoint.address).await?)?;
+        let stream = TcpStream::connect(endpoint.address).await?;
         match &endpoint.tls {
-            Some(settings) => tls::connect(socket, settings, endpoint.protocol).await,
-            None => Ok(HyperStream::new_plain(socket)),
+            Some(settings) => {
+                tls::connect(socket(stream)?, settings, endpoint.protocol).await
+            }
+            None => Ok(Io::plain(stream)?),
         }
     }
 }
