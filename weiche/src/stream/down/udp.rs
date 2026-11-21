@@ -92,35 +92,44 @@ pub(super) async fn serve(
     let mut replies = FuturesUnordered::new();
     let mut receiving = std::pin::pin!(socket.recv_from(Vec::with_capacity(MAX_PACKET)));
     loop {
-        tokio::select! {
+        let (received, mut packet) = tokio::select! {
             biased;
-            changed=routes.changed()=>{
-                if changed.is_err(){return Ok(())}
+            changed = routes.changed() => {
+                if changed.is_err() { return Ok(()) }
                 // a new route may revoke a backend or its ReferenceGrant.
                 replies.clear();
                 flows.clear();
+                continue;
             }
-            Some(peer)=replies.next(),if !replies.is_empty()=>{flows.remove(&peer);}
-            compio::BufResult(received,mut packet)=&mut receiving=>{
-                let (len,peer)=received?;
-                packet.truncate(len);
-                if let std::collections::hash_map::Entry::Vacant(entry)=flows.entry(peer){
-                    let target=routes.borrow().select();
-                    if let Some(target)=target && let Some(permit)=admission.acquire()
-                        && let Ok(flow)=Flow::connect(target,permit).await{
-                        let flow=Rc::new(flow);
-                        replies.push(flow.clone().replies(&socket,peer,idle));
-                        entry.insert(flow);
-                    }
+            Some(peer) = replies.next(), if !replies.is_empty() => {
+                flows.remove(&peer);
+                continue;
+            }
+            compio::BufResult(received, packet) = &mut receiving => (received, packet),
+        };
+        let (len, peer) = received?;
+        packet.truncate(len);
+        // invalid backends drop their weighted share of every peer's packets.
+        // packets admitted to an established flow keep its upstream socket.
+        let target = routes.borrow().select();
+        if let Some(target) = target {
+            if let std::collections::hash_map::Entry::Vacant(entry) = flows.entry(peer)
+                && let Some(permit) = admission.acquire()
+                && let Ok(flow) = Flow::connect(target, permit).await
+            {
+                let flow = Rc::new(flow);
+                replies.push(flow.clone().replies(&socket, peer, idle));
+                entry.insert(flow);
+            }
+            if let Some(flow) = flows.get(&peer) {
+                let compio::BufResult(sent, buf) = flow.upstream.send(packet).await;
+                if sent.is_ok() {
+                    flow.active.set(Instant::now());
                 }
-                if let Some(flow)=flows.get(&peer){
-                    let compio::BufResult(sent,buf)=flow.upstream.send(packet).await;
-                    if sent.is_ok(){flow.active.set(Instant::now())}
-                    packet=buf;
-                }
-                packet.clear();
-                receiving.set(socket.recv_from(packet));
+                packet = buf;
             }
         }
+        packet.clear();
+        receiving.set(socket.recv_from(packet));
     }
 }

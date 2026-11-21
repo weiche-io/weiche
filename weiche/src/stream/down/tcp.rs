@@ -1,4 +1,4 @@
-//! downstream TCP listeners for HTTP/1 and HTTP/2.
+//! worker socket lifecycle for HTTP and transport routes.
 use super::{
     super::{
         super::{
