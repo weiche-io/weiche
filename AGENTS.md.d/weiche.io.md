@@ -13,13 +13,15 @@
 ## fonts and binary assets
 
 - never commit font files or large third-party binaries into git; keep
-  `weiche.io/assets/fonts/` ignored in `.gitignore`.
-- fetch pinned upstream font archives (such as `@fontsource` tarballs) on demand
-  in `weiche.io/mk/assets.mk` with atomic `.tmp` -> `mv` writes, and ship their
-  license files (`OFL-*.txt`) beside the served `.woff2` files in `build/fonts/`.
+  `weiche.io/assets/` strictly for tracked source assets and ignore only
+  `/build/` in `weiche.io/.gitignore`.
+- fetch pinned upstream font archives (such as `@fontsource` tarballs) directly
+  into `weiche.io/build/fonts/` in `weiche.io/mk/assets.mk` with atomic
+  `.tmp` -> `mv` writes, shipping their license files (`OFL-*.txt`) beside the
+  `.woff2` files.
 - prefer pre-subsetted `.woff2` fonts; if large or CJK fonts are ever added,
-  subset them at build time (e.g. via `pyftsubset`) rather than serving full
-  fonts.
+  fetch raw sources under `build/` (cleaned before deploy) and subset them into
+  `build/fonts/` (e.g. via `pyftsubset`) rather than serving full fonts.
 
 ## build layout and makefiles
 

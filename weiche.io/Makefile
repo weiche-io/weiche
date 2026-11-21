@@ -3,7 +3,7 @@ SHELL       := bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
 
-.PHONY: build full assets css raw-fonts fonts serve clean distclean
+.PHONY: build full assets css fonts serve clean distclean
 .DEFAULT_GOAL := build
 
 include mk/log.mk
@@ -37,9 +37,8 @@ build: assets fonts build/index.html $(TARGET_PAGES)
 full: build
 	$(Q)$(MAKE) --no-print-directory clean
 
-assets: css raw-fonts $(addprefix build/,$(ASSET_STATIC))
+assets: css $(addprefix build/,$(ASSET_STATIC))
 css: $(addprefix build/,$(ASSET_CSS))
-raw-fonts: $(addprefix assets/,$(ASSET_FONTS))
 fonts: $(addprefix build/,$(ASSET_FONTS))
 
 $(MODE_STAMP):
