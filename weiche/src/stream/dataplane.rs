@@ -77,20 +77,15 @@ impl WorkerGroup {
         }.await;
         stop.send_replace(true);
         if !local_done {
-            let local_result = local.await;
-            if result.is_ok() {
-                result = local_result;
-            }
+            result = result.and(local.await);
         }
         while let Some(done) = completed.next().await {
-            let done = done.context("worker panicked").and_then(|result| result);
-            if result.is_ok() {
-                result = done;
-            }
+            let done = done.context("worker panicked").and_then(|r| r);
+            result = result.and(done);
         }
         for thread in threads {
-            if thread.join().is_err() && result.is_ok() {
-                result = Err(anyhow::anyhow!("data-plane worker panicked"));
+            if thread.join().is_err() {
+                result = result.and(Err(anyhow::anyhow!("data-plane worker panicked")));
             }
         }
         state.send_replace(WorkerGroupState::default());

@@ -31,7 +31,7 @@ pub fn listen(address: SocketAddr) -> io::Result<TcpListener> {
 }
 
 /// run one listener on its owning compio runtime.
-pub(in super::super) async fn run(
+pub async fn run(
     id: usize,
     mut config: routing::Reader,
     runtime: Arc<RuntimeConfig>,

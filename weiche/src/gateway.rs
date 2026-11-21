@@ -31,33 +31,25 @@ pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
         .context("spawn control-plane thread")?;
     let data = group.run(stopped);
     tokio::pin!(data);
-    let mut data_done = false;
-    let mut control_done = false;
-    let mut result = tokio::select! {
-        result = &mut data => { data_done = true; result },
-        result = &mut done_rx => {
-            control_done = true;
-            result.context("control thread panicked").and_then(|result| result)
-        },
+    let (mut result, data_done, control_done) = tokio::select! {
+        result = &mut data => (result, true, false),
+        result = &mut done_rx => (
+            result.context("control thread panicked").and_then(|r| r),
+            false,
+            true,
+        ),
     };
     stop.send_replace(true);
     if !data_done {
-        let data_result = data.await;
-        if result.is_ok() {
-            result = data_result;
-        }
+        result = result.and(data.await);
     }
     if !control_done {
-        let control_result = done_rx
-            .await
-            .context("control thread panicked")
-            .and_then(|result| result);
-        if result.is_ok() {
-            result = control_result;
-        }
+        let control_result =
+            done_rx.await.context("control thread panicked").and_then(|r| r);
+        result = result.and(control_result);
     }
-    if control.join().is_err() && result.is_ok() {
-        result = Err(anyhow::anyhow!("control thread panicked"));
+    if control.join().is_err() {
+        result = result.and(Err(anyhow::anyhow!("control thread panicked")));
     }
     result
 }

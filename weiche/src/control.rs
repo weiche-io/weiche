@@ -37,9 +37,9 @@ use weiche_gtwapi::v1::{
     tcproutes::TcpRoute, udproutes::UdpRoute,
 };
 
-/// Live snapshots maintained by kube-runtime, including updates and deletions.
-/// Wait for each store's initial list before reading it. The caches are
-/// eventually consistent and do not form an atomic snapshot.
+/// live snapshots maintained by kube-runtime, including updates and deletions.
+/// wait for each store's initial list before reading it; caches are eventually
+/// consistent and do not form an atomic snapshot.
 #[derive(Clone)]
 pub struct GatewayStores {
     pub gateway_classes: Store<GatewayClass>,
@@ -57,7 +57,7 @@ pub struct GatewayStores {
 }
 
 /// maintains resource caches for the reconciliation loop.
-/// Uses reflectors directly because these watches have no per-object reconcile.
+/// uses reflectors directly because these watches have no per-object reconcile.
 pub struct GatewayController {
     stores: GatewayStores,
     watches: Vec<BoxStream<'static, ()>>,

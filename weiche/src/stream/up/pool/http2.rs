@@ -66,7 +66,8 @@ impl ConnectionPool {
     }
 }
 
-pub(super) struct Http2Connection {
+/// shared HTTP/2 upstream connection and its active stream counter.
+pub struct Http2Connection {
     transport: Connected<http2::SendRequest<Upload>>,
     slot: Slot,
     active: Cell<usize>,
@@ -74,12 +75,14 @@ pub(super) struct Http2Connection {
 }
 
 impl Http2Connection {
-    pub(super) fn expired(&self, timeout: Duration) -> bool {
+    /// check whether the connection closed or sat idle past timeout.
+    pub fn expired(&self, timeout: Duration) -> bool {
         self.transport.sender.is_closed()
             || self.idle_since().is_some_and(|since| since.elapsed() >= timeout)
     }
 
-    pub(super) fn idle_since(&self) -> Option<Instant> {
+    /// return when the last active stream finished, or None while streams are active.
+    pub fn idle_since(&self) -> Option<Instant> {
         (self.active.get() == 0).then(|| self.idle_since.get())
     }
 

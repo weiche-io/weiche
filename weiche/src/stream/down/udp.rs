@@ -82,7 +82,8 @@ impl Flow {
     }
 }
 
-pub(super) async fn serve(
+/// serve UDP flows for one bound datagram socket until routes close.
+pub async fn serve(
     socket: UdpSocket,
     mut routes: watch::Receiver<Arc<StreamRoute>>,
     admission: Arc<Admission>,

@@ -10,7 +10,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 /// select a backend on accept. existing streams keep their peer across endpoint updates.
-pub(super) async fn serve(
+pub async fn serve(
     socket: TcpListener,
     mut routes: watch::Receiver<Arc<StreamRoute>>,
     admission: Arc<Admission>,

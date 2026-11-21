@@ -12,7 +12,8 @@ use hyper_util::server::conn::auto::Builder;
 use std::{net::SocketAddr, rc::Rc, time::Duration};
 use tokio::sync::watch;
 
-pub(super) struct Server {
+/// downstream HTTP/1 and HTTP/2 server configured for one worker.
+pub struct Server {
     pub service: ProxyService,
     builder: Builder<CompioExecutor>,
     drain_timeout: Duration,

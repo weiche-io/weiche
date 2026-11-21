@@ -15,13 +15,15 @@ struct Connection {
     _slot: Slot,
 }
 
-pub(super) struct Idle {
+/// idle HTTP/1 connection waiting for reuse or expiration.
+pub struct Idle {
     connection: Connection,
-    pub(super) since: Instant,
+    pub since: Instant,
 }
 
 impl Idle {
-    pub(super) fn reusable(&self, timeout: Duration) -> bool {
+    /// check whether this idle connection is still open and within the idle timeout.
+    pub fn reusable(&self, timeout: Duration) -> bool {
         self.since.elapsed() < timeout && !self.connection.transport.sender.is_closed()
     }
 }
@@ -87,7 +89,8 @@ impl Lease {
         PooledBody::new(body, ResponseLease::Http1(self))
     }
 
-    pub(super) fn recycle(self) {
+    /// return an idle HTTP/1 connection to its endpoint pool once framing completes.
+    pub fn recycle(self) {
         if !self.endpoint.enabled.get() || self.connection.transport.sender.is_closed() {
             return;
         }
