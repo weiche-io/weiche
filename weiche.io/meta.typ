@@ -4,10 +4,15 @@
   url: "https://weiche.io",
   description: "An experimental Kubernetes gateway, built in Rust.",
   repository: "https://github.com/weiche-io/weiche",
-  source-ref: "codex",
+  source-ref: "master",
 )
 
-#let head(title: site.name, description: site.description, path: "", root: "./") = {
+#let head(
+  title: site.name,
+  description: site.description,
+  path: "",
+  root: "./",
+) = {
   html.meta(charset: "utf-8")
   html.meta(name: "viewport", content: "width=device-width, initial-scale=1")
   html.meta(name: "color-scheme", content: "light dark")
