@@ -16,14 +16,10 @@ use std::{
 
 impl Endpoint {
     pub fn retire_http2(&self, lease: &Http2Lease) {
-        let mut current = self.http2.borrow_mut();
-        if current
-            .as_ref()
-            .is_some_and(|connection| Rc::ptr_eq(connection, &lease.connection))
-        {
-            current.take();
-            self.budget.changed.notify_waiters();
-        }
+        self.http2
+            .borrow_mut()
+            .retain(|connection| !Rc::ptr_eq(connection, &lease.connection));
+        self.budget.changed.notify_waiters();
     }
 }
 
@@ -35,12 +31,15 @@ impl ConnectionPool {
         loop {
             let changed = self.watch_capacity(endpoint)?;
             endpoint.prune(self.idle_timeout);
-            let connection = endpoint.http2.borrow().clone();
-            if let Some(connection) = connection {
-                if connection.active.get() < self.max_streams {
-                    return Ok(connection.lease());
-                }
-            } else if !endpoint.connecting.get()
+            if let Some(connection) = endpoint
+                .http2
+                .borrow()
+                .iter()
+                .find(|connection| connection.active.get() < self.max_streams)
+            {
+                return Ok(connection.lease());
+            }
+            if !endpoint.connecting.get()
                 && let Some(slot) = self.try_reserve()
             {
                 // one dial per endpoint, even when many streams arrive together.
@@ -58,7 +57,7 @@ impl ConnectionPool {
                     active: Cell::new(0),
                     idle_since: Cell::new(Instant::now()),
                 });
-                *endpoint.http2.borrow_mut() = Some(connection.clone());
+                endpoint.http2.borrow_mut().push(connection.clone());
                 return Ok(connection.lease());
             }
             changed.await;
