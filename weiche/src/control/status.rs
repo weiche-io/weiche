@@ -6,11 +6,13 @@ use super::{
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
+    runtime::reflector::ObjectRef,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use weiche_gtwapi::v1::{
-    gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute,
+    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
+    gateways::Gateway, httproutes::HttpRoute,
 };
 
 fn condition(
@@ -75,6 +77,7 @@ pub async fn update_status(
     revision: Revision,
     listener: &WorkerGroupState,
 ) -> anyhow::Result<()> {
+    update_policies(client, stores, selection, compiled).await?;
     let Some(gateway) = stores.gateways.state().into_iter().find(|g| {
         g.namespace().as_deref() == Some(&selection.namespace)
             && g.name_any() == selection.gateway
@@ -98,7 +101,7 @@ pub async fn update_status(
             "Accepted",
             class_accepted,
             if class_accepted { "Accepted" } else { "InvalidParameters" },
-            "Weiche plaintext HTTP demo",
+            "Weiche HTTP gateway controller",
             class.metadata.generation,
         )],
         class_old.get("conditions"),
@@ -116,12 +119,23 @@ pub async fn update_status(
         .as_ref()
         .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let programmed =
-        compiled.accepted && listener.programmed(revision, compiled.snapshot.listener);
-    let programmed_message = listener.error.as_deref().unwrap_or(if programmed {
-        "all workers applied the gateway snapshot and bound the listener"
+        compiled.accepted && listener.programmed(revision, compiled.snapshot.address());
+    let programmed_reason = if !compiled.accepted {
+        "Invalid"
+    } else if programmed {
+        "Programmed"
     } else {
-        "waiting for all workers to apply the gateway snapshot and bind the listener"
-    });
+        "Pending"
+    };
+    let programmed_message = if !compiled.accepted {
+        &compiled.message
+    } else {
+        listener.error.as_deref().unwrap_or(if programmed {
+            "all workers applied the gateway snapshot and bound the listener"
+        } else {
+            "waiting for all workers to apply the gateway snapshot and bind the listener"
+        })
+    };
     let conditions = stamp(
         vec![
             condition(
@@ -134,7 +148,7 @@ pub async fn update_status(
             condition(
                 "Programmed",
                 programmed,
-                if programmed { "Programmed" } else { "Pending" },
+                programmed_reason,
                 programmed_message,
                 gateway.metadata.generation,
             ),
@@ -151,14 +165,15 @@ pub async fn update_status(
         .filter(|r| r.accepted)
         .map(|r| (r.route.namespace(), r.route.name_any()))
         .collect();
+    let certificate = compiled.certificate_error.as_ref();
     let listeners = if gateway.spec.listeners.iter().any(|l| l.name == selection.listener)
     {
         json!([{
             "name": selection.listener, "attachedRoutes": accepted_routes.len(),
             "supportedKinds": [{"group":"gateway.networking.k8s.io", "kind":"HTTPRoute"}],
             "conditions": stamp(vec![condition("Accepted", compiled.accepted, compiled.reason, &compiled.message, gateway.metadata.generation),
-                condition("Programmed", programmed, if programmed {"Programmed"} else {"Pending"}, programmed_message, gateway.metadata.generation),
-                condition("ResolvedRefs", true, "ResolvedRefs", "HTTP listener has no certificate references", gateway.metadata.generation)], old_listener.and_then(|l| l.get("conditions")))
+                condition("Programmed", programmed, programmed_reason, programmed_message, gateway.metadata.generation),
+                condition("ResolvedRefs", certificate.is_none(), certificate.map_or("ResolvedRefs", |e| e.reason), certificate.map_or("listener references resolved", |e| e.message.as_str()), gateway.metadata.generation)], old_listener.and_then(|l| l.get("conditions")))
         }])
     } else {
         json!([])
@@ -203,7 +218,7 @@ pub async fn update_status(
                 .find(|p| owned_parent(p) && p["parentRef"] == parent);
             parents.push(json!({"controllerName": CONTROLLER_NAME, "parentRef": parent,
                 "conditions": stamp(vec![condition("Accepted", report.accepted, report.reason, &report.message, route.metadata.generation),
-                    condition("ResolvedRefs", report.resolved, report.refs_reason, if report.resolved { "backend references resolved" } else { "backend reference is missing, unsupported or not permitted" }, route.metadata.generation)], previous.and_then(|p| p.get("conditions")))}));
+                    condition("ResolvedRefs", report.resolved, report.refs_reason, if report.resolved { "backend references resolved" } else if report.refs_reason == "InvalidBackendTLSPolicy" { "the referenced Service has an invalid BackendTLSPolicy" } else { "backend reference is missing, unsupported or not permitted" }, route.metadata.generation)], previous.and_then(|p| p.get("conditions")))}));
         }
         if parents.is_empty() && old_parents.is_empty() {
             continue;
@@ -216,6 +231,87 @@ pub async fn update_status(
             route.as_ref(),
             &old,
             json!({"parents":parents}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// reconcile this gateway's ancestor entry without overwriting other controllers' reports.
+async fn update_policies(
+    client: &Client,
+    stores: &GatewayStores,
+    selection: &Selection,
+    compiled: &Compiled,
+) -> anyhow::Result<()> {
+    for policy in stores.tls_policies.state() {
+        let old = policy
+            .status
+            .as_ref()
+            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
+        let entries = old["ancestors"].as_array().map_or(&[][..], Vec::as_slice);
+        let owned = |p: &Value| {
+            let ancestor = &p["ancestorRef"];
+            p["controllerName"] == CONTROLLER_NAME
+                && ancestor["name"] == selection.gateway
+                && ancestor["namespace"] == selection.namespace
+                && ancestor["kind"] == "Gateway"
+                && ancestor["group"] == "gateway.networking.k8s.io"
+        };
+        let previous = entries.iter().find(|entry| owned(entry));
+        let report = compiled.policies.reports.get(&ObjectRef::from_obj(policy.as_ref()));
+        if previous.is_none() && report.is_none() {
+            continue;
+        }
+        let mut ancestors: Vec<_> =
+            entries.iter().filter(|entry| !owned(entry)).cloned().collect();
+        if let Some(report) = report {
+            let error = report.as_ref().err();
+            let refs_error = error.filter(|e| {
+                matches!(
+                    e.reason,
+                    "InvalidCACertificateRef" | "InvalidKind" | "TargetNotFound"
+                )
+            });
+            let reason = if refs_error.is_some_and(|e| e.reason != "TargetNotFound") {
+                "NoValidCACertificate"
+            } else {
+                error.map_or("Accepted", |e| e.reason)
+            };
+            let message =
+                error.map_or("backend TLS policy applied", |e| e.message.as_str());
+            let generation = policy.metadata.generation;
+            let conditions = stamp(
+                vec![
+                    condition("Accepted", error.is_none(), reason, message, generation),
+                    condition(
+                        "ResolvedRefs",
+                        refs_error.is_none(),
+                        refs_error.map_or("ResolvedRefs", |e| e.reason),
+                        refs_error
+                            .map_or("policy references resolved", |e| e.message.as_str()),
+                        generation,
+                    ),
+                ],
+                previous.and_then(|entry| entry.get("conditions")),
+            );
+            ancestors.push(json!({
+                "ancestorRef": {
+                    "group": "gateway.networking.k8s.io", "kind": "Gateway",
+                    "name": selection.gateway, "namespace": selection.namespace
+                },
+                "controllerName": CONTROLLER_NAME,
+                "conditions": conditions
+            }));
+        }
+        patch_status(
+            Api::<BackendTlsPolicy>::namespaced(
+                client.clone(),
+                &policy.namespace().unwrap_or_default(),
+            ),
+            policy.as_ref(),
+            &old,
+            json!({"ancestors":ancestors}),
         )
         .await?;
     }

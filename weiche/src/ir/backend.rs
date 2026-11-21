@@ -1,5 +1,6 @@
 //! resolved routing rules and upstreams, independent of the configuration source.
-use std::net::SocketAddr;
+use super::BackendTls;
+use std::{net::SocketAddr, sync::Arc};
 
 /// rules contributed by one route, in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl Default for Http {
 pub struct ClusterSpec {
     pub endpoints: Vec<SocketAddr>,
     pub protocol: Protocol,
+    pub tls: Option<Arc<BackendTls>>,
 }
 
 /// supported upstream HTTP wire protocols.
@@ -56,4 +58,5 @@ pub enum RefError {
     RefNotPermitted,
     BackendNotFound,
     UnsupportedProtocol,
+    InvalidTlsPolicy,
 }

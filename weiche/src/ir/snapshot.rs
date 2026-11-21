@@ -1,5 +1,6 @@
 //! immutable data-plane input, independent of Kubernetes objects and worker state.
-use super::Route;
+use super::{Route, ServerTls};
+use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,11 +15,27 @@ impl Default for ForwardingPolicy {
     }
 }
 
+/// socket and transport identity applied together by each worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listener {
+    pub address: SocketAddr,
+    /// present when the listener terminates HTTPS.
+    pub tls: Option<Arc<ServerTls>>,
+}
+
+/// configuration produced by one compilation of the watched resources.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewaySnapshot {
-    pub listener: Option<SocketAddr>,
+    pub listener: Option<Listener>,
     pub routes: Vec<Route>,
     pub forwarding: ForwardingPolicy,
+}
+
+impl GatewaySnapshot {
+    /// address reported by socket binding and readiness checks.
+    pub fn address(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().map(|listener| listener.address)
+    }
 }
 
 pub type Revision = usize;

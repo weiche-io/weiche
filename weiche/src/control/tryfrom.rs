@@ -2,6 +2,7 @@
 use super::{
     super::ir::{Backend, ClusterSpec, Http, Protocol, RefError, Rule},
     GatewayStores,
+    tls::Policies,
 };
 use kube::{ResourceExt, runtime::reflector::ObjectRef};
 use std::net::{IpAddr, SocketAddr};
@@ -28,6 +29,17 @@ impl Resolve<HttpRoute> for GatewayStores {
     type Output = Backend<Http>;
 
     fn resolve(&self, route: &HttpRoute) -> Result<Self::Output, ResolveError> {
+        self.resolve_http(route, &mut Policies::default())
+    }
+}
+
+impl GatewayStores {
+    /// retain policy status for the Service ports used by accepted routes.
+    pub(super) fn resolve_http(
+        &self,
+        route: &HttpRoute,
+        policies: &mut Policies,
+    ) -> Result<Backend<Http>, ResolveError> {
         let rules = route.spec.rules.as_deref().unwrap_or_default();
         if rules.iter().any(unsupported_rule) {
             return Err(ResolveError::UnsupportedValue);
@@ -43,6 +55,7 @@ impl Resolve<HttpRoute> for GatewayStores {
                 },
                 upstream: resolve_backend(
                     self,
+                    policies,
                     namespace,
                     rule.backend_refs.as_ref().and_then(|refs| refs.first()),
                 ),
@@ -117,6 +130,7 @@ impl RefError {
             Self::InvalidKind => "InvalidKind",
             Self::RefNotPermitted => "RefNotPermitted",
             Self::BackendNotFound => "BackendNotFound",
+            Self::InvalidTlsPolicy => "InvalidBackendTLSPolicy",
             Self::UnsupportedProtocol => "UnsupportedProtocol",
         }
     }
@@ -125,6 +139,7 @@ impl RefError {
 /// resolve a Service backend into a validated cluster or a Gateway API status reason.
 fn resolve_backend(
     stores: &GatewayStores,
+    policies: &mut Policies,
     namespace: &str,
     backend: Option<&HttpRouteRulesBackendRefs>,
 ) -> Result<ClusterSpec, RefError> {
@@ -155,11 +170,20 @@ fn resolve_backend(
             })
         })
         .ok_or(RefError::BackendNotFound)?;
+    // https and h2 require an authenticated transport; h2c explicitly uses cleartext.
     let protocol = match port.app_protocol.as_deref() {
-        None | Some("http" | "kubernetes.io/http") => Protocol::Http1,
-        Some("kubernetes.io/h2c") => Protocol::Http2,
+        None | Some("http" | "kubernetes.io/http" | "https") => Protocol::Http1,
+        Some("kubernetes.io/h2c" | "h2") => Protocol::Http2,
         _ => return Err(RefError::UnsupportedProtocol),
     };
+    let tls =
+        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol)?;
+    match (port.app_protocol.as_deref(), &tls) {
+        (Some("https" | "h2"), None) | (Some("kubernetes.io/h2c"), Some(_)) => {
+            return Err(RefError::UnsupportedProtocol);
+        }
+        _ => {}
+    }
     let mut endpoints = vec![];
     for slice in stores.endpoint_slices.state() {
         if slice.namespace().as_deref() != Some(namespace)
@@ -199,5 +223,5 @@ fn resolve_backend(
     }
     endpoints.sort_unstable();
     endpoints.dedup();
-    Ok(ClusterSpec { endpoints, protocol })
+    Ok(ClusterSpec { endpoints, protocol, tls })
 }

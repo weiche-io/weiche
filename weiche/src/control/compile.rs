@@ -4,8 +4,11 @@ use std::{
     sync::Arc,
 };
 
-use super::super::ir::{GatewaySnapshot, Route, RouteAction, hostname_matches};
-use super::{GatewayStores, Resolve, ResolveError};
+use super::super::ir::{GatewaySnapshot, Listener, Route, RouteAction, hostname_matches};
+use super::{
+    GatewayStores, ResolveError,
+    tls::{Policies, TlsError, listener_tls},
+};
 use kube::ResourceExt;
 use weiche_gtwapi::v1::{
     gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From},
@@ -80,6 +83,8 @@ pub struct RouteReport {
 
 /// data plane snapshot and corresponding control plane status.
 pub struct Compiled {
+    pub policies: Policies,
+    pub certificate_error: Option<TlsError>,
     pub snapshot: GatewaySnapshot,
     pub reports: Vec<RouteReport>,
     pub accepted: bool,
@@ -90,6 +95,8 @@ pub struct Compiled {
 /// bind resolved routes to the selected listener and assemble the next snapshot.
 pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
     let mut result = Compiled {
+        policies: Policies::default(),
+        certificate_error: None,
         snapshot: GatewaySnapshot::default(),
         reports: vec![],
         accepted: false,
@@ -118,16 +125,27 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
         || gateway.spec.listeners.len() != 1
     {
         result.message =
-            "demo requires one listener, no class parameters and no Gateway TLS".into();
+            "expected one listener without class parameters or gateway-wide TLS options"
+                .into();
     } else if let Some(l) = listener {
-        if l.protocol == "HTTP" && l.tls.is_none() {
-            result.accepted = true;
-            result.reason = "Accepted";
-            result.message = "selected HTTP listener is valid".into();
-            result.snapshot.listener = Some(SocketAddr::new(selection.bind_ip, l.port));
-        } else {
-            result.reason = "UnsupportedProtocol";
-            result.message = "only plaintext HTTP listeners are supported".into();
+        match listener_tls(stores, &selection.namespace, l) {
+            Ok(tls) => {
+                result.accepted = true;
+                result.reason = "Accepted";
+                result.message = format!("selected {} listener is valid", l.protocol);
+                result.snapshot.listener = Some(Listener {
+                    address: SocketAddr::new(selection.bind_ip, l.port),
+                    tls,
+                });
+            }
+            Err(error) => {
+                result.message = error.message.clone();
+                if matches!(error.reason, "InvalidCertificateRef" | "RefNotPermitted") {
+                    result.certificate_error = Some(error);
+                } else {
+                    result.reason = error.reason;
+                }
+            }
         }
     }
     let mut routes = stores.http_routes.state();
@@ -179,7 +197,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                         report.message =
                             "route and listener hostnames do not intersect".into();
                     } else {
-                        match stores.resolve(route.as_ref()) {
+                        match stores.resolve_http(&route, &mut result.policies) {
                             Err(ResolveError::UnsupportedValue) => {
                                 report.reason = "UnsupportedValue";
                                 report.message = "unsupported rule: use Exact/PathPrefix, exact headers, method and one same-namespace HTTP Service backend".into();

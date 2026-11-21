@@ -128,7 +128,7 @@ impl ListenerGroup {
         let bound = workers[0].bound.filter(|address| {
             desired.gateway.listener.is_some()
                 && workers.iter().all(|worker| {
-                    worker.requested == desired.gateway.listener
+                    worker.requested == desired.gateway.address()
                         && worker.bound == Some(*address)
                 })
         });

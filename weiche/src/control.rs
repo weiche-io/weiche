@@ -2,6 +2,7 @@
 mod compile;
 mod reconcile;
 mod status;
+mod tls;
 mod tryfrom;
 
 pub use compile::{CONTROLLER_NAME, Compiled, Selection, compile};
@@ -12,7 +13,10 @@ use futures::{
     StreamExt,
     stream::{BoxStream, select_all},
 };
-use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
+use k8s_openapi::api::{
+    core::v1::{ConfigMap, Secret, Service},
+    discovery::v1::EndpointSlice,
+};
 use kube::{
     Api, Client, Resource, ResourceExt,
     runtime::{
@@ -25,7 +29,8 @@ use serde::de::DeserializeOwned;
 use std::{fmt::Debug, future::ready};
 use tokio::sync::watch;
 use weiche_gtwapi::v1::{
-    gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute,
+    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
+    gateways::Gateway, httproutes::HttpRoute, referencegrants::ReferenceGrant,
 };
 
 /// Live snapshots maintained by kube-runtime, including updates and deletions.
@@ -36,6 +41,10 @@ pub struct GatewayStores {
     pub gateway_classes: Store<GatewayClass>,
     pub gateways: Store<Gateway>,
     pub http_routes: Store<HttpRoute>,
+    pub secrets: Store<Secret>,
+    pub grants: Store<ReferenceGrant>,
+    pub config_maps: Store<ConfigMap>,
+    pub tls_policies: Store<BackendTlsPolicy>,
     pub services: Store<Service>,
     pub endpoint_slices: Store<EndpointSlice>,
 }
@@ -48,16 +57,27 @@ pub struct GatewayController {
 }
 impl GatewayController {
     pub fn new(client: Client) -> Self {
-        let (gateway_classes, classes_watch) = cache(Api::all(client.clone()));
-        let (gateways, gateways_watch) = cache(Api::all(client.clone()));
-        let (http_routes, routes_watch) = cache(Api::all(client.clone()));
-        let (services, services_watch) = cache(Api::all(client.clone()));
-        let (endpoint_slices, endpoints_watch) = cache(Api::all(client));
+        let defaults = watcher::Config::default;
+        let (gateway_classes, classes_watch) =
+            cache(Api::all(client.clone()), defaults());
+        let (gateways, gateways_watch) = cache(Api::all(client.clone()), defaults());
+        let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
+        let (secrets, secrets_watch) =
+            cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
+        let (grants, grants_watch) = cache(Api::all(client.clone()), defaults());
+        let (config_maps, maps_watch) = cache(Api::all(client.clone()), defaults());
+        let (tls_policies, policies_watch) = cache(Api::all(client.clone()), defaults());
+        let (services, services_watch) = cache(Api::all(client.clone()), defaults());
+        let (endpoint_slices, endpoints_watch) = cache(Api::all(client), defaults());
         Self {
             stores: GatewayStores {
                 gateway_classes,
                 gateways,
                 http_routes,
+                secrets,
+                grants,
+                config_maps,
+                tls_policies,
                 services,
                 endpoint_slices,
             },
@@ -65,6 +85,10 @@ impl GatewayController {
                 classes_watch,
                 gateways_watch,
                 routes_watch,
+                secrets_watch,
+                grants_watch,
+                maps_watch,
+                policies_watch,
                 services_watch,
                 endpoints_watch,
             ],
@@ -87,7 +111,7 @@ impl GatewayController {
     }
 }
 
-fn cache<K>(api: Api<K>) -> (Store<K>, BoxStream<'static, ()>)
+fn cache<K>(api: Api<K>, config: watcher::Config) -> (Store<K>, BoxStream<'static, ()>)
 where
     K: Resource<DynamicType = ()>
         + Clone
@@ -98,7 +122,7 @@ where
         + 'static,
 {
     let (reader, writer) = reflector::store();
-    let stream = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()))
+    let stream = reflector::reflector(writer, watcher::watcher(api, config))
         .default_backoff()
         .filter_map(|result| ready(match result {
             Ok(watcher::Event::Apply(resource) | watcher::Event::Delete(resource)) => {

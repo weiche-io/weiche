@@ -31,6 +31,10 @@ pub async fn run(
                 stores.gateway_classes.wait_until_ready(),
                 stores.gateways.wait_until_ready(),
                 stores.http_routes.wait_until_ready(),
+                stores.secrets.wait_until_ready(),
+                stores.grants.wait_until_ready(),
+                stores.config_maps.wait_until_ready(),
+                stores.tls_policies.wait_until_ready(),
                 stores.services.wait_until_ready(),
                 stores.endpoint_slices.wait_until_ready()
             )?;
@@ -42,7 +46,7 @@ pub async fn run(
                 let revision = config_tx.publish(compiled.snapshot.clone());
                 if published != Some(revision) {
                     published = Some(revision);
-                    tracing::info!(revision, bind = ?compiled.snapshot.listener, routes = compiled.snapshot.routes.len(), "published gateway snapshot");
+                    tracing::info!(revision, bind = ?compiled.snapshot.address(), routes = compiled.snapshot.routes.len(), "published gateway snapshot");
                 }
                 loop {
                     let state = listener_rx.borrow_and_update().clone();

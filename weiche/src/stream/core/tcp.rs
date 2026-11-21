@@ -1,5 +1,5 @@
 //! TCP admission and listener selection; neither filter inspects application bytes.
-use std::net::SocketAddr;
+use super::super::super::ir::Listener;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -7,14 +7,14 @@ use std::sync::{
 
 /// target attached to a configured listener, before any protocol-specific matching.
 pub struct Route<T> {
-    pub listener: SocketAddr,
+    pub listener: Listener,
     pub target: T,
 }
 
 impl<T> Route<T> {
-    /// match the accepting listener's configured address, including wildcard binds.
-    pub fn find(&self, listener: SocketAddr) -> Option<&T> {
-        (self.listener == listener).then_some(&self.target)
+    /// keep existing connections bound to their original socket and TLS identity.
+    pub fn find(&self, listener: &Listener) -> Option<&T> {
+        (&self.listener == listener).then_some(&self.target)
     }
 }
 

@@ -119,6 +119,10 @@ impl ConnectionPool {
     }
 
     /// retain connections only for endpoints reachable through active routes.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "TLS session caches do not participate in endpoint key equality or hashing"
+    )]
     pub fn reconcile(&self, allowed: &HashSet<EndpointKey>) {
         let mut endpoints = self.endpoints.borrow_mut();
         endpoints.retain(|address, endpoint| {
@@ -130,10 +134,10 @@ impl ConnectionPool {
                 false
             }
         });
-        for &key in allowed {
-            endpoints.entry(key).or_insert_with(|| {
+        for key in allowed {
+            endpoints.entry(key.clone()).or_insert_with(|| {
                 Rc::new(Endpoint {
-                    key,
+                    key: key.clone(),
                     enabled: Cell::new(true),
                     closed: Notify::new(),
                     idle: RefCell::new(Vec::new()),

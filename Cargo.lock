@@ -2681,6 +2681,8 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "ring",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "socket2",

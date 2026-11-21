@@ -4,7 +4,7 @@ mod router;
 use super::{
     super::{
         super::{
-            ir::{Protocol, PublishedSnapshot, Revision, Route, RouteAction},
+            ir::{Listener, Protocol, PublishedSnapshot, Revision, Route, RouteAction},
             rtconf::RuntimeConfig,
         },
         up::{ConnectionPool, Endpoint, UpstreamClient},
@@ -22,7 +22,6 @@ use router::Router;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -39,6 +38,10 @@ struct WorkerView {
 }
 
 impl WorkerView {
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "TLS configuration identity hashes only immutable certificate and protocol data"
+    )]
     fn prepare(
         snapshot: &PublishedSnapshot,
         previous: Option<&tcp::Route<Router>>,
@@ -64,7 +67,11 @@ impl WorkerView {
                 RouteAction::Forward(spec) => {
                     if gateway.listener.is_some() {
                         endpoints.extend(spec.endpoints.iter().map(|&address| {
-                            EndpointKey { address, protocol: spec.protocol }
+                            EndpointKey {
+                                address,
+                                protocol: spec.protocol,
+                                tls: spec.tls.clone(),
+                            }
                         }));
                     }
                     let cluster = clusters
@@ -86,6 +93,7 @@ impl WorkerView {
                 deadline: gateway.forwarding.response_header_timeout,
                 route: gateway
                     .listener
+                    .clone()
                     .map(|listener| tcp::Route { listener, target: router }),
             },
             endpoints,
@@ -128,16 +136,18 @@ impl ProxyService {
         Ok(snapshot.revision)
     }
 
-    pub fn listener(&self) -> Option<SocketAddr> {
-        self.view.borrow().route.as_ref().map(|route| route.listener)
+    /// capture the complete listener at TCP accept, before the first handshake poll.
+    pub fn listener(&self) -> Option<Listener> {
+        self.view.borrow().route.as_ref().map(|route| route.listener.clone())
     }
+
     pub fn close(&self) {
         self.pool.close();
     }
 
     fn select(
         &self,
-        listener: SocketAddr,
+        listener: &Listener,
         request: &Request<Incoming>,
         authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
@@ -147,7 +157,7 @@ impl ProxyService {
             return Err(ProxyError::UnsupportedUpgrade);
         }
         let host = authority.host().to_ascii_lowercase();
-        // no shared locks or Arc clones on requests; release this borrow before I/O.
+        // release the worker-local routing view before starting I/O.
         let view = self.view.borrow();
         let router = view
             .route
@@ -168,7 +178,7 @@ impl ProxyService {
     /// routing and forwarding failures become HTTP responses rather than service errors.
     pub async fn call(
         &self,
-        listener: SocketAddr,
+        listener: &Listener,
         mut request: Request<Incoming>,
     ) -> Result<Response<Body>, !> {
         let authority = match normalize_authority(&mut request) {
@@ -180,7 +190,12 @@ impl ProxyService {
             Err(error) => return Ok(error.response()),
         };
         let downstream_version = request.version();
-        prepare_request(&mut request, authority, endpoint.key.protocol);
+        prepare_request(
+            &mut request,
+            authority,
+            endpoint.key.protocol,
+            listener.tls.is_some(),
+        );
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
             Ok(Ok(response)) => {
@@ -288,6 +303,7 @@ fn prepare_request(
     request: &mut Request<Incoming>,
     authority: Authority,
     protocol: Protocol,
+    downstream_tls: bool,
 ) {
     let trailers = request
         .headers()
@@ -330,7 +346,11 @@ fn prepare_request(
             *request.version_mut() = Version::HTTP_2;
             // encode authority once; some HTTP/2 servers reject a duplicate Host field.
             request.headers_mut().remove(header::HOST);
-            uri.scheme.get_or_insert(http::uri::Scheme::HTTP);
+            uri.scheme.get_or_insert(if downstream_tls {
+                http::uri::Scheme::HTTPS
+            } else {
+                http::uri::Scheme::HTTP
+            });
             uri.authority = Some(authority);
         }
     }

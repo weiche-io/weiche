@@ -1,4 +1,4 @@
-//! downstream TCP listeners for plaintext HTTP/1 and HTTP/2.
+//! downstream TCP listeners for HTTP/1 and HTTP/2.
 use super::{
     super::{
         super::{routing, rtconf::RuntimeConfig},
@@ -48,10 +48,10 @@ pub(in super::super) async fn run(
         if *stop.borrow() {
             break Ok(());
         }
-        let requested = server.service.listener();
+        let requested = server.service.listener().map(|l| l.address);
         listeners.clear_listener(id);
         let binding = requested.and_then(|address| match listeners.bind(id, address) {
-            Ok(socket) => Some((address, socket)),
+            Ok(socket) => Some(socket),
             Err(error) => {
                 tracing::error!(worker = id, %address, %error, "http listener bind failed; retrying");
                 None
@@ -60,8 +60,8 @@ pub(in super::super) async fn run(
         let retry = requested.is_some() && binding.is_none();
         // keep the native accept pending across route-only snapshot updates.
         let accept = async || {
-            let Some((address, socket)) = &binding else { return pending().await };
-            socket.accept().await.map(|(stream, peer)| (*address, stream, peer))
+            let Some(socket) = &binding else { return pending().await };
+            socket.accept().await
         };
         let mut incoming = pin!(accept());
         loop {
@@ -75,8 +75,12 @@ pub(in super::super) async fn run(
                     }
                     let snapshot = config.snapshot();
                     let revision = snapshot.revision;
+                    let previous = server.service.listener();
                     match server.service.apply(snapshot) {
                         Ok(revision) => {
+                            if previous != server.service.listener() {
+                                connections.send_replace(false);
+                            }
                             listeners.applied(id, revision);
                             tracing::debug!(worker = id, revision, "applied gateway snapshot");
                         }
@@ -85,17 +89,17 @@ pub(in super::super) async fn run(
                             tracing::error!(worker = id, revision, %error, "failed to prepare gateway snapshot");
                         }
                     }
-                    if retry || server.service.listener() != requested { continue 'bind; }
+                    if retry || server.service.listener().map(|l| l.address) != requested { continue 'bind; }
                 }
                 _ = sleep(runtime.listener_retry_interval), if retry => continue 'bind,
                 accepted = &mut incoming => {
-                    let (address, stream, peer) = match accepted {
+                    let (stream, peer) = match accepted {
                         Ok(connection) => connection,
                         Err(error) => break 'bind Err(error.into()),
                     };
-                    if let Some(permit) = admission.acquire() {
+                    if let Some(listener) = server.service.listener() && let Some(permit) = admission.acquire() {
                         tracing::debug!(worker = id, %peer, "serving HTTP connection");
-                        let task = server.clone().serve(address, stream, peer, permit, connections.subscribe());
+                        let task = server.clone().serve(listener, stream, peer, permit, connections.subscribe());
                         runtime::spawn(task).detach();
                     }
                     incoming.set(accept());
