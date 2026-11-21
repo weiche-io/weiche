@@ -2,6 +2,11 @@ SITE     := weiche.io
 SITE_OUT := $(SITE)/build
 TYPST    ?= typst
 PORT     ?= 8000
+MINIFY   ?= n
+
+MINIFY_HTML := minify --html-keep-quotes --html-keep-end-tags --html-keep-document-tags
+HTML_MODE := $(if $(filter y,$(MINIFY)),minified,plain)
+HTML_STAMP := $(SITE_OUT)/.html-$(HTML_MODE)
 
 PAGES  := $(SITE_OUT)/index.html $(patsubst $(SITE)/src/%.typ,$(SITE_OUT)/%.html,$(shell find $(SITE)/src -name index.typ -type f))
 ASSETS := $(patsubst $(SITE)/assets/%,$(SITE_OUT)/%,$(shell find $(SITE)/assets -type f))
@@ -18,15 +23,26 @@ docs build: weiche.io
 $(META_PAGES): $(SITE_OUT)/%/index.html: $(SITE)/src/%/meta.typ
 
 ifeq ($(V),y)
-run_typst = $(1)
+site_run = $(1)
 else
-run_typst = diagnostics=$$($(1) 2>&1) || { printf '%s\n' "$$diagnostics" >&2; exit 1; }
+site_run = diagnostics=$$($(1) 2>&1) || { printf '%s\n' "$$diagnostics" >&2; exit 1; }
 endif
 
-$(SITE_OUT)/%.html: %.typ $(addprefix $(SITE)/,page.typ meta.typ nav.typ) mk/site.mk
+# Switching modes invalidates the HTML, even when no Typst source changed.
+$(HTML_STAMP):
+	$(call log,HTML,$(HTML_MODE))
+	mkdir -p "$(@D)"
+	rm -f "$(@D)/.html-plain" "$(@D)/.html-minified"
+	touch "$@"
+
+$(SITE_OUT)/%.html: %.typ $(addprefix $(SITE)/,page.typ meta.typ nav.typ) mk/site.mk $(HTML_STAMP)
 	$(call log,TYP,$<)
 	mkdir -p "$(@D)"
-	$(call run_typst,$(TYPST) compile --root "$(SITE)" --features html "$<" "$@")
+	$(call site_run,$(TYPST) compile --root "$(SITE)" --features html "$<" "$@")
+ifeq ($(HTML_MODE),minified)
+	$(call log,MINI,$@)
+	$(call site_run,$(MINIFY_HTML) -o "$@" "$@")
+endif
 
 $(SITE_OUT)/%: $(SITE)/assets/%
 	$(call log,ASSET,$@)
