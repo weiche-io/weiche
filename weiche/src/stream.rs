@@ -2,6 +2,7 @@
 pub mod core;
 mod dataplane;
 pub mod down;
+mod io;
 pub mod up;
 
 pub use dataplane::WorkerGroup;

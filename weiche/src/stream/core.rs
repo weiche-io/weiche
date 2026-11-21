@@ -2,13 +2,14 @@
 pub mod http;
 pub mod tcp;
 
-use super::super::ir::{ClusterSpec, Protocol};
+use super::super::ir::{BackendTls, ClusterSpec, Protocol};
 use std::{cell::Cell, net::SocketAddr, sync::Arc};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EndpointKey {
     pub address: SocketAddr,
     pub protocol: Protocol,
+    pub tls: Option<Arc<BackendTls>>,
 }
 
 /// worker-local round-robin state shared by routes with the same membership and protocol.
@@ -32,6 +33,7 @@ impl Cluster {
         Some(EndpointKey {
             address: endpoints[index % endpoints.len()],
             protocol: self.spec.protocol,
+            tls: self.spec.tls.clone(),
         })
     }
 }

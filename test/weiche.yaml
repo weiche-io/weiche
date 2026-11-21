@@ -1,0 +1,11 @@
+# Helm overrides for the disposable conformance cluster.
+image:
+  repository: localhost/weiche
+  tag: spec
+  pullPolicy: Never
+gatewayNamespaces:
+  - gateway-conformance-infra
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi

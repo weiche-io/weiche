@@ -28,11 +28,8 @@ impl WorkerGroup {
 
     pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let Self { runtime, mut config, state } = self;
-        let listeners = Arc::new(ListenerGroup::new(
-            runtime.workers.get(),
-            config.clone(),
-            state.clone(),
-        ));
+        let listeners =
+            Arc::new(ListenerGroup::new(runtime.workers.get(), state.clone()));
         let admission =
             Arc::new(Admission::new(runtime.downstream_connections_global.get()));
         let (stop, stopped_rx) = watch::channel(false);
@@ -80,20 +77,15 @@ impl WorkerGroup {
         }.await;
         stop.send_replace(true);
         if !local_done {
-            let local_result = local.await;
-            if result.is_ok() {
-                result = local_result;
-            }
+            result = result.and(local.await);
         }
         while let Some(done) = completed.next().await {
-            let done = done.context("worker panicked").and_then(|result| result);
-            if result.is_ok() {
-                result = done;
-            }
+            let done = done.context("worker panicked").and_then(|r| r);
+            result = result.and(done);
         }
         for thread in threads {
-            if thread.join().is_err() && result.is_ok() {
-                result = Err(anyhow::anyhow!("data-plane worker panicked"));
+            if thread.join().is_err() {
+                result = result.and(Err(anyhow::anyhow!("data-plane worker panicked")));
             }
         }
         state.send_replace(WorkerGroupState::default());

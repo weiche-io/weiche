@@ -46,7 +46,7 @@ pub struct Endpoint {
     enabled: Cell<bool>,
     closed: Notify,
     idle: RefCell<Vec<Idle>>,
-    http2: RefCell<Option<Rc<Http2Connection>>>,
+    http2: RefCell<Vec<Rc<Http2Connection>>>,
     connecting: Cell<bool>,
     budget: Rc<Budget>,
 }
@@ -55,7 +55,7 @@ impl Endpoint {
     fn close(&self) {
         self.enabled.set(false);
         self.idle.borrow_mut().clear();
-        self.http2.borrow_mut().take();
+        self.http2.borrow_mut().clear();
         self.closed.notify_waiters();
     }
 
@@ -63,21 +63,33 @@ impl Endpoint {
         self.idle.borrow_mut().retain(|idle| idle.reusable(timeout));
         self.http2
             .borrow_mut()
-            .take_if(|connection| connection.expired(timeout));
+            .retain(|connection| !connection.expired(timeout));
     }
 
-    fn idle_since(&self) -> Option<Instant> {
+    /// find the oldest idle socket and its index in the protocol's connection list.
+    fn oldest_idle(&self) -> Option<(Instant, usize)> {
         match self.key.protocol {
-            Protocol::Http1 => self.idle.borrow().first().map(|idle| idle.since),
-            Protocol::Http2 => self.http2.borrow().as_ref()?.idle_since(),
+            Protocol::Http1 => self.idle.borrow().first().map(|idle| (idle.since, 0)),
+            Protocol::Http2 => self
+                .http2
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, connection)| {
+                    connection.idle_since().map(|since| (since, index))
+                })
+                .min(),
         }
     }
 
-    fn evict_idle(&self) {
-        if self.key.protocol == Protocol::Http2 {
-            self.http2.borrow_mut().take();
-        } else {
-            self.idle.borrow_mut().remove(0);
+    fn evict_idle(&self, index: usize) {
+        match self.key.protocol {
+            Protocol::Http1 => {
+                self.idle.borrow_mut().remove(index);
+            }
+            Protocol::Http2 => {
+                self.http2.borrow_mut().swap_remove(index);
+            }
         }
     }
 }
@@ -119,6 +131,10 @@ impl ConnectionPool {
     }
 
     /// retain connections only for endpoints reachable through active routes.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "TLS session caches do not participate in endpoint key equality or hashing"
+    )]
     pub fn reconcile(&self, allowed: &HashSet<EndpointKey>) {
         let mut endpoints = self.endpoints.borrow_mut();
         endpoints.retain(|address, endpoint| {
@@ -130,14 +146,14 @@ impl ConnectionPool {
                 false
             }
         });
-        for &key in allowed {
-            endpoints.entry(key).or_insert_with(|| {
+        for key in allowed {
+            endpoints.entry(key.clone()).or_insert_with(|| {
                 Rc::new(Endpoint {
-                    key,
+                    key: key.clone(),
                     enabled: Cell::new(true),
                     closed: Notify::new(),
                     idle: RefCell::new(Vec::new()),
-                    http2: RefCell::new(None),
+                    http2: RefCell::new(Vec::new()),
                     connecting: Cell::new(false),
                     budget: self.budget.clone(),
                 })
@@ -164,10 +180,13 @@ impl ConnectionPool {
         let endpoints = self.endpoints.borrow();
         let oldest = endpoints
             .values()
-            .filter_map(|endpoint| endpoint.idle_since().map(|since| (since, endpoint)))
-            .min_by_key(|(since, _)| *since);
-        if let Some((_, endpoint)) = oldest {
-            endpoint.evict_idle();
+            .filter_map(|endpoint| {
+                let (since, index) = endpoint.oldest_idle()?;
+                Some((since, endpoint, index))
+            })
+            .min_by_key(|(since, _, _)| *since);
+        if let Some((_, endpoint, index)) = oldest {
+            endpoint.evict_idle(index);
         }
     }
 

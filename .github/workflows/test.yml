@@ -1,0 +1,65 @@
+name: test
+on:
+  pull_request:
+  # warm branch caches on master so new pull requests reuse them.
+  push:
+    branches: [master]
+permissions:
+  contents: read
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: tools
+        with:
+          path: |
+            target/conformance/conformance.test
+            target/conformance/kind-*
+          key: conformance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('weiche-gtwapi/manifests/source.json', 'mk/conformance.mk') }}
+      - if: steps.tools.outputs.cache-hit == 'true'
+        run: touch target/conformance/conformance.test
+      - if: steps.tools.outputs.cache-hit != 'true'
+        run: make conformance-source
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        if: steps.tools.outputs.cache-hit != 'true'
+        with:
+          go-version-file: target/conformance/gateway-api/go.work
+          cache: false
+      - if: steps.tools.outputs.cache-hit != 'true'
+        run: make conformance-tools
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          tags: localhost/weiche:spec
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - if: github.event_name == 'pull_request'
+        run: make IMAGE=localhost/weiche:spec conformance
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && hashFiles('target/conformance/report.yaml') != '' }}
+        with:
+          name: gateway-api-conformance
+          path: target/conformance/report.yaml
+          if-no-files-found: error
+  docs:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: typst-community/setup-typst@48aeee7543d37f01afd1ffb27307dc277387ba13 # v4
+        with:
+          typst-version: 0.15.1
+      - run: sudo apt-get update && sudo apt-get install -y minify
+      - run: make MINIFY=y full

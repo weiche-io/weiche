@@ -1,0 +1,6 @@
+apiVersion: v2
+name: weiche
+description: Weiche gateway controller for clusters with Gateway API v1.7.0 standard CRDs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

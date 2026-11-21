@@ -1,8 +1,7 @@
 //! supervise compio workers and a dedicated Tokio control thread.
 use super::{
-    control::{self, Selection},
     ir::GatewaySnapshot,
-    routing,
+    proxy, routing,
     rtconf::RuntimeConfig,
     stream::{WorkerGroup, down::WorkerGroupState},
 };
@@ -10,7 +9,7 @@ use anyhow::Context;
 use std::thread;
 use tokio::sync::{oneshot, watch};
 
-pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result<()> {
+pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
     let (config_tx, config_rx) = routing::channel(GatewaySnapshot::default());
     let (listener_tx, listener_rx) = watch::channel(WorkerGroupState::default());
     let (stop, stopped) = watch::channel(false);
@@ -18,52 +17,39 @@ pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result
     let (done_tx, mut done_rx) = oneshot::channel();
     let group = WorkerGroup::new(runtime, config_rx, listener_tx)?;
     let control = thread::Builder::new()
-        .name("weiche-control".into())
+        .name("weiche-proxy-watch".into())
         .spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .context("create control-plane Tokio runtime")?;
-                runtime.block_on(control::run(
-                    selection,
-                    config_tx,
-                    listener_rx,
-                    control_stop,
-                ))
+                runtime.block_on(proxy::run(name, config_tx, listener_rx, control_stop))
             })();
             let _ = done_tx.send(result);
         })
         .context("spawn control-plane thread")?;
     let data = group.run(stopped);
     tokio::pin!(data);
-    let mut data_done = false;
-    let mut control_done = false;
-    let mut result = tokio::select! {
-        result = &mut data => { data_done = true; result },
-        result = &mut done_rx => {
-            control_done = true;
-            result.context("control thread panicked").and_then(|result| result)
-        },
+    let (mut result, data_done, control_done) = tokio::select! {
+        result = &mut data => (result, true, false),
+        result = &mut done_rx => (
+            result.context("control thread panicked").and_then(|r| r),
+            false,
+            true,
+        ),
     };
     stop.send_replace(true);
     if !data_done {
-        let data_result = data.await;
-        if result.is_ok() {
-            result = data_result;
-        }
+        result = result.and(data.await);
     }
     if !control_done {
-        let control_result = done_rx
-            .await
-            .context("control thread panicked")
-            .and_then(|result| result);
-        if result.is_ok() {
-            result = control_result;
-        }
+        let control_result =
+            done_rx.await.context("control thread panicked").and_then(|r| r);
+        result = result.and(control_result);
     }
-    if control.join().is_err() && result.is_ok() {
-        result = Err(anyhow::anyhow!("control thread panicked"));
+    if control.join().is_err() {
+        result = result.and(Err(anyhow::anyhow!("control thread panicked")));
     }
     result
 }

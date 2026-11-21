@@ -1,0 +1,20 @@
+{{- $image := printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag | toString) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-settings
+  namespace: {{ .Release.Namespace | quote }}
+data:
+  proxy.json: |
+    {{- dict
+        "image" $image
+        "pullPolicy" .Values.image.pullPolicy
+        "pullSecrets" .Values.imagePullSecrets
+        "seccompProfile" .Values.seccompProfile
+        "resources" .Values.resources
+        "replicas" .Values.proxy.replicas
+        "workers" .Values.proxy.workers
+        "bindAddress" .Values.proxy.bindAddress
+        "serviceType" .Values.proxy.serviceType
+        "namespaces" (.Values.gatewayNamespaces | default (list .Release.Namespace))
+        | toPrettyJson | nindent 4 }}

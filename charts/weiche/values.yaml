@@ -1,0 +1,27 @@
+image:
+  repository: ghcr.io/weiche-io/weiche
+  # Empty uses appVersion from Chart.yaml.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Workers need a seccomp profile that permits io_uring.
+seccompProfile:
+  type: Unconfined
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+controllerReplicas: 2
+# Existing, platform-controlled namespaces where proxies and their TLS material may run.
+# An empty list selects the release namespace. Pull secrets must exist in each namespace.
+gatewayNamespaces: []
+proxy:
+  replicas: 2
+  workers: 1
+  bindAddress: "::"
+  serviceType: ClusterIP

@@ -16,14 +16,10 @@ use std::{
 
 impl Endpoint {
     pub fn retire_http2(&self, lease: &Http2Lease) {
-        let mut current = self.http2.borrow_mut();
-        if current
-            .as_ref()
-            .is_some_and(|connection| Rc::ptr_eq(connection, &lease.connection))
-        {
-            current.take();
-            self.budget.changed.notify_waiters();
-        }
+        self.http2
+            .borrow_mut()
+            .retain(|connection| !Rc::ptr_eq(connection, &lease.connection));
+        self.budget.changed.notify_waiters();
     }
 }
 
@@ -35,12 +31,15 @@ impl ConnectionPool {
         loop {
             let changed = self.watch_capacity(endpoint)?;
             endpoint.prune(self.idle_timeout);
-            let connection = endpoint.http2.borrow().clone();
-            if let Some(connection) = connection {
-                if connection.active.get() < self.max_streams {
-                    return Ok(connection.lease());
-                }
-            } else if !endpoint.connecting.get()
+            if let Some(connection) = endpoint
+                .http2
+                .borrow()
+                .iter()
+                .find(|connection| connection.active.get() < self.max_streams)
+            {
+                return Ok(connection.lease());
+            }
+            if !endpoint.connecting.get()
                 && let Some(slot) = self.try_reserve()
             {
                 // one dial per endpoint, even when many streams arrive together.
@@ -50,7 +49,7 @@ impl ConnectionPool {
                     endpoint.budget.changed.notify_waiters();
                 });
                 let transport = self
-                    .dial(endpoint, self.connector.connect_http2(endpoint.key.address))
+                    .dial(endpoint, self.connector.connect_http2(&endpoint.key))
                     .await?;
                 let connection = Rc::new(Http2Connection {
                     transport,
@@ -58,7 +57,7 @@ impl ConnectionPool {
                     active: Cell::new(0),
                     idle_since: Cell::new(Instant::now()),
                 });
-                *endpoint.http2.borrow_mut() = Some(connection.clone());
+                endpoint.http2.borrow_mut().push(connection.clone());
                 return Ok(connection.lease());
             }
             changed.await;
@@ -66,7 +65,8 @@ impl ConnectionPool {
     }
 }
 
-pub(super) struct Http2Connection {
+/// shared HTTP/2 upstream connection and its active stream counter.
+pub struct Http2Connection {
     transport: Connected<http2::SendRequest<Upload>>,
     slot: Slot,
     active: Cell<usize>,
@@ -74,12 +74,14 @@ pub(super) struct Http2Connection {
 }
 
 impl Http2Connection {
-    pub(super) fn expired(&self, timeout: Duration) -> bool {
+    /// check whether the connection closed or sat idle past timeout.
+    pub fn expired(&self, timeout: Duration) -> bool {
         self.transport.sender.is_closed()
             || self.idle_since().is_some_and(|since| since.elapsed() >= timeout)
     }
 
-    pub(super) fn idle_since(&self) -> Option<Instant> {
+    /// return when the last active stream finished, or None while streams are active.
+    pub fn idle_since(&self) -> Option<Instant> {
         (self.active.get() == 0).then(|| self.idle_since.get())
     }
 
