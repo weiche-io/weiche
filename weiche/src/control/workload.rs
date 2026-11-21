@@ -158,37 +158,30 @@ pub async fn reconcile(
     applied
         .ensure::<ServiceAccount>(client, &ns, &name, &owner, json!({}))
         .await?;
-    applied.ensure::<Role>(client, &ns, &name, &owner, json!({"rules":[
-        {"apiGroups":[""],"resources":["secrets"],"resourceNames":[name],"verbs":["get","list","watch"]},
-        {"apiGroups":[""],"resources":["configmaps"],"resourceNames":[name],"verbs":["patch"]},
-        {"apiGroups":["rbac.authorization.k8s.io"],"resources":["rolebindings"],"resourceNames":["weiche-gateway-provisioner"],"verbs":["get"]}
-    ]})).await?;
-    applied.ensure::<RoleBinding>(client, &ns, &name, &owner, json!({
-        "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":name},
-        "subjects":[{"kind":"ServiceAccount","name":name,"namespace":ns}]
-    })).await?;
-    applied.ensure::<Deployment>(client, &ns, &name, &owner, json!({"spec":{
-        "replicas":settings.replicas, "selector":{"matchLabels":labels},
-        "template":{"metadata":{"labels":labels},"spec":{
-            "serviceAccountName":name,"nodeSelector":{"kubernetes.io/os":"linux"},
-            "imagePullSecrets":settings.pull_secrets,
-            "securityContext":{"sysctls":[{"name":"net.ipv4.ip_unprivileged_port_start","value":"0"}]},
-            "terminationGracePeriodSeconds":10,
-            "volumes":[{"name":"run","emptyDir":{"medium":"Memory"}}],
-            "containers":[{"name":"proxy","image":settings.image,"imagePullPolicy":settings.pull_policy,
-                "args":["proxy",name],"resources":settings.resources,
-                "env":[{"name":"WEICHE_WORKERS","value":settings.workers.to_string()},{"name":"POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}],
-                "volumeMounts":[{"name":"run","mountPath":"/run/weiche"}],
-                "readinessProbe":{"exec":{"command":["/usr/local/bin/weiche","ready"]},"periodSeconds":2,"failureThreshold":1},
-                "securityContext":{"runAsNonRoot":true,"runAsUser":65532,"allowPrivilegeEscalation":false,
-                    "capabilities":{"drop":["ALL"]},"seccompProfile":settings.seccomp_profile}
-            }]
-        }}
-    }})).await?;
-    let ports = plan.ports();
-    applied.ensure::<Service>(client, &ns, &name, &owner, json!({"spec":{
-        "type":settings.service_type,"ipFamilyPolicy":"PreferDualStack","selector":labels,"ports":ports
-    }})).await?;
+    applied
+        .ensure::<Role>(client, &ns, &name, &owner, proxy_role(&name))
+        .await?;
+    applied
+        .ensure::<RoleBinding>(client, &ns, &name, &owner, proxy_role_binding(&name, &ns))
+        .await?;
+    applied
+        .ensure::<Deployment>(
+            client,
+            &ns,
+            &name,
+            &owner,
+            proxy_deployment(&name, &labels, settings),
+        )
+        .await?;
+    applied
+        .ensure::<Service>(
+            client,
+            &ns,
+            &name,
+            &owner,
+            proxy_service(&labels, plan.ports(), settings),
+        )
+        .await?;
     let Some(service) = stores.services.get(&ObjectRef::new(&name).within(&ns)) else {
         return Ok(());
     };
@@ -259,8 +252,116 @@ pub async fn reconcile(
             .filter(|k| !members.contains(*k))
             .map(|k| (k, Value::Null))
             .collect();
-        Api::<ConfigMap>::namespaced(client.clone(),&ns).patch(&name,&PatchParams::default(),
-            &Patch::Merge(json!({"metadata":{"resourceVersion":report.resource_version()},"data":stale}))).await?;
+        Api::<ConfigMap>::namespaced(client.clone(), &ns)
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({
+                    "metadata": {"resourceVersion": report.resource_version()},
+                    "data": stale,
+                })),
+            )
+            .await?;
     }
     Ok(())
+}
+
+fn proxy_role(name: &str) -> Value {
+    json!({
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": [name],
+                "verbs": ["get", "list", "watch"],
+            },
+            {
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "resourceNames": [name],
+                "verbs": ["patch"],
+            },
+            {
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["rolebindings"],
+                "resourceNames": ["weiche-gateway-provisioner"],
+                "verbs": ["get"],
+            },
+        ]
+    })
+}
+
+fn proxy_role_binding(name: &str, namespace: &str) -> Value {
+    json!({
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": name,
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": name,
+            "namespace": namespace,
+        }],
+    })
+}
+
+fn proxy_deployment(name: &str, labels: &Value, settings: &Settings) -> Value {
+    json!({
+        "spec": {
+            "replicas": settings.replicas,
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "serviceAccountName": name,
+                    "nodeSelector": {"kubernetes.io/os": "linux"},
+                    "imagePullSecrets": settings.pull_secrets,
+                    "securityContext": {
+                        "sysctls": [{
+                            "name": "net.ipv4.ip_unprivileged_port_start",
+                            "value": "0",
+                        }]
+                    },
+                    "terminationGracePeriodSeconds": 10,
+                    "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
+                    "containers": [{
+                        "name": "proxy",
+                        "image": settings.image,
+                        "imagePullPolicy": settings.pull_policy,
+                        "args": ["proxy", name],
+                        "resources": settings.resources,
+                        "env": [
+                            {"name": "WEICHE_WORKERS", "value": settings.workers.to_string()},
+                            {"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
+                        ],
+                        "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
+                        "readinessProbe": {
+                            "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
+                            "periodSeconds": 2,
+                            "failureThreshold": 1,
+                        },
+                        "securityContext": {
+                            "runAsNonRoot": true,
+                            "runAsUser": 65532,
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]},
+                            "seccompProfile": settings.seccomp_profile,
+                        },
+                    }],
+                },
+            },
+        }
+    })
+}
+
+fn proxy_service(labels: &Value, ports: Vec<Value>, settings: &Settings) -> Value {
+    json!({
+        "spec": {
+            "type": settings.service_type,
+            "ipFamilyPolicy": "PreferDualStack",
+            "selector": labels,
+            "ports": ports,
+        }
+    })
 }
