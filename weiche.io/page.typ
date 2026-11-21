@@ -1,51 +1,32 @@
 #import "meta.typ": head, site
+#import "nav.typ": banner, breadcrumbs, contents, footer
 
-#let nav-link(href, body, current: false) = html.elem(
-  "a",
-  attrs: (href: href, ..if current { ("aria-current": "page") } else { (:) }),
-  body,
-)
+#let root-for(path) = if path == "" { "./" } else { "../" * path.matches("/").len() }
 
-#let page(
-  title: site.name + " — A Kubernetes gateway, built in Rust",
-  description: site.description,
-  path: "",
-  root: "./",
-  body-class: "",
-  body,
-) = {
+#let page(title: site.name, description: site.description, path: "", main-class: "", body) = {
+  let root = root-for(path)
   html.html(lang: "en", {
-    html.head(head(
-      title: title,
-      description: description,
-      path: path,
-      root: root,
-    ))
-    html.body(class: body-class, {
-      html.a(href: "#main", class: "skip-link")[Skip to content]
-      html.header(class: "site-header wrap", {
-        html.a(href: root, class: "brand", aria-label: "Weiche home", {
-          html.img(
-            src: root + "weiche.svg",
-            width: 34,
-            height: 34,
-            alt: "",
-          )
-          [Weiche]
-        })
-        html.nav(aria-label: "Main navigation", {
-          nav-link(root + "guide/", [Guide], current: path == "guide/")
-          nav-link(site.repository, [GitHub])
-        })
-      })
-      html.main(id: "main", class: if body-class == "home" { "landing" } else { "wrap reader" }, body)
-      html.footer(class: "site-footer wrap", {
-        html.a(class: "footer-brand", href: root)[Weiche]
-        html.nav(aria-label: "Project links", {
-          html.a(href: root + "weiche.svg")[Project logo]
-          html.a(href: site.repository + "/issues")[Issues]
-        })
-      })
+    html.head(head(title: title, description: description, path: path, root: root))
+    html.body({
+      banner(root, path)
+      html.main(id: "main", class: main-class, body)
+      footer(root)
     })
   })
 }
+
+#let article(meta, body) = page(
+  title: meta.title + " — " + site.name,
+  description: meta.description,
+  path: meta.path,
+  main-class: "wrap reader",
+  {
+    html.header(class: "page-intro", {
+      breadcrumbs(root-for(meta.path), meta.breadcrumb)
+      html.h1(meta.heading)
+      html.p(class: "lede", meta.intro)
+    })
+    contents()
+    html.article(class: "prose", body)
+  },
+)

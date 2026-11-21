@@ -1,6 +1,9 @@
 #import "page.typ": page
 #import "meta.typ": site
-#show: page.with(body-class: "home")
+#show: page.with(
+  title: site.name + " — A Kubernetes gateway, built in Rust",
+  main-class: "landing",
+)
 
 #html.section(class: "hero hero-layout wrap", aria-labelledby: "title", {
   html.header(class: "hero-copy", {

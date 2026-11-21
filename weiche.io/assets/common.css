@@ -98,9 +98,8 @@ a:hover { text-decoration: underline; }
 .toc a { font-size: .9rem; color: var(--muted); text-decoration: none; }
 .toc a:hover, .crumbs a:hover { color: var(--link); text-decoration: underline; }
 .prose { grid-area: article; min-width: 0; line-height: 1.7; }
-.prose section { border-top: 1px solid var(--line); padding-top: 1.45rem; }
-.prose section + section { margin-top: 2rem; }
-.prose h2 { font-size: 1.6rem; letter-spacing: -.035em; margin-bottom: .75rem; }
+.prose h2:not(:first-child) { margin-top: 2rem; }
+.prose h2 { border-top: 1px solid var(--line); padding-top: 1.45rem; font-size: 1.6rem; letter-spacing: -.035em; margin-bottom: .75rem; }
 .prose p + p { margin-top: 1rem; }
 pre { margin: .9rem 0 1.2rem; padding: 1rem 1.25rem; overflow-x: auto; border: 1px solid var(--line); border-radius: .7rem; background: var(--panel); box-shadow: 0 2px 6px var(--shade); }
 code { font: .9em/1.7 var(--mono); }
