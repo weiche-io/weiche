@@ -7,6 +7,8 @@
   `article`, `section`, `aside`, `footer`).
 - centralize styling in `weiche.io/assets/common.css` using css custom
   properties, `prefers-color-scheme`, and `@media print`; avoid inline styles.
+- always attribute adapted third-party styles, palettes, or assets with their
+  upstream repository, commit/version, and license header in the file.
 - keep accessibility intact: skip link, focus-visible outlines, `aria-current`,
   and meaningful `alt` text on images.
 
