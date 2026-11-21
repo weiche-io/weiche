@@ -26,7 +26,10 @@ pub struct Connector {
 
 impl Connector {
     pub async fn connect(&self, endpoint: &EndpointKey) -> anyhow::Result<Connected> {
-        let (sender, connection) = http1::handshake(self.open(endpoint).await?).await?;
+        let (sender, connection) = http1::Builder::new()
+            .max_buf_size(self.max_buffer)
+            .handshake(self.open(endpoint).await?)
+            .await?;
         let address = endpoint.address;
         let driver = runtime::spawn(async move {
             if let Err(error) = connection.await {

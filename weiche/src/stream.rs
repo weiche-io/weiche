@@ -5,7 +5,7 @@ pub mod down;
 mod io;
 pub mod up;
 
-pub use dataplane::WorkerGroup;
+pub use dataplane::{WorkerGroup, runtime};
 
 pub async fn stopped(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     if !*shutdown.borrow_and_update() {

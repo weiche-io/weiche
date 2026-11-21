@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use tracing_subscriber::EnvFilter;
-use weiche::{control, gateway, proxy, rtconf::RuntimeConfig};
+use weiche::{control, gateway, proxy, rtconf::RuntimeConfig, stream};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
             .block_on(control::run()),
         [role, resource] if role == "proxy" => {
             let runtime = RuntimeConfig::from_env()?;
-            let io = compio::runtime::Runtime::new().context("create proxy runtime")?;
+            let io = stream::runtime().context("create proxy runtime")?;
             tracing::info!(workers=runtime.workers.get(), driver=?io.driver_type(), "starting data plane");
             io.block_on(gateway::run(resource.clone(), runtime))
         }
