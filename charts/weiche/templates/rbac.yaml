@@ -51,10 +51,6 @@ rules:
     resources: [leases]
     resourceNames: [weiche-controller]
     verbs: [get, patch]
-  # Retire GatewayClass-owned Services left by the shared proxy deployment.
-  - apiGroups: ['']
-    resources: [services]
-    verbs: [delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

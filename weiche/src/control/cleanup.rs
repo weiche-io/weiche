@@ -1,9 +1,5 @@
 //! retire only resources whose recorded owner and identity still match the observed Gateway.
-use super::{
-    GatewayStores,
-    service::{OWNER, Plan},
-    workload::Settings,
-};
+use super::{GatewayStores, service::Plan, workload::Settings};
 use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{ConfigMap, Secret, Service, ServiceAccount},
@@ -91,49 +87,6 @@ pub async fn retired(
             ApiResource::erase::<ConfigMap>(&()),
         ] {
             remove(client, kind, &ns, &name, &owner.uid).await?;
-        }
-    }
-
-    // older releases put GatewayClass-owned Services alongside the controller.
-    for svc in stores.services.state() {
-        let Some(uid) = svc.labels().get(OWNER) else { continue };
-        let name = svc.name_any();
-        if svc.namespace().as_deref() != Some(client.default_namespace())
-            || name != format!("weiche-{uid}")
-        {
-            continue;
-        }
-        let Some(owner) = svc.owner_references().iter().find(|r| {
-            r.controller == Some(true)
-                && r.kind == "GatewayClass"
-                && r.api_version == "gateway.networking.k8s.io/v1"
-        }) else {
-            continue;
-        };
-        if !stores.gateway_classes.state().iter().any(|c| {
-            c.uid().as_deref() == Some(&owner.uid)
-                && c.spec.controller_name == super::CONTROLLER_NAME
-        }) {
-            continue;
-        }
-        let ready = plans
-            .iter()
-            .any(|p| p.programmed && p.gateway.uid().as_deref() == Some(uid));
-        if ready
-            || !stores
-                .gateways
-                .state()
-                .iter()
-                .any(|g| g.uid().as_deref() == Some(uid))
-        {
-            remove(
-                client,
-                ApiResource::erase::<Service>(&()),
-                client.default_namespace(),
-                &name,
-                &owner.uid,
-            )
-            .await?;
         }
     }
     Ok(())
