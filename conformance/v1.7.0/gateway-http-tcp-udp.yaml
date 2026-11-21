@@ -1,0 +1,41 @@
+apiVersion: gateway.networking.k8s.io/v1
+date: "2026-11-21T08:57:05Z"
+gatewayAPIChannel: standard
+gatewayAPIVersion: v1.7.0
+implementation:
+  contact:
+  - https://github.com/weiche-io/weiche/issues
+  organization: weiche-io
+  project: weiche
+  url: https://github.com/weiche-io/weiche
+  version: 0.1.0-dev+bfd69b7
+kind: ConformanceReport
+mode: shared
+profiles:
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 40
+      Skipped: 0
+  name: GATEWAY-HTTP
+  summary: Core tests succeeded.
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 20
+      Skipped: 0
+  name: GATEWAY-TCP
+  summary: Core tests succeeded.
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 21
+      Skipped: 0
+  name: GATEWAY-UDP
+  summary: Core tests succeeded.
+succeededProvisionalTests:
+- GatewayPreserveForeignConditions
+- HTTPRoutePreserveForeignStatus
