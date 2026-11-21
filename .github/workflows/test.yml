@@ -1,0 +1,71 @@
+name: test
+
+on: pull_request
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build weiche
+        run: docker build -t localhost/weiche:demo .
+      - name: Fetch the suite matching the bundled CRDs
+        run: |
+          release=$(jq -er .release weiche-gtwapi/manifests/source.json)
+          git clone --quiet --depth 1 --branch "$release" https://github.com/kubernetes-sigs/gateway-api.git gateway-api
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: gateway-api/conformance/go.mod
+          cache-dependency-path: gateway-api/conformance/go.sum
+      - name: Build the conformance runner
+        working-directory: gateway-api/conformance
+        run: CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/conformance.test" .
+      - name: Deploy to kind
+        run: |
+          go install sigs.k8s.io/kind@v0.31.0
+          kind create cluster --config test/contrib/kind.yaml --image kindest/node:v1.35.0 --wait 2m
+          kind load docker-image localhost/weiche:demo
+          kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
+          kubectl wait --for=condition=Established crd --all --timeout=2m
+          kubectl apply -k test/conformace
+          kubectl -n weiche-demo rollout status deployment/weiche --timeout=2m
+          kubectl wait --for=condition=Accepted gatewayclass/weiche --timeout=2m
+      - name: Run Gateway API Core profiles
+        id: suite
+        run: |
+          docker cp "$RUNNER_TEMP/conformance.test" kind-control-plane:/tmp/conformance.test
+          docker exec -e KUBECONFIG=/etc/kubernetes/admin.conf kind-control-plane \
+            /tmp/conformance.test -test.v -test.run '^TestConformance$' -test.timeout=35m \
+            -gateway-class weiche -conformance-profiles GATEWAY-HTTP,GATEWAY-TCP,GATEWAY-UDP \
+            -organization weiche-io -project weiche -url https://github.com/weiche-io/weiche \
+            -contact https://github.com/weiche-io/weiche/issues -version "$GITHUB_SHA" \
+            -mode shared -report-output /tmp/report.yaml
+      - name: Collect the report
+        id: report
+        if: ${{ !cancelled() && steps.suite.outcome != 'skipped' }}
+        run: docker cp kind-control-plane:/tmp/report.yaml "$RUNNER_TEMP/report.yaml"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        with:
+          name: gateway-api-conformance
+          path: ${{ runner.temp }}/report.yaml
+          if-no-files-found: error
