@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 use super::super::ir::{Route, StreamRoute, Transport, hostname_matches};
 use super::{
     GatewayStores, ResolveError,
-    tls::{Policies, TlsError, listener_tls},
+    tls::{Policies, listener_tls},
 };
 use kube::{Resource, ResourceExt};
 use serde::Serialize;
@@ -59,10 +59,17 @@ pub struct RouteReport {
     pub message: String,
 }
 
+/// listener ResolvedRefs failure reason and status message.
+#[derive(Clone, Debug)]
+pub struct RefsError {
+    pub reason: &'static str,
+    pub message: String,
+}
+
 /// data plane snapshot and corresponding control plane status.
 pub struct Compiled {
     pub policies: Policies,
-    pub certificate_error: Option<TlsError>,
+    pub refs_error: Option<RefsError>,
     pub address: SocketAddr,
     pub tls: Option<Arc<super::super::ir::ServerTls>>,
     pub conflict: Option<&'static str>,
@@ -101,7 +108,7 @@ pub fn compile(
     });
     let mut result = Compiled {
         policies: Policies::default(),
-        certificate_error: None,
+        refs_error: None,
         address,
         tls: None,
         conflict: None,
@@ -154,18 +161,20 @@ pub fn compile(
             Err(error) => {
                 result.message = error.message.clone();
                 if matches!(error.reason, "InvalidCertificateRef" | "RefNotPermitted") {
-                    result.certificate_error = Some(error);
+                    result.refs_error =
+                        Some(RefsError { reason: error.reason, message: error.message });
                 } else {
                     result.reason = error.reason;
                 }
             }
         }
     }
-    if route_kind.is_some()
+    if result.refs_error.is_none()
+        && route_kind.is_some()
         && kinds
             .is_some_and(|ks| ks.iter().any(|k| !supports(k.group.as_deref(), &k.kind)))
     {
-        result.certificate_error = Some(TlsError {
+        result.refs_error = Some(RefsError {
             reason: "InvalidRouteKinds",
             message: "listener contains unsupported Route kinds".into(),
         });

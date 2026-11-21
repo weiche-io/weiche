@@ -177,9 +177,38 @@ where
         let previous = old_parents
             .iter()
             .find(|p| owned_parent(p) && &p["parentRef"] == parent);
-        parents.push(json!({"controllerName": CONTROLLER_NAME, "parentRef": parent,
-                "conditions": stamp(vec![condition("Accepted", report.accepted, report.reason, &report.message, route.meta().generation),
-                    condition("ResolvedRefs", report.resolved, report.refs_reason, if report.resolved { "backend references resolved" } else if report.refs_reason == "InvalidBackendTLSPolicy" { "the referenced Service has an invalid BackendTLSPolicy" } else { "backend reference is missing, unsupported or not permitted" }, route.meta().generation)], previous.and_then(|p| p.get("conditions")))}));
+        let generation = route.meta().generation;
+        let refs_message = if report.resolved {
+            "backend references resolved"
+        } else if report.refs_reason == "InvalidBackendTLSPolicy" {
+            "the referenced Service has an invalid BackendTLSPolicy"
+        } else {
+            "backend reference is missing, unsupported or not permitted"
+        };
+        let conditions = stamp(
+            vec![
+                condition(
+                    "Accepted",
+                    report.accepted,
+                    report.reason,
+                    &report.message,
+                    generation,
+                ),
+                condition(
+                    "ResolvedRefs",
+                    report.resolved,
+                    report.refs_reason,
+                    refs_message,
+                    generation,
+                ),
+            ],
+            previous.and_then(|p| p.get("conditions")),
+        );
+        parents.push(json!({
+            "controllerName": CONTROLLER_NAME,
+            "parentRef": parent,
+            "conditions": conditions,
+        }));
     }
     if parents.is_empty() && old_parents.is_empty() {
         return Ok(());
@@ -250,7 +279,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             .flatten()
             .find(|v| v["name"] == l.name);
         let bound = plan.programmed && report.accepted;
-        let error = report.certificate_error.as_ref();
+        let error = report.refs_error.as_ref();
         let attached = report
             .reports
             .iter()
@@ -259,16 +288,49 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         let kinds = if let Some(kind) = report.supported_kind {
-            json!([{"group":"gateway.networking.k8s.io","kind":kind}])
+            json!([{"group": "gateway.networking.k8s.io", "kind": kind}])
         } else {
             json!([])
         };
-        statuses.push(json!({"name":l.name,"attachedRoutes":attached,"supportedKinds":kinds,"conditions":stamp(vec![
-            condition("Accepted",report.accepted,report.reason,&report.message,generation),
-            condition("Programmed",bound,if bound {"Programmed"}else{"Pending"},"proxy snapshot and listener readiness",generation),
-            condition("ResolvedRefs",error.is_none(),error.map_or("ResolvedRefs",|e|e.reason),error.map_or("listener references resolved",|e| &e.message),generation),
-            condition("Conflicted",report.conflict.is_some(),report.conflict.unwrap_or("NoConflicts"),"listener distinctness",generation)
-        ],previous.and_then(|v|v.get("conditions")))}));
+        let conditions = stamp(
+            vec![
+                condition(
+                    "Accepted",
+                    report.accepted,
+                    report.reason,
+                    &report.message,
+                    generation,
+                ),
+                condition(
+                    "Programmed",
+                    bound,
+                    if bound { "Programmed" } else { "Pending" },
+                    "proxy snapshot and listener readiness",
+                    generation,
+                ),
+                condition(
+                    "ResolvedRefs",
+                    error.is_none(),
+                    error.map_or("ResolvedRefs", |e| e.reason),
+                    error.map_or("listener references resolved", |e| &e.message),
+                    generation,
+                ),
+                condition(
+                    "Conflicted",
+                    report.conflict.is_some(),
+                    report.conflict.unwrap_or("NoConflicts"),
+                    "listener distinctness",
+                    generation,
+                ),
+            ],
+            previous.and_then(|v| v.get("conditions")),
+        );
+        statuses.push(json!({
+            "name": l.name,
+            "attachedRoutes": attached,
+            "supportedKinds": kinds,
+            "conditions": conditions,
+        }));
     }
     desired["listeners"] = json!(statuses);
     patch_status(
