@@ -1,7 +1,11 @@
 //! downstream TCP listeners for HTTP/1 and HTTP/2.
 use super::{
     super::{
-        super::{routing, rtconf::RuntimeConfig},
+        super::{
+            ir::{StreamRoute, Transport},
+            routing,
+            rtconf::RuntimeConfig,
+        },
         core::{http::ProxyService, tcp::Admission},
         stopped,
     },
@@ -15,7 +19,7 @@ use compio::{
         time::{sleep, timeout},
     },
 };
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{collections::BTreeMap, io, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::watch;
 
@@ -41,6 +45,10 @@ pub(in super::super) async fn run(
     let mut sockets = BTreeMap::<
         SocketAddr,
         (super::super::super::ir::Listener, watch::Sender<bool>),
+    >::new();
+    let mut streams = BTreeMap::<
+        (Transport, SocketAddr),
+        (String, watch::Sender<Arc<StreamRoute>>),
     >::new();
     let mut serving = FuturesUnordered::new();
     let stopping = stopped(stop.subscribe());
@@ -69,26 +77,85 @@ pub(in super::super) async fn run(
                 Ok(socket) => {
                     let (close, rx) = watch::channel(false);
                     sockets.insert(*address, (routes.listener.clone(), close));
-                    serving.push(accept(
-                        socket,
-                        server.clone(),
-                        routes.listener.clone(),
-                        admission.clone(),
-                        rx,
-                        runtime.worker_drain_timeout,
-                    ));
+                    serving.push(
+                        accept(
+                            socket,
+                            server.clone(),
+                            routes.listener.clone(),
+                            admission.clone(),
+                            rx,
+                            runtime.worker_drain_timeout,
+                        )
+                        .boxed_local(),
+                    );
                 }
                 Err(error) => tracing::warn!(%address,%error,"listener bind failed"),
+            }
+        }
+        streams.retain(|key, (uid, _)| {
+            snapshot
+                .gateway
+                .streams
+                .get(key)
+                .is_some_and(|l| &l.gateway_uid == uid)
+        });
+        for (&key, listener) in &snapshot.gateway.streams {
+            if let Some((_, tx)) = streams.get(&key) {
+                tx.send_if_modified(|current| {
+                    if *current == listener.route {
+                        false
+                    } else {
+                        *current = listener.route.clone();
+                        true
+                    }
+                });
+                continue;
+            }
+            let (tx, rx) = watch::channel(listener.route.clone());
+            let (transport, address) = key;
+            let task = match transport {
+                Transport::Tcp => listen(address).map(|s| {
+                    super::relay::serve(
+                        s,
+                        rx,
+                        admission.clone(),
+                        runtime.connection_drain_timeout,
+                    )
+                    .boxed_local()
+                }),
+                Transport::Udp => super::udp::listen(address).map(|s| {
+                    super::udp::serve(
+                        s,
+                        rx,
+                        admission.clone(),
+                        runtime.upstream_idle_timeout,
+                    )
+                    .boxed_local()
+                }),
+            };
+            match task {
+                Ok(task) => {
+                    serving.push(task);
+                    streams.insert(key, (listener.gateway_uid.clone(), tx));
+                }
+                Err(error) => {
+                    tracing::warn!(%address,?transport,%error,"transport listener bind failed")
+                }
             }
         }
         listeners.report(
             id,
             WorkerStatus {
                 revision: snapshot.revision,
-                bound: sockets.keys().copied().collect(),
+                bound: sockets
+                    .keys()
+                    .map(|a| (Transport::Tcp, *a))
+                    .chain(streams.keys().copied())
+                    .collect(),
             },
         );
-        let retry = sockets.len() != snapshot.gateway.sockets.len();
+        let retry = sockets.len() != snapshot.gateway.sockets.len()
+            || streams.len() != snapshot.gateway.streams.len();
         tokio::select! {
             biased;
             _=&mut stopping=>break,
@@ -100,6 +167,7 @@ pub(in super::super) async fn run(
     for (_, (_, close)) in sockets {
         close.send_replace(true);
     }
+    drop(streams);
     while serving.next().await.is_some() {}
     listeners.report(id, WorkerStatus::default());
     server.service.close();

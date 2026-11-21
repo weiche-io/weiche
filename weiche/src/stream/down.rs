@@ -2,11 +2,12 @@
 mod http;
 #[cfg(feature = "quic")]
 pub mod quic;
+mod relay;
 pub mod tcp;
 mod tls;
 pub mod udp;
 
-use super::super::ir::Revision;
+use super::super::ir::{Revision, Transport};
 use std::{collections::BTreeSet, net::SocketAddr, sync::Mutex};
 use tokio::sync::watch;
 
@@ -14,14 +15,18 @@ use tokio::sync::watch;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkerStatus {
     pub revision: Revision,
-    pub bound: BTreeSet<SocketAddr>,
+    pub bound: BTreeSet<(Transport, SocketAddr)>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkerGroupState {
     pub workers: Vec<WorkerStatus>,
 }
 impl WorkerGroupState {
-    pub fn programmed(&self, revision: Revision, address: SocketAddr) -> bool {
+    pub fn programmed(
+        &self,
+        revision: Revision,
+        address: (Transport, SocketAddr),
+    ) -> bool {
         !self.workers.is_empty()
             && self
                 .workers
