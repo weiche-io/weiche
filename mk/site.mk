@@ -1,9 +1,9 @@
-SITE := weiche.io
+SITE     := weiche.io
 SITE_OUT := $(SITE)/build
-TYPST ?= typst
-PORT ?= 8000
+TYPST    ?= typst
+PORT     ?= 8000
 
-PAGES := $(SITE_OUT)/index.html $(patsubst $(SITE)/src/%.typ,$(SITE_OUT)/%.html,$(shell find $(SITE)/src -name index.typ -type f))
+PAGES  := $(SITE_OUT)/index.html $(patsubst $(SITE)/src/%.typ,$(SITE_OUT)/%.html,$(shell find $(SITE)/src -name index.typ -type f))
 ASSETS := $(patsubst $(SITE)/assets/%,$(SITE_OUT)/%,$(shell find $(SITE)/assets -type f))
 # Each article can keep its metadata beside index.typ.
 ARTICLE_META := $(shell find $(SITE)/src -type f -name meta.typ)

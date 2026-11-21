@@ -1,9 +1,9 @@
-SPEC := target/conformance
-SUITE := $(SPEC)/gateway-api
+SPEC         := target/conformance
+SUITE        := $(SPEC)/gateway-api
 KIND_VERSION := v0.31.0
-KIND := $(SPEC)/kind-$(KIND_VERSION)/kind
-NODE_IMAGE := docker.io/kindest/node:v1.35.0
-PROFILES := GATEWAY-HTTP,GATEWAY-TCP,GATEWAY-UDP
+KIND         := $(SPEC)/kind-$(KIND_VERSION)/kind
+NODE_IMAGE   := docker.io/kindest/node:v1.35.0
+PROFILES     := GATEWAY-HTTP,GATEWAY-TCP,GATEWAY-UDP
 
 .PHONY: conformance-source conformance
 conformance-source: $(SUITE)/go.work
