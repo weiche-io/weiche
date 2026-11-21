@@ -42,18 +42,19 @@ conformance: $(SPEC)/conformance.test $(KIND)
 	kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
 	kubectl wait --for=condition=Established crd --all --timeout=2m
 	$(call log,APPLY,test/weiche.yaml)
-	kubectl apply -f test/weiche.yaml
+	kubectl create namespace gateway-conformance-infra
+	helm install weiche charts/weiche --namespace weiche-spec --create-namespace -f test/weiche.yaml
 	kubectl -n weiche-spec rollout status deployment/weiche --timeout=2m
 	kubectl wait --for=condition=Accepted gatewayclass/weiche --timeout=2m
 	docker cp "$<" "$$node:/tmp/conformance.test"
 	status=0
 	$(call log,TEST,$(PROFILES))
 	docker exec -e KUBECONFIG=/etc/kubernetes/admin.conf "$$node" \
-	    /tmp/conformance.test -test.v -test.run '^TestConformance$$' -test.timeout=35m \
+	    /tmp/conformance.test -test.v -test.parallel=4 -test.run '^TestConformance$$' -test.timeout=35m \
 	    -gateway-class weiche -conformance-profiles $(PROFILES) \
 	    -organization weiche-io -project weiche -url https://github.com/weiche-io/weiche \
 	    -contact https://github.com/weiche-io/weiche/issues -version "$$(git rev-parse HEAD)" \
-	    -mode shared -report-output /tmp/report.yaml || status=$$?
+	    -mode dedicated -report-output /tmp/report.yaml || status=$$?
 	$(call log,REPORT,$(SPEC)/report.yaml)
 	docker cp "$$node:/tmp/report.yaml" "$$run/report.yaml"
 	mv "$$run/report.yaml" "$(SPEC)/report.yaml"

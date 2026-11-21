@@ -6,7 +6,7 @@
 
 = Prerequisites <prerequisites>
 
-Use a Linux host with Docker running, GNU Make, Bash, Git, Go, jq and kubectl.
+Use a Linux host with Docker running, GNU Make, Bash, Git, Go, Helm, jq and kubectl.
 The build downloads kind and the Go toolchain selected by the upstream suite.
 
 = Run the suite <run>
@@ -25,7 +25,7 @@ The build downloads kind and the Go toolchain selected by the upstream suite.
 
 Make builds the Weiche image and the test runner, creates a temporary kind
 cluster, and installs the bundled Gateway API definitions and the #link(
-  blob + "test/weiche.yaml",
+  tree + "charts/weiche",
 )[Weiche controller]. The upstream suite creates its own Gateways, routes and
 backends. The runner executes inside the kind node to reach their cluster IPs.
 
