@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build weiche
-        run: docker build -t localhost/weiche:demo .
+        run: docker build -t localhost/weiche:spec .
       - name: Fetch the suite matching the bundled CRDs
         run: |
           release=$(jq -er .release weiche-gtwapi/manifests/source.json)
@@ -42,12 +42,12 @@ jobs:
       - name: Deploy to kind
         run: |
           go install sigs.k8s.io/kind@v0.31.0
-          kind create cluster --config test/contrib/kind.yaml --image kindest/node:v1.35.0 --wait 2m
-          kind load docker-image localhost/weiche:demo
+          kind create cluster --image kindest/node:v1.35.0 --wait 2m
+          kind load docker-image localhost/weiche:spec
           kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
           kubectl wait --for=condition=Established crd --all --timeout=2m
-          kubectl apply -k test/spec
-          kubectl -n weiche-demo rollout status deployment/weiche --timeout=2m
+          kubectl apply -f test/spec
+          kubectl -n weiche-spec rollout status deployment/weiche --timeout=2m
           kubectl wait --for=condition=Accepted gatewayclass/weiche --timeout=2m
       - name: Run Gateway API Core profiles
         id: suite

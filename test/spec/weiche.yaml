@@ -1,18 +1,18 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: weiche-demo
+  name: weiche-spec
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weiche
-  namespace: weiche-demo
+  namespace: weiche-spec
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: weiche-demo
+  name: weiche-spec
 rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses, gateways, httproutes, tcproutes, udproutes, referencegrants, backendtlspolicies]
@@ -33,15 +33,39 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: weiche-demo
+  name: weiche-spec
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: weiche-demo
+  name: weiche-spec
 subjects:
   - kind: ServiceAccount
     name: weiche
-    namespace: weiche-demo
+    namespace: weiche-spec
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: weiche-services
+  namespace: weiche-spec
+rules:
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: weiche-services
+  namespace: weiche-spec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: weiche-services
+subjects:
+  - kind: ServiceAccount
+    name: weiche
+    namespace: weiche-spec
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -50,29 +74,14 @@ metadata:
 spec:
   controllerName: weiche.io/gateway-controller
 ---
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: weiche
-  namespace: weiche-demo
-spec:
-  gatewayClassName: weiche
-  listeners:
-    - name: http
-      port: 8080
-      protocol: HTTP
-      hostname: '*.demo.local'
-      allowedRoutes:
-        namespaces:
-          from: Same
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: weiche
-  namespace: weiche-demo
+  namespace: weiche-spec
 spec:
-  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: weiche
@@ -85,31 +94,22 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: weiche
-          image: localhost/weiche:demo
+          image: localhost/weiche:spec
           imagePullPolicy: Never
           env:
+            - name: WEICHE_MANAGE_GATEWAYS
+              value: "true"
             - name: WEICHE_NAMESPACE
-              value: weiche-demo
-            - name: WEICHE_GATEWAY
-              value: weiche
-            - name: WEICHE_LISTENER
-              value: http
-            - name: RUST_LOG
-              value: info,weiche::controller=warn
-          ports:
-            - name: http
-              containerPort: 8080
-          readinessProbe:
-            tcpSocket:
-              port: http
-            periodSeconds: 1
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
-            # Local demo: common default profiles deny io_uring syscalls.
+            # the gateway worker needs io_uring in the kind node.
             seccompProfile:
               type: Unconfined
           resources:
@@ -118,16 +118,3 @@ spec:
               memory: 64Mi
             limits:
               memory: 256Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: weiche
-  namespace: weiche-demo
-spec:
-  selector:
-    app: weiche
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
