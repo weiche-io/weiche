@@ -1,3 +1,4 @@
+#let order = 10
 #let title = "Get started"
 #let description = "Build Weiche and run the Gateway API conformance suite on kind."
 #let breadcrumb = [Guide]

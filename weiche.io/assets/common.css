@@ -134,6 +134,8 @@ a:hover {
   top: 0;
   z-index: 3;
   min-height: 4rem;
+  flex-wrap: wrap;
+  padding-block: 0.35rem;
   border-bottom: 1px solid var(--line);
   background: var(--paper);
 }
@@ -153,7 +155,8 @@ a:hover {
 }
 .site-header nav,
 .site-footer nav {
-  gap: 1.8rem;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.8rem;
 }
 .site-header nav a,
 .site-footer nav a {
@@ -333,8 +336,45 @@ a:hover {
   letter-spacing: -0.035em;
   margin-bottom: 0.75rem;
 }
-.prose p + p {
-  margin-top: 1rem;
+.prose h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1.18rem;
+  letter-spacing: -0.02em;
+}
+.prose p + p,
+.prose ul + p,
+.prose ol + p,
+.prose pre + p,
+.prose table + p {
+  margin-top: 0.9rem;
+}
+.prose ul,
+.prose ol {
+  margin: 0.75rem 0 1rem;
+  padding-left: 1.4rem;
+}
+.prose li + li {
+  margin-top: 0.35rem;
+}
+.prose table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 1rem 0 1.25rem;
+  font-size: 0.94rem;
+}
+.prose th,
+.prose td {
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line);
+}
+.prose th {
+  font-weight: 600;
+  border-bottom-width: 2px;
+  white-space: nowrap;
 }
 pre {
   margin: 0.9rem 0 1.2rem;

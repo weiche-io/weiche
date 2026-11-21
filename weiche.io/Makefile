@@ -51,13 +51,13 @@ build/nav.typ: $(SRC_META) src
 			printf '    import "/%s" as m\n' "$$meta"; \
 			printf '    let fields = dictionary(m)\n'; \
 			printf '    if fields.at("nav", default: true) {\n'; \
-			printf '      ((path: "%s/", label: fields.at("breadcrumb", default: m.title)),)\n' "$$section"; \
+			printf '      ((order: fields.at("order", default: 100), path: "%s/", label: fields.at("breadcrumb", default: m.title)),)\n' "$$section"; \
 			printf '    } else {\n'; \
 			printf '      ()\n'; \
 			printf '    }\n'; \
 			printf '  },\n'; \
 		done; \
-		printf ').flatten()\n'; \
+		printf ').flatten().sorted(key: it => it.order)\n'; \
 	} > "$@.tmp" && mv "$@.tmp" "$@" || { rm -f "$@.tmp"; exit 1; }
 
 build/%/index.typ: src/%/index.typ src/%/meta.typ src/%
