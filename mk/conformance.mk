@@ -46,16 +46,20 @@ conformance: $(SPEC)/conformance.test $(KIND)
 	helm install weiche charts/weiche --namespace weiche-spec --create-namespace -f test/weiche.yaml
 	kubectl -n weiche-spec rollout status deployment/weiche --timeout=2m
 	kubectl wait --for=condition=Accepted gatewayclass/weiche --timeout=2m
-	docker cp "$<" "$$node:/tmp/conformance.test"
+	# keep docker cp on the node's root filesystem because kind mounts /tmp separately.
+	docker cp "$<" "$$node:/conformance.test"
 	status=0
 	$(call log,TEST,$(PROFILES))
 	docker exec -e KUBECONFIG=/etc/kubernetes/admin.conf "$$node" \
-	    /tmp/conformance.test -test.v -test.parallel=4 -test.run '^TestConformance$$' -test.timeout=35m \
+	    /conformance.test -test.v -test.parallel=4 -test.run '^TestConformance$$' -test.timeout=35m \
 	    -gateway-class weiche -conformance-profiles $(PROFILES) \
 	    -organization weiche-io -project weiche -url https://github.com/weiche-io/weiche \
 	    -contact https://github.com/weiche-io/weiche/issues -version "$$(git rev-parse HEAD)" \
-	    -mode dedicated -report-output /tmp/report.yaml || status=$$?
+	    -mode dedicated -report-output /report.yaml || status=$$?
+	if [ "$$status" -ne 0 ] && ! docker exec "$$node" test -f /report.yaml; then
+	    exit "$$status"
+	fi
 	$(call log,REPORT,$(SPEC)/report.yaml)
-	docker cp "$$node:/tmp/report.yaml" "$$run/report.yaml"
+	docker cp "$$node:/report.yaml" "$$run/report.yaml"
 	mv "$$run/report.yaml" "$(SPEC)/report.yaml"
 	exit "$$status"
