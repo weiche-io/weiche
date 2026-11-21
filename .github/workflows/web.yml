@@ -1,0 +1,54 @@
+name: weiche.io
+on:
+  pull_request:
+    paths: &web
+      - 'weiche.io/**'
+      - 'Makefile'
+      - 'mk/site.mk'
+      - '.github/workflows/web.yml'
+  push:
+    branches: [master]
+    paths: *web
+permissions:
+  contents: read
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: typst-community/setup-typst@48aeee7543d37f01afd1ffb27307dc277387ba13 # v4
+        with:
+          typst-version: 0.15.1
+      - run: sudo apt-get update && sudo apt-get install -y minify
+      - run: make -j"$(nproc)" web MINIFY=y
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: weiche.io
+          path: |
+            weiche.io/build/
+            !weiche.io/build/**/*.typ
+            !weiche.io/build/**/*.bib
+          retention-days: 1
+  deploy:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: weiche.io
+          path: build/
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy build --project-name weiche --branch master --commit-hash ${{ github.sha }}

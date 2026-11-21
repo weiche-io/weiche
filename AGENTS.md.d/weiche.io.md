@@ -11,6 +11,7 @@
 
 ## build layout and makefiles
 
+- build the documentation site from the repository root with `make web`.
 - keep the website self-contained under `weiche.io/` with its own `Makefile` and
   modular `mk/{log,assets,typst}.mk`; keep root `mk/site.mk` as a thin
   forwarding layer.
