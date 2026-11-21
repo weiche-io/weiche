@@ -1,7 +1,9 @@
 //! report gateway and route conditions for the applied worker revision.
 use super::{
     super::{ir::Revision, stream::down::WorkerGroupState},
-    CONTROLLER_NAME, Compiled, GatewayStores, Selection,
+    CONTROLLER_NAME, GatewayStores, Selection,
+    compile::RouteReport,
+    service::Plan,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -43,6 +45,15 @@ fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
                 )
             });
     }
+    if let Some(old) = old.and_then(Value::as_array) {
+        for previous in old {
+            if previous["type"].as_str().is_some_and(|t| {
+                t.contains('/') && !conditions.iter().any(|c| c["type"] == t)
+            }) {
+                conditions.push(previous.clone());
+            }
+        }
+    }
     json!(conditions)
 }
 
@@ -73,121 +84,47 @@ pub async fn update_status(
     client: &Client,
     stores: &GatewayStores,
     selection: &Selection,
-    compiled: &Compiled,
+    plans: &[Plan],
     revision: Revision,
-    listener: &WorkerGroupState,
+    workers: &WorkerGroupState,
 ) -> anyhow::Result<()> {
-    update_policies(client, stores, selection, compiled).await?;
-    let Some(gateway) = stores.gateways.state().into_iter().find(|g| {
-        g.namespace().as_deref() == Some(&selection.namespace)
-            && g.name_any() == selection.gateway
-    }) else {
-        return Ok(());
-    };
-    let Some(class) = stores.gateway_classes.state().into_iter().find(|c| {
-        c.name_any() == gateway.spec.gateway_class_name
-            && c.spec.controller_name == CONTROLLER_NAME
-    }) else {
-        return Ok(());
-    };
-    let class_old = class
-        .status
-        .as_ref()
-        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-    let class_accepted = class.spec.parameters_ref.is_none();
-    let mut class_status = class_old.clone();
-    class_status["conditions"] = stamp(
-        vec![condition(
-            "Accepted",
-            class_accepted,
-            if class_accepted { "Accepted" } else { "InvalidParameters" },
-            "Weiche HTTP gateway controller",
-            class.metadata.generation,
-        )],
-        class_old.get("conditions"),
-    );
-    patch_status(
-        Api::<GatewayClass>::all(client.clone()),
-        class.as_ref(),
-        &class_old,
-        class_status,
-    )
-    .await?;
-
-    let old = gateway
-        .status
-        .as_ref()
-        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-    let programmed =
-        compiled.accepted && listener.programmed(revision, compiled.snapshot.address());
-    let programmed_reason = if !compiled.accepted {
-        "Invalid"
-    } else if programmed {
-        "Programmed"
-    } else {
-        "Pending"
-    };
-    let programmed_message = if !compiled.accepted {
-        &compiled.message
-    } else {
-        listener.error.as_deref().unwrap_or(if programmed {
-            "all workers applied the gateway snapshot and bound the listener"
-        } else {
-            "waiting for all workers to apply the gateway snapshot and bind the listener"
-        })
-    };
-    let conditions = stamp(
-        vec![
-            condition(
-                "Accepted",
-                compiled.accepted,
-                compiled.reason,
-                &compiled.message,
-                gateway.metadata.generation,
-            ),
-            condition(
-                "Programmed",
-                programmed,
-                programmed_reason,
-                programmed_message,
-                gateway.metadata.generation,
-            ),
-        ],
-        old.get("conditions"),
-    );
-    let old_listener = old
-        .get("listeners")
-        .and_then(Value::as_array)
-        .and_then(|ls| ls.iter().find(|l| l["name"] == selection.listener));
-    let accepted_routes: std::collections::BTreeSet<_> = compiled
-        .reports
-        .iter()
-        .filter(|r| r.accepted)
-        .map(|r| (r.route.namespace(), r.route.name_any()))
-        .collect();
-    let certificate = compiled.certificate_error.as_ref();
-    let listeners = if gateway.spec.listeners.iter().any(|l| l.name == selection.listener)
+    for class in stores
+        .gateway_classes
+        .state()
+        .into_iter()
+        .filter(|c| c.spec.controller_name == CONTROLLER_NAME)
     {
-        json!([{
-            "name": selection.listener, "attachedRoutes": accepted_routes.len(),
-            "supportedKinds": [{"group":"gateway.networking.k8s.io", "kind":"HTTPRoute"}],
-            "conditions": stamp(vec![condition("Accepted", compiled.accepted, compiled.reason, &compiled.message, gateway.metadata.generation),
-                condition("Programmed", programmed, programmed_reason, programmed_message, gateway.metadata.generation),
-                condition("ResolvedRefs", certificate.is_none(), certificate.map_or("ResolvedRefs", |e| e.reason), certificate.map_or("listener references resolved", |e| e.message.as_str()), gateway.metadata.generation)], old_listener.and_then(|l| l.get("conditions")))
-        }])
-    } else {
-        json!([])
-    };
-    let mut desired = old.clone();
-    desired["conditions"] = conditions;
-    desired["listeners"] = listeners;
-    patch_status(
-        Api::<Gateway>::namespaced(client.clone(), &selection.namespace),
-        gateway.as_ref(),
-        &old,
-        desired,
-    )
-    .await?;
+        let class_old = class
+            .status
+            .as_ref()
+            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
+        let class_accepted = class.spec.parameters_ref.is_none();
+        let mut class_status = class_old.clone();
+        class_status["conditions"] = stamp(
+            vec![condition(
+                "Accepted",
+                class_accepted,
+                if class_accepted { "Accepted" } else { "InvalidParameters" },
+                "Weiche HTTP gateway controller",
+                class.metadata.generation,
+            )],
+            class_old.get("conditions"),
+        );
+        if selection.managed {
+            class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"}]);
+        }
+        patch_status(
+            Api::<GatewayClass>::all(client.clone()),
+            class.as_ref(),
+            &class_old,
+            class_status,
+        )
+        .await?;
+    }
+    for plan in plans {
+        update_gateway(client, plan, revision, workers).await?;
+        update_policies(client, stores, plan).await?;
+    }
 
     for route in stores.http_routes.state() {
         let old = route
@@ -200,18 +137,32 @@ pub async fn update_status(
             .map_or(&[][..], Vec::as_slice);
         let owned_parent = |p: &Value| {
             p["controllerName"] == CONTROLLER_NAME
-                && p["parentRef"]["name"] == selection.gateway
-                && p["parentRef"]["namespace"]
-                    .as_str()
-                    .or(route.metadata.namespace.as_deref())
-                    == Some(&selection.namespace)
+                && (selection.managed
+                    || (p["parentRef"]["name"] == selection.gateway
+                        && p["parentRef"]["namespace"]
+                            .as_str()
+                            .or(route.metadata.namespace.as_deref())
+                            == Some(&selection.namespace)))
         };
         let mut parents: Vec<_> =
             old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
-        for report in compiled.reports.iter().filter(|r| {
-            r.route.name_any() == route.name_any()
-                && r.route.namespace() == route.namespace()
-        }) {
+        let mut reports = std::collections::BTreeMap::new();
+        for report in plans
+            .iter()
+            .flat_map(|p| &p.listeners)
+            .flat_map(|l| &l.reports)
+            .filter(|r| r.route.uid() == route.uid())
+        {
+            let key = serde_json::to_string(&report.parent)?;
+            let score = |r: &RouteReport| {
+                (r.accepted, r.reason != "NoMatchingParent", !r.resolved)
+            };
+            let chosen = reports.entry(key).or_insert(report);
+            if score(report) > score(chosen) {
+                *chosen = report;
+            }
+        }
+        for report in reports.into_values() {
             let parent = serde_json::to_value(&report.parent)?;
             let previous = old_parents
                 .iter()
@@ -237,13 +188,107 @@ pub async fn update_status(
     Ok(())
 }
 
+/// publish independent listener status and the address actually assigned by Kubernetes.
+async fn update_gateway(
+    client: &Client,
+    plan: &Plan,
+    revision: Revision,
+    workers: &WorkerGroupState,
+) -> anyhow::Result<()> {
+    let gateway = &plan.gateway;
+    let old = gateway
+        .status
+        .as_ref()
+        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
+    let generation = gateway.metadata.generation;
+    let accepted = plan.listeners.iter().any(|l| l.accepted);
+    let all_valid = plan.listeners.iter().all(|l| l.accepted);
+    let programmed = plan.available
+        && accepted
+        && plan
+            .listeners
+            .iter()
+            .filter(|l| l.accepted)
+            .all(|l| workers.programmed(revision, l.address));
+    let mut desired = old.clone();
+    desired["conditions"] = stamp(
+        vec![
+            condition(
+                "Accepted",
+                accepted,
+                if all_valid { "Accepted" } else { "ListenersNotValid" },
+                "evaluated gateway listeners",
+                generation,
+            ),
+            condition(
+                "Programmed",
+                programmed,
+                if programmed { "Programmed" } else { "Pending" },
+                "worker socket programming",
+                generation,
+            ),
+        ],
+        old.get("conditions"),
+    );
+    if let Some(addresses) = &plan.addresses {
+        desired["addresses"] = json!(
+            addresses
+                .iter()
+                .map(|ip| json!({"type":"IPAddress","value":ip}))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut statuses = Vec::new();
+    for (l, report) in gateway.spec.listeners.iter().zip(&plan.listeners) {
+        let previous = old["listeners"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|v| v["name"] == l.name);
+        let bound = plan.available
+            && report.accepted
+            && workers.programmed(revision, report.address);
+        let error = report.certificate_error.as_ref();
+        let attached = report
+            .reports
+            .iter()
+            .filter(|r| r.accepted)
+            .map(|r| r.route.uid())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let kinds = if report.supported_http {
+            json!([{"group":"gateway.networking.k8s.io","kind":"HTTPRoute"}])
+        } else {
+            json!([])
+        };
+        statuses.push(json!({"name":l.name,"attachedRoutes":attached,"supportedKinds":kinds,"conditions":stamp(vec![
+            condition("Accepted",report.accepted,report.reason,&report.message,generation),
+            condition("Programmed",bound,if bound {"Programmed"}else{"Pending"},"worker socket programming",generation),
+            condition("ResolvedRefs",error.is_none(),error.map_or("ResolvedRefs",|e|e.reason),error.map_or("listener references resolved",|e| &e.message),generation),
+            condition("Conflicted",report.reason=="Conflicted",if report.reason=="Conflicted" {"HostnameConflict"}else{"NoConflicts"},"listener distinctness",generation)
+        ],previous.and_then(|v|v.get("conditions")))}));
+    }
+    desired["listeners"] = json!(statuses);
+    patch_status(
+        Api::<Gateway>::namespaced(
+            client.clone(),
+            &gateway.namespace().unwrap_or_default(),
+        ),
+        gateway.as_ref(),
+        &old,
+        desired,
+    )
+    .await
+}
+
 /// reconcile this gateway's ancestor entry without overwriting other controllers' reports.
 async fn update_policies(
     client: &Client,
     stores: &GatewayStores,
-    selection: &Selection,
-    compiled: &Compiled,
+    plan: &Plan,
 ) -> anyhow::Result<()> {
+    let namespace = plan.gateway.namespace().unwrap_or_default();
+    let name = plan.gateway.name_any();
     for policy in stores.tls_policies.state() {
         let old = policy
             .status
@@ -253,13 +298,14 @@ async fn update_policies(
         let owned = |p: &Value| {
             let ancestor = &p["ancestorRef"];
             p["controllerName"] == CONTROLLER_NAME
-                && ancestor["name"] == selection.gateway
-                && ancestor["namespace"] == selection.namespace
+                && ancestor["name"] == name
+                && ancestor["namespace"] == namespace
                 && ancestor["kind"] == "Gateway"
                 && ancestor["group"] == "gateway.networking.k8s.io"
         };
         let previous = entries.iter().find(|entry| owned(entry));
-        let report = compiled.policies.reports.get(&ObjectRef::from_obj(policy.as_ref()));
+        let key = ObjectRef::from_obj(policy.as_ref());
+        let report = plan.listeners.iter().find_map(|l| l.policies.reports.get(&key));
         if previous.is_none() && report.is_none() {
             continue;
         }
@@ -298,7 +344,7 @@ async fn update_policies(
             ancestors.push(json!({
                 "ancestorRef": {
                     "group": "gateway.networking.k8s.io", "kind": "Gateway",
-                    "name": selection.gateway, "namespace": selection.namespace
+                    "name": name, "namespace": namespace
                 },
                 "controllerName": CONTROLLER_NAME,
                 "conditions": conditions
