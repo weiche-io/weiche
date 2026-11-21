@@ -109,7 +109,7 @@ impl ServerTls {
             .with_single_cert(certs, parsed_key)?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
-            hostname: hostname.to_owned(),
+            hostname: hostname.to_ascii_lowercase(),
             config: Config::new(config, (chain.to_vec(), key.to_vec()), [chain, key]),
         })
     }

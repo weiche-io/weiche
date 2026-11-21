@@ -20,31 +20,18 @@ use weiche_gtwapi::v1::{
 /// gateway class controller owned by this process.
 pub const CONTROLLER_NAME: &str = "weiche.io/gateway-controller";
 
+/// choose the narrower of two exact, wildcard or unrestricted hostnames.
 fn intersection(a: &str, b: &str) -> Option<String> {
-    if a.is_empty() {
-        return Some(b.into());
+    let a = a.to_ascii_lowercase();
+    let b = b.to_ascii_lowercase();
+    // a more specific wildcard also ends in the broader wildcard's DNS suffix.
+    if hostname_matches(&a, &b) {
+        Some(b)
+    } else if hostname_matches(&b, &a) {
+        Some(a)
+    } else {
+        None
     }
-    if b.is_empty() {
-        return Some(a.into());
-    }
-    if a == b {
-        return Some(a.into());
-    }
-    if !a.starts_with("*.") && hostname_matches(b, a) {
-        return Some(a.into());
-    }
-    if !b.starts_with("*.") && hostname_matches(a, b) {
-        return Some(b.into());
-    }
-    if a.starts_with("*.") && b.starts_with("*.") {
-        if hostname_matches(a, &b[2..]) {
-            return Some(b.into());
-        }
-        if hostname_matches(b, &a[2..]) {
-            return Some(a.into());
-        }
-    }
-    None
 }
 
 /// reconciliation status for one route parent.
@@ -130,7 +117,12 @@ pub fn compile(
         }
         if other.protocol != l.protocol || raw {
             Some("ProtocolConflict")
-        } else if other.hostname == l.hostname {
+        } else if other
+            .hostname
+            .as_deref()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(l.hostname.as_deref().unwrap_or_default())
+        {
             Some("HostnameConflict")
         } else {
             None
@@ -253,6 +245,7 @@ impl Routed for HttpRoute {
             .spec
             .hostnames
             .as_deref()
+            .filter(|hosts| !hosts.is_empty())
             .unwrap_or(&[String::new()])
             .iter()
             .filter_map(|h| intersection(l.hostname.as_deref().unwrap_or(""), h))
