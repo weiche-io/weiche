@@ -38,7 +38,7 @@ pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error
 struct WorkerView {
     revision: Revision,
     deadline: Duration,
-    routes: BTreeMap<SocketAddr, tcp::Route<Vec<(String, Router)>>>,
+    routes: BTreeMap<SocketAddr, tcp::Route<Router>>,
 }
 
 impl WorkerView {
@@ -58,8 +58,7 @@ impl WorkerView {
         let mut clusters: HashMap<_, _> = previous
             .into_iter()
             .flat_map(|view| view.routes.values())
-            .flat_map(|socket| &socket.target)
-            .flat_map(|(_, router)| router.routes())
+            .flat_map(|socket| socket.target.routes())
             .flat_map(|route| &route.action.backends)
             .filter_map(|(_, target)| target.as_ref().ok())
             .map(|c| (c.spec.clone(), c.clone()))
@@ -67,59 +66,49 @@ impl WorkerView {
         let mut endpoints = HashSet::new();
         let mut routes = BTreeMap::new();
         for (address, socket) in &gateway.sockets {
-            let mut hosts = Vec::new();
-            for (hostname, rules) in &socket.hosts {
-                let router = Router::compile(rules.iter().map(|route| {
-                    let backends = route
-                        .action
-                        .backends
-                        .iter()
-                        .map(|(weight, target)| {
-                            (
-                                *weight,
-                                target
-                                    .as_ref()
-                                    .map(|spec| {
-                                        endpoints.extend(spec.endpoints.iter().map(
-                                            |&address| EndpointKey {
-                                                address,
-                                                protocol: spec.protocol,
-                                                tls: spec.tls.clone(),
-                                            },
-                                        ));
-                                        clusters
-                                            .entry(spec.clone())
-                                            .or_insert_with(|| {
-                                                Rc::new(Cluster::new(spec.clone()))
-                                            })
-                                            .clone()
-                                    })
-                                    .map_err(|e| *e),
-                            )
-                        })
-                        .collect();
-                    let action = RouteAction {
-                        backends,
-                        headers: route.action.headers.clone(),
-                        redirect: route.action.redirect.clone(),
-                    };
-                    Route {
-                        hostname: route.hostname.clone(),
-                        http: route.http.clone(),
-                        action,
-                    }
-                }));
-                hosts.push((hostname.clone(), router));
-            }
-            hosts.sort_by_key(|(name, _)| {
-                std::cmp::Reverse((
-                    !name.is_empty() && !name.starts_with("*."),
-                    name.len(),
-                ))
-            });
+            let router = Router::compile(socket.routes.iter().map(|route| {
+                let backends = route
+                    .action
+                    .backends
+                    .iter()
+                    .map(|(weight, target)| {
+                        (
+                            *weight,
+                            target
+                                .as_ref()
+                                .map(|spec| {
+                                    endpoints.extend(spec.endpoints.iter().map(
+                                        |&address| EndpointKey {
+                                            address,
+                                            protocol: spec.protocol,
+                                            tls: spec.tls.clone(),
+                                        },
+                                    ));
+                                    clusters
+                                        .entry(spec.clone())
+                                        .or_insert_with(|| {
+                                            Rc::new(Cluster::new(spec.clone()))
+                                        })
+                                        .clone()
+                                })
+                                .map_err(|e| *e),
+                        )
+                    })
+                    .collect();
+                let action = RouteAction {
+                    backends,
+                    headers: route.action.headers.clone(),
+                    redirect: route.action.redirect.clone(),
+                };
+                Route {
+                    hostname: route.hostname.clone(),
+                    http: route.http.clone(),
+                    action,
+                }
+            }));
             routes.insert(
                 *address,
-                tcp::Route { listener: socket.listener.clone(), target: hosts },
+                tcp::Route { listener: socket.listener.clone(), target: router },
             );
         }
         Ok((
@@ -133,6 +122,7 @@ impl WorkerView {
     }
 }
 
+/// worker-local HTTP routing and upstream forwarding service.
 pub struct ProxyService {
     view: RefCell<WorkerView>,
     pool: Rc<ConnectionPool>,
@@ -145,7 +135,6 @@ impl ProxyService {
         runtime: &RuntimeConfig,
     ) -> anyhow::Result<Self> {
         let (view, endpoints) = WorkerView::prepare(&snapshot, None)?;
-        // the 2026-11-12 benchmark exhausted ephemeral ports without connection reuse.
         let pool = ConnectionPool::new(runtime);
         pool.reconcile(&endpoints);
         Ok(Self {
@@ -190,12 +179,6 @@ impl ProxyService {
             .routes
             .get(&listener.address)
             .and_then(|route| route.find(listener))
-            .and_then(|hosts| {
-                hosts.iter().find(|(name, _)| {
-                    super::super::super::ir::hostname_matches(name, &host)
-                })
-            })
-            .map(|(_, router)| router)
             .ok_or(ProxyError::NoRoute)?;
         let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())

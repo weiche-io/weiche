@@ -28,11 +28,11 @@ pub struct Listener {
     pub tls: Vec<Arc<ServerTls>>,
 }
 
-/// logical hostname listeners sharing one transport socket.
+/// resolved HTTP routes sharing one transport socket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketRoutes {
     pub listener: Listener,
-    pub hosts: BTreeMap<String, Vec<Route>>,
+    pub routes: Vec<Route>,
 }
 
 /// all sockets published together at a resource revision.

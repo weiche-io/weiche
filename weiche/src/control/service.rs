@@ -64,13 +64,10 @@ impl Plan {
                                 gateway_uid: uid.clone(),
                                 tls: vec![],
                             },
-                            hosts: Default::default(),
+                            routes: vec![],
                         });
                     socket.listener.tls.extend(result.tls.iter().cloned());
-                    socket.hosts.insert(
-                        listener.hostname.clone().unwrap_or_default(),
-                        std::mem::take(&mut result.routes),
-                    );
+                    socket.routes.append(&mut result.routes);
                 }
             }
             listeners.push(result);
