@@ -1,10 +1,5 @@
 //! report gateway and route conditions for the applied worker revision.
-use super::{
-    super::{ir::Revision, stream::down::WorkerGroupState},
-    CONTROLLER_NAME, GatewayStores, Selection,
-    compile::RouteReport,
-    service::Plan,
-};
+use super::{CONTROLLER_NAME, GatewayStores, compile::RouteReport, service::Plan};
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
@@ -82,10 +77,7 @@ where
 pub async fn update_status(
     client: &Client,
     stores: &GatewayStores,
-    selection: &Selection,
     plans: &[Plan],
-    revision: Revision,
-    workers: &WorkerGroupState,
 ) -> anyhow::Result<()> {
     for class in stores
         .gateway_classes
@@ -109,9 +101,7 @@ pub async fn update_status(
             )],
             class_old.get("conditions"),
         );
-        if selection.managed {
-            class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"},{"name":"TCPRoute"},{"name":"UDPRoute"}]);
-        }
+        class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"},{"name":"TCPRoute"},{"name":"UDPRoute"}]);
         patch_status(
             Api::<GatewayClass>::all(client.clone()),
             class.as_ref(),
@@ -121,7 +111,7 @@ pub async fn update_status(
         .await?;
     }
     for plan in plans {
-        update_gateway(client, plan, revision, workers).await?;
+        update_gateway(client, plan).await?;
         update_policies(client, stores, plan).await?;
     }
 
@@ -136,7 +126,7 @@ pub async fn update_status(
                     client.clone(),
                     &route.namespace().unwrap_or_default(),
                 );
-                update_route(api, route.as_ref(), old, selection, plans).await?;
+                update_route(api, route.as_ref(), old, plans).await?;
             }
         };
     }
@@ -151,7 +141,6 @@ async fn update_route<K>(
     api: Api<K>,
     route: &K,
     old: Value,
-    selection: &Selection,
     plans: &[Plan],
 ) -> anyhow::Result<()>
 where
@@ -165,15 +154,7 @@ where
         .get("parents")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let owned_parent = |p: &Value| {
-        p["controllerName"] == CONTROLLER_NAME
-            && (selection.managed
-                || (p["parentRef"]["name"] == selection.gateway
-                    && p["parentRef"]["namespace"]
-                        .as_str()
-                        .or(route.meta().namespace.as_deref())
-                        == Some(&selection.namespace)))
-    };
+    let owned_parent = |p: &Value| p["controllerName"] == CONTROLLER_NAME;
     let mut parents: Vec<_> =
         old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
     let mut reports = std::collections::BTreeMap::new();
@@ -207,12 +188,7 @@ where
 }
 
 /// publish independent listener status and the address actually assigned by Kubernetes.
-async fn update_gateway(
-    client: &Client,
-    plan: &Plan,
-    revision: Revision,
-    workers: &WorkerGroupState,
-) -> anyhow::Result<()> {
+async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
     let gateway = &plan.gateway;
     let old = gateway
         .status
@@ -221,41 +197,51 @@ async fn update_gateway(
     let generation = gateway.metadata.generation;
     let accepted = plan.listeners.iter().any(|l| l.accepted);
     let all_valid = plan.listeners.iter().all(|l| l.accepted);
-    let programmed = plan.available
-        && accepted
-        && plan
-            .listeners
-            .iter()
-            .filter(|l| l.accepted)
-            .all(|l| workers.programmed(revision, (l.transport, l.address)));
+    let programmed = plan.programmed && accepted;
     let mut desired = old.clone();
     desired["conditions"] = stamp(
         vec![
             condition(
                 "Accepted",
                 accepted,
-                if all_valid { "Accepted" } else { "ListenersNotValid" },
-                "evaluated gateway listeners",
+                if plan.denied {
+                    "NamespaceNotAllowed"
+                } else if all_valid {
+                    "Accepted"
+                } else {
+                    "ListenersNotValid"
+                },
+                if plan.denied {
+                    "gateway namespace is outside the configured deployment scope"
+                } else {
+                    "evaluated gateway listeners"
+                },
                 generation,
             ),
             condition(
                 "Programmed",
                 programmed,
-                if programmed { "Programmed" } else { "Pending" },
-                "worker socket programming",
+                if programmed {
+                    "Programmed"
+                } else if plan.issue.is_some() {
+                    "NoResources"
+                } else {
+                    "Pending"
+                },
+                plan.issue
+                    .as_deref()
+                    .unwrap_or("proxy snapshot and listener readiness"),
                 generation,
             ),
         ],
         old.get("conditions"),
     );
-    if let Some(addresses) = &plan.addresses {
-        desired["addresses"] = json!(
-            addresses
-                .iter()
-                .map(|ip| json!({"type":"IPAddress","value":ip}))
-                .collect::<Vec<_>>()
-        );
-    }
+    desired["addresses"] = json!(
+        plan.addresses
+            .iter()
+            .map(|(kind, value)| json!({"type":kind,"value":value}))
+            .collect::<Vec<_>>()
+    );
     let mut statuses = Vec::new();
     for (l, report) in gateway.spec.listeners.iter().zip(&plan.listeners) {
         let previous = old["listeners"]
@@ -263,9 +249,7 @@ async fn update_gateway(
             .into_iter()
             .flatten()
             .find(|v| v["name"] == l.name);
-        let bound = plan.available
-            && report.accepted
-            && workers.programmed(revision, (report.transport, report.address));
+        let bound = plan.programmed && report.accepted;
         let error = report.certificate_error.as_ref();
         let attached = report
             .reports
@@ -281,7 +265,7 @@ async fn update_gateway(
         };
         statuses.push(json!({"name":l.name,"attachedRoutes":attached,"supportedKinds":kinds,"conditions":stamp(vec![
             condition("Accepted",report.accepted,report.reason,&report.message,generation),
-            condition("Programmed",bound,if bound {"Programmed"}else{"Pending"},"worker socket programming",generation),
+            condition("Programmed",bound,if bound {"Programmed"}else{"Pending"},"proxy snapshot and listener readiness",generation),
             condition("ResolvedRefs",error.is_none(),error.map_or("ResolvedRefs",|e|e.reason),error.map_or("listener references resolved",|e| &e.message),generation),
             condition("Conflicted",report.conflict.is_some(),report.conflict.unwrap_or("NoConflicts"),"listener distinctness",generation)
         ],previous.and_then(|v|v.get("conditions")))}));

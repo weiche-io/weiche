@@ -1,8 +1,5 @@
 //! compile attached routes independently for each listener.
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use super::super::ir::{Route, StreamRoute, Transport, hostname_matches};
 use super::{
@@ -22,31 +19,6 @@ use weiche_gtwapi::v1::{
 
 /// gateway class controller owned by this process.
 pub const CONTROLLER_NAME: &str = "weiche.io/gateway-controller";
-
-/// gateway and listener selected for this gateway instance.
-#[derive(Clone, Debug)]
-pub struct Selection {
-    pub namespace: String,
-    pub gateway: String,
-    pub managed: bool,
-    pub bind_ip: IpAddr,
-}
-
-impl Selection {
-    /// read the listener selection and bind address from the environment.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            namespace: std::env::var("WEICHE_NAMESPACE")
-                .unwrap_or_else(|_| "weiche-demo".into()),
-            gateway: std::env::var("WEICHE_GATEWAY").unwrap_or_else(|_| "weiche".into()),
-            managed: std::env::var("WEICHE_MANAGE_GATEWAYS")
-                .map_or(Ok(false), |v| v.parse())?,
-            bind_ip: std::env::var("WEICHE_BIND_IP")
-                .unwrap_or_else(|_| "::".into())
-                .parse()?,
-        })
-    }
-}
 
 fn intersection(a: &str, b: &str) -> Option<String> {
     if a.is_empty() {
