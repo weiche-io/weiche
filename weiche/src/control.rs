@@ -14,7 +14,7 @@ use futures::{
     stream::{BoxStream, select_all},
 };
 use k8s_openapi::api::{
-    core::v1::{ConfigMap, Secret, Service},
+    core::v1::{ConfigMap, Namespace, Secret, Service},
     discovery::v1::EndpointSlice,
 };
 use kube::{
@@ -42,6 +42,7 @@ pub struct GatewayStores {
     pub gateways: Store<Gateway>,
     pub http_routes: Store<HttpRoute>,
     pub secrets: Store<Secret>,
+    pub namespaces: Store<Namespace>,
     pub grants: Store<ReferenceGrant>,
     pub config_maps: Store<ConfigMap>,
     pub tls_policies: Store<BackendTlsPolicy>,
@@ -64,6 +65,7 @@ impl GatewayController {
         let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
         let (secrets, secrets_watch) =
             cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
+        let (namespaces, namespaces_watch) = cache(Api::all(client.clone()), defaults());
         let (grants, grants_watch) = cache(Api::all(client.clone()), defaults());
         let (config_maps, maps_watch) = cache(Api::all(client.clone()), defaults());
         let (tls_policies, policies_watch) = cache(Api::all(client.clone()), defaults());
@@ -75,6 +77,7 @@ impl GatewayController {
                 gateways,
                 http_routes,
                 secrets,
+                namespaces,
                 grants,
                 config_maps,
                 tls_policies,
@@ -86,6 +89,7 @@ impl GatewayController {
                 gateways_watch,
                 routes_watch,
                 secrets_watch,
+                namespaces_watch,
                 grants_watch,
                 maps_watch,
                 policies_watch,
@@ -137,4 +141,32 @@ where
             }
         })).boxed();
     (reader, stream)
+}
+
+impl GatewayStores {
+    /// authorize a core resource reference using grants in the target namespace.
+    pub fn permits(
+        &self,
+        from: &str,
+        source_kind: &str,
+        target: &str,
+        kind: &str,
+        name: &str,
+    ) -> bool {
+        from == target
+            || self.grants.state().iter().any(|grant| {
+                grant.metadata.namespace.as_deref() == Some(target)
+                    && grant.metadata.deletion_timestamp.is_none()
+                    && grant.spec.from.iter().any(|r| {
+                        r.group == "gateway.networking.k8s.io"
+                            && r.kind == source_kind
+                            && r.namespace == from
+                    })
+                    && grant.spec.to.iter().any(|r| {
+                        r.group.is_empty()
+                            && r.kind == kind
+                            && r.name.as_deref().is_none_or(|n| n == name)
+                    })
+            })
+    }
 }

@@ -67,29 +67,14 @@ pub fn listener_tls(
     let group = reference.group.as_deref().unwrap_or("");
     let kind = reference.kind.as_deref().unwrap_or("Secret");
     let target = reference.namespace.as_deref().unwrap_or(namespace);
-    if target != namespace
-        && !stores.grants.state().iter().any(|grant| {
-            grant.metadata.namespace.as_deref() == Some(target)
-                && grant.metadata.deletion_timestamp.is_none()
-                && grant.spec.from.iter().any(|from| {
-                    from.group == "gateway.networking.k8s.io"
-                        && from.kind == "Gateway"
-                        && from.namespace == namespace
-                })
-                && grant.spec.to.iter().any(|to| {
-                    to.group == group
-                        && to.kind == kind
-                        && to.name.as_ref().is_none_or(|name| name == &reference.name)
-                })
-        })
-    {
+    if !group.is_empty() || kind != "Secret" {
+        return Err(invalid("certificate reference must name a core Secret"));
+    }
+    if !stores.permits(namespace, "Gateway", target, kind, &reference.name) {
         return Err(TlsError::new(
             "RefNotPermitted",
             "certificate reference requires a ReferenceGrant in the Secret namespace",
         ));
-    }
-    if !group.is_empty() || kind != "Secret" {
-        return Err(invalid("certificate reference must name a core Secret"));
     }
     let secret = stores
         .secrets

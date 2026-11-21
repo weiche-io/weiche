@@ -177,7 +177,7 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
                 && parent.section_name.as_deref().is_none_or(|name| name == l.name)
                 && parent.port.is_none_or(|port| port == l.port)
             {
-                if !allows_route(l, &selection.namespace, &route) {
+                if !allows_route(stores, l, &selection.namespace, &route) {
                     report.reason = "NotAllowedByListeners";
                     report.message =
                         "listener does not allow this route namespace or kind".into();
@@ -239,7 +239,12 @@ pub fn compile(stores: &GatewayStores, selection: &Selection) -> Compiled {
     result
 }
 
-fn allows_route(l: &GatewayListeners, namespace: &str, route: &HttpRoute) -> bool {
+fn allows_route(
+    stores: &GatewayStores,
+    l: &GatewayListeners,
+    namespace: &str,
+    route: &HttpRoute,
+) -> bool {
     let Some(allowed) = &l.allowed_routes else {
         return route.namespace().as_deref() == Some(namespace);
     };
@@ -254,7 +259,38 @@ fn allows_route(l: &GatewayListeners, namespace: &str, route: &HttpRoute) -> boo
     }
     match allowed.namespaces.as_ref().and_then(|n| n.from.as_ref()) {
         Some(From::All) => true,
-        Some(From::Selector) => false,
+        Some(From::Selector) => {
+            let Some(selector) =
+                allowed.namespaces.as_ref().and_then(|n| n.selector.as_ref())
+            else {
+                return false;
+            };
+            let Some(ns) = route.namespace().and_then(|name| {
+                stores
+                    .namespaces
+                    .get(&kube::runtime::reflector::ObjectRef::new(&name))
+            }) else {
+                return false;
+            };
+            let labels = ns.labels();
+            selector
+                .match_labels
+                .iter()
+                .flatten()
+                .all(|(k, v)| labels.get(k) == Some(v))
+                && selector.match_expressions.iter().flatten().all(|e| {
+                    let value = labels.get(&e.key);
+                    let listed =
+                        value.is_some_and(|v| e.values.iter().flatten().any(|w| w == v));
+                    match e.operator.as_str() {
+                        "In" => listed,
+                        "NotIn" => !listed,
+                        "Exists" => value.is_some(),
+                        "DoesNotExist" => value.is_none(),
+                        _ => false,
+                    }
+                })
+        }
         _ => route.namespace().as_deref() == Some(namespace),
     }
 }

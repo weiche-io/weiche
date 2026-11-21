@@ -149,9 +149,11 @@ fn resolve_backend(
     {
         return Err(RefError::InvalidKind);
     }
-    if backend.namespace.as_deref().is_some_and(|value| value != namespace) {
+    let target = backend.namespace.as_deref().unwrap_or(namespace);
+    if !stores.permits(namespace, "HTTPRoute", target, "Service", &backend.name) {
         return Err(RefError::RefNotPermitted);
     }
+    let namespace = target;
     let backend_port = backend.port.ok_or(RefError::BackendNotFound)?;
     let key = ObjectRef::new(&backend.name).within(namespace);
     let service = stores

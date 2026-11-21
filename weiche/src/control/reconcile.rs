@@ -32,6 +32,7 @@ pub async fn run(
                 stores.gateways.wait_until_ready(),
                 stores.http_routes.wait_until_ready(),
                 stores.secrets.wait_until_ready(),
+                stores.namespaces.wait_until_ready(),
                 stores.grants.wait_until_ready(),
                 stores.config_maps.wait_until_ready(),
                 stores.tls_policies.wait_until_ready(),

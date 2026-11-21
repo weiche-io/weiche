@@ -21,7 +21,7 @@ rules:
     resources: [gatewayclasses/status, gateways/status, httproutes/status, backendtlspolicies/status]
     verbs: [get, patch]
   - apiGroups: ['']
-    resources: [services]
+    resources: [services, namespaces]
     verbs: [get, list, watch]
   - apiGroups: ['']
     resources: [configmaps, secrets]
