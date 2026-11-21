@@ -4,17 +4,16 @@ metadata:
   name: {{ .Release.Name | quote }}
   namespace: {{ .Release.Namespace | quote }}
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: {{ .Values.controllerReplicas }}
   selector:
     matchLabels:
       app: weiche
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   template:
     metadata:
+      annotations:
+        weiche.io/settings: {{ include (print $.Template.BasePath "/settings.yaml") . | sha256sum }}
       labels:
-        # Services created by the controller select this label.
         app: weiche
         app.kubernetes.io/instance: {{ .Release.Name | quote }}
     spec:
@@ -25,22 +24,30 @@ spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
+      volumes:
+        - name: settings
+          configMap:
+            name: {{ .Release.Name }}-settings
       containers:
         - name: weiche
           image: {{ printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag | toString) | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [controller]
+          volumeMounts:
+            - name: settings
+              mountPath: /etc/weiche
+              readOnly: true
           env:
-            - name: WEICHE_MANAGE_GATEWAYS
-              value: "true"
-            - name: WEICHE_NAMESPACE
+            - name: POD_UID
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.namespace
+                  fieldPath: metadata.uid
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
-            seccompProfile: {{- toYaml .Values.seccompProfile | nindent 14 }}
+            seccompProfile:
+              type: RuntimeDefault
           resources: {{- toYaml .Values.resources | nindent 12 }}

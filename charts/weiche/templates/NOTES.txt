@@ -1,0 +1,10 @@
+Use gatewayClassName: weiche in {{ join ", " (.Values.gatewayNamespaces | default (list .Release.Namespace)) }}.
+Each Gateway gets a Service and a proxy Deployment in its own namespace.
+Inspect the assigned address and conditions with kubectl describe gateway -n NAMESPACE NAME.
+
+Use platform-controlled namespaces for Gateways. Each proxy reads a Secret containing
+its routes and authorized TLS material. The compressed snapshot limit is 1 MiB per Gateway.
+Create cross-namespace ReferenceGrants in the namespace of the referenced resource.
+
+Delete Gateways before retiring their namespace from gatewayNamespaces or uninstalling
+the chart. Kubernetes then removes their proxy workloads, credentials and Services.

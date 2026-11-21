@@ -41,23 +41,62 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ .Release.Name | quote }}
+  name: {{ .Release.Name }}-election
   namespace: {{ .Release.Namespace | quote }}
 rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [weiche-controller]
+    verbs: [get, patch]
+  # Retire GatewayClass-owned Services left by the shared proxy deployment.
   - apiGroups: ['']
     resources: [services]
-    verbs: [create, patch, delete]
+    verbs: [delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ .Release.Name | quote }}
+  name: {{ .Release.Name }}-election
   namespace: {{ .Release.Namespace | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ .Release.Name | quote }}
+  name: {{ .Release.Name }}-election
 subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name | quote }}
     namespace: {{ .Release.Namespace | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weiche-gateway-provisioner
+rules:
+  - apiGroups: ['']
+    resources: [services, secrets, configmaps, serviceaccounts]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, create, patch, delete]
+{{- range .Values.gatewayNamespaces | default (list .Release.Namespace) | uniq }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: weiche-gateway-provisioner
+  namespace: {{ . | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: weiche-gateway-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Release.Name | quote }}
+    namespace: {{ $.Release.Namespace | quote }}
+{{- end }}
