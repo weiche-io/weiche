@@ -1,7 +1,7 @@
 TYPST     ?= typst
 TYPST_CMD := $(TYPST) c --root . --features html
 
-SITE_TMPLS := page.typ meta.typ nav.typ
+SITE_TMPLS := page.typ meta.typ build/nav.typ
 
 build/index.html: src/index.typ $(SITE_TMPLS) mk/typst.mk $(MODE_STAMP)
 	$(call log,TYP,$<)

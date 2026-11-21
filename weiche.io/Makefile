@@ -23,6 +23,7 @@ FIND    := find
 
 SRC_PAGES    := $(shell find src -mindepth 2 -type f -name index.typ | sort)
 SRC_SECTIONS := $(patsubst src/%/index.typ,%,$(SRC_PAGES))
+SRC_META     := $(patsubst %,src/%/meta.typ,$(SRC_SECTIONS))
 STAGED_PAGES := $(addprefix build/,$(addsuffix /index.typ,$(SRC_SECTIONS)))
 TARGET_PAGES := $(addprefix build/,$(addsuffix /index.html,$(SRC_SECTIONS)))
 TRASH_COUNT  = $(words $(shell [ -d build ] && find build \( -name '*.bib' -o -name '*.typ' -o -name '.mode-*' \) 2>/dev/null))
@@ -32,7 +33,7 @@ include mk/typst.mk
 
 .SECONDARY: $(STAGED_PAGES)
 
-build: assets fonts build/index.html $(TARGET_PAGES)
+build: assets fonts build/nav.typ build/index.html $(TARGET_PAGES)
 
 full: build
 	$(Q)$(MAKE) --no-print-directory clean
@@ -40,6 +41,27 @@ full: build
 assets: css $(addprefix build/,$(ASSET_STATIC))
 css: $(addprefix build/,$(ASSET_CSS))
 fonts: $(addprefix build/,$(ASSET_FONTS))
+
+build/nav.typ: $(SRC_META) src Makefile
+	$(call log,NAV,$@)
+	$(Q)$(MKDIR_P) $(@D)
+	$(Q){ \
+		printf '#let items = (\n'; \
+		for meta in $(SRC_META); do \
+			section=$${meta#src/}; \
+			section=$${section%/meta.typ}; \
+			printf '  {\n'; \
+			printf '    import "/%s" as m\n' "$$meta"; \
+			printf '    let fields = dictionary(m)\n'; \
+			printf '    if fields.at("nav", default: true) {\n'; \
+			printf '      ((path: "%s/", label: fields.at("breadcrumb", default: m.title)),)\n' "$$section"; \
+			printf '    } else {\n'; \
+			printf '      ()\n'; \
+			printf '    }\n'; \
+			printf '  },\n'; \
+		done; \
+		printf ').flatten()\n'; \
+	} > "$@.tmp" && mv "$@.tmp" "$@" || { rm -f "$@.tmp"; exit 1; }
 
 $(MODE_STAMP):
 	$(call log,MODE,$(BUILD_MODE))

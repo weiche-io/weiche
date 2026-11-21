@@ -43,8 +43,12 @@
 ## typst templates and pages
 
 - keep only shared templates at `weiche.io/` root (`meta.typ` for site-wide
-  metadata, `nav.typ` for shared chrome and `context query` TOC, and `page.typ`
-  for the html shell plus `page`, `article`, `canvas`, and lazy `html-image`).
+  metadata, and `page.typ` for the html shell, header/footer chrome, TOC, and
+  helpers `page`, `article`, `canvas`, lazy `html-image`).
+- generate `build/nav.typ` automatically from `src/**/meta.typ` during build
+  (never commit `nav.typ` to git; strip it alongside other `*.typ` intermediates
+  in `clean` / `full`). Pages can opt out of top-level navigation with
+  `#let nav = false` in their `meta.typ`.
 - put all page content under `weiche.io/src/` — `src/index.typ` for the landing
   page and `src/<section>/{index.typ, meta.typ}` alongside page-local media for
   subpages — importing templates via root paths (`"/page.typ"`, `"/meta.typ"`)
