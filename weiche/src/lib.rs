@@ -9,3 +9,17 @@ pub mod ir;
 pub mod routing;
 pub mod rtconf;
 pub mod stream;
+
+pub mod proxy;
+
+/// wait for Kubernetes termination or a foreground interrupt.
+pub async fn shutdown() -> anyhow::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = terminate.recv() => {},
+        _ = interrupt.recv() => {},
+    }
+    Ok(())
+}
