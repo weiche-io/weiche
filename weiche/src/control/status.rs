@@ -13,8 +13,7 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use weiche_gtwapi::v1::{
-    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
-    gateways::Gateway, httproutes::HttpRoute,
+    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
 };
 
 fn condition(
@@ -105,13 +104,13 @@ pub async fn update_status(
                 "Accepted",
                 class_accepted,
                 if class_accepted { "Accepted" } else { "InvalidParameters" },
-                "Weiche HTTP gateway controller",
+                "Weiche gateway controller",
                 class.metadata.generation,
             )],
             class_old.get("conditions"),
         );
         if selection.managed {
-            class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"}]);
+            class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"},{"name":"TCPRoute"},{"name":"UDPRoute"}]);
         }
         patch_status(
             Api::<GatewayClass>::all(client.clone()),
@@ -126,66 +125,85 @@ pub async fn update_status(
         update_policies(client, stores, plan).await?;
     }
 
-    for route in stores.http_routes.state() {
-        let old = route
-            .status
-            .as_ref()
-            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-        let old_parents = old
-            .get("parents")
-            .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let owned_parent = |p: &Value| {
-            p["controllerName"] == CONTROLLER_NAME
-                && (selection.managed
-                    || (p["parentRef"]["name"] == selection.gateway
-                        && p["parentRef"]["namespace"]
-                            .as_str()
-                            .or(route.metadata.namespace.as_deref())
-                            == Some(&selection.namespace)))
-        };
-        let mut parents: Vec<_> =
-            old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
-        let mut reports = std::collections::BTreeMap::new();
-        for report in plans
-            .iter()
-            .flat_map(|p| &p.listeners)
-            .flat_map(|l| &l.reports)
-            .filter(|r| r.route.uid() == route.uid())
-        {
-            let key = serde_json::to_string(&report.parent)?;
-            let score = |r: &RouteReport| {
-                (r.accepted, r.reason != "NoMatchingParent", !r.resolved)
-            };
-            let chosen = reports.entry(key).or_insert(report);
-            if score(report) > score(chosen) {
-                *chosen = report;
+    macro_rules! routes {
+        ($store:expr) => {
+            for route in $store.state() {
+                let old = route
+                    .status
+                    .as_ref()
+                    .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
+                let api = Api::namespaced(
+                    client.clone(),
+                    &route.namespace().unwrap_or_default(),
+                );
+                update_route(api, route.as_ref(), old, selection, plans).await?;
             }
-        }
-        for report in reports.into_values() {
-            let parent = serde_json::to_value(&report.parent)?;
-            let previous = old_parents
-                .iter()
-                .find(|p| owned_parent(p) && p["parentRef"] == parent);
-            parents.push(json!({"controllerName": CONTROLLER_NAME, "parentRef": parent,
-                "conditions": stamp(vec![condition("Accepted", report.accepted, report.reason, &report.message, route.metadata.generation),
-                    condition("ResolvedRefs", report.resolved, report.refs_reason, if report.resolved { "backend references resolved" } else if report.refs_reason == "InvalidBackendTLSPolicy" { "the referenced Service has an invalid BackendTLSPolicy" } else { "backend reference is missing, unsupported or not permitted" }, route.metadata.generation)], previous.and_then(|p| p.get("conditions")))}));
-        }
-        if parents.is_empty() && old_parents.is_empty() {
-            continue;
-        }
-        patch_status(
-            Api::<HttpRoute>::namespaced(
-                client.clone(),
-                &route.namespace().unwrap_or_default(),
-            ),
-            route.as_ref(),
-            &old,
-            json!({"parents":parents}),
-        )
-        .await?;
+        };
     }
+    routes!(stores.http_routes);
+    routes!(stores.tcp_routes);
+    routes!(stores.udp_routes);
     Ok(())
+}
+
+/// merge parent conditions for any Route kind while preserving foreign controller entries.
+async fn update_route<K>(
+    api: Api<K>,
+    route: &K,
+    old: Value,
+    selection: &Selection,
+    plans: &[Plan],
+) -> anyhow::Result<()>
+where
+    K: Resource<DynamicType = ()>
+        + Clone
+        + std::fmt::Debug
+        + DeserializeOwned
+        + Serialize,
+{
+    let old_parents = old
+        .get("parents")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let owned_parent = |p: &Value| {
+        p["controllerName"] == CONTROLLER_NAME
+            && (selection.managed
+                || (p["parentRef"]["name"] == selection.gateway
+                    && p["parentRef"]["namespace"]
+                        .as_str()
+                        .or(route.meta().namespace.as_deref())
+                        == Some(&selection.namespace)))
+    };
+    let mut parents: Vec<_> =
+        old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
+    let mut reports = std::collections::BTreeMap::new();
+    for report in plans
+        .iter()
+        .flat_map(|p| &p.listeners)
+        .flat_map(|l| &l.reports)
+        .filter(|r| r.uid == route.uid())
+    {
+        let key = serde_json::to_string(&report.parent)?;
+        let score =
+            |r: &RouteReport| (r.accepted, r.reason != "NoMatchingParent", !r.resolved);
+        let chosen = reports.entry(key).or_insert(report);
+        if score(report) > score(chosen) {
+            *chosen = report;
+        }
+    }
+    for report in reports.into_values() {
+        let parent = &report.parent;
+        let previous = old_parents
+            .iter()
+            .find(|p| owned_parent(p) && &p["parentRef"] == parent);
+        parents.push(json!({"controllerName": CONTROLLER_NAME, "parentRef": parent,
+                "conditions": stamp(vec![condition("Accepted", report.accepted, report.reason, &report.message, route.meta().generation),
+                    condition("ResolvedRefs", report.resolved, report.refs_reason, if report.resolved { "backend references resolved" } else if report.refs_reason == "InvalidBackendTLSPolicy" { "the referenced Service has an invalid BackendTLSPolicy" } else { "backend reference is missing, unsupported or not permitted" }, route.meta().generation)], previous.and_then(|p| p.get("conditions")))}));
+    }
+    if parents.is_empty() && old_parents.is_empty() {
+        return Ok(());
+    }
+    patch_status(api, route, &old, json!({"parents":parents})).await
 }
 
 /// publish independent listener status and the address actually assigned by Kubernetes.
@@ -209,7 +227,7 @@ async fn update_gateway(
             .listeners
             .iter()
             .filter(|l| l.accepted)
-            .all(|l| workers.programmed(revision, l.address));
+            .all(|l| workers.programmed(revision, (l.transport, l.address)));
     let mut desired = old.clone();
     desired["conditions"] = stamp(
         vec![
@@ -247,17 +265,17 @@ async fn update_gateway(
             .find(|v| v["name"] == l.name);
         let bound = plan.available
             && report.accepted
-            && workers.programmed(revision, report.address);
+            && workers.programmed(revision, (report.transport, report.address));
         let error = report.certificate_error.as_ref();
         let attached = report
             .reports
             .iter()
             .filter(|r| r.accepted)
-            .map(|r| r.route.uid())
+            .map(|r| &r.uid)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let kinds = if report.supported_http {
-            json!([{"group":"gateway.networking.k8s.io","kind":"HTTPRoute"}])
+        let kinds = if let Some(kind) = report.supported_kind {
+            json!([{"group":"gateway.networking.k8s.io","kind":kind}])
         } else {
             json!([])
         };

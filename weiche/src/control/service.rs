@@ -1,5 +1,7 @@
 //! expose each managed Gateway through a ClusterIP and distinct target ports on the shared workers.
-use super::super::ir::{GatewaySnapshot, Listener, SocketRoutes};
+use super::super::ir::{
+    GatewaySnapshot, Listener, SocketRoutes, StreamListener, Transport,
+};
 use super::{CONTROLLER_NAME, Compiled, GatewayStores, Selection, compile};
 use k8s_openapi::{
     api::core::v1::{Service, ServicePort},
@@ -70,11 +72,20 @@ async fn expose(
     }
     let current = existing.and_then(|s| s.spec.as_ref()).and_then(|s| s.ports.as_ref());
     let mut ports = Vec::new();
-    for port in gateway.spec.listeners.iter().map(|l| l.port).collect::<BTreeSet<_>>() {
+    for (transport, port) in gateway
+        .spec
+        .listeners
+        .iter()
+        .map(|l| (Transport::for_protocol(&l.protocol), l.port))
+        .collect::<BTreeSet<_>>()
+    {
         let previous = current
             .into_iter()
             .flatten()
-            .find(|p| p.port == i32::from(port))
+            .find(|p| {
+                p.port == i32::from(port)
+                    && p.protocol.as_deref().unwrap_or("TCP") == transport.protocol()
+            })
             .and_then(target)
             .filter(|n| (10000..=60999).contains(n) && used.get(n) == Some(&1));
         let local = match previous {
@@ -82,7 +93,7 @@ async fn expose(
             None => {
                 use std::hash::{DefaultHasher, Hash, Hasher};
                 let mut hash = DefaultHasher::new();
-                (&uid, port).hash(&mut hash);
+                (&uid, port, transport).hash(&mut hash);
                 let start = hash.finish() % 51000;
                 let n = (0..51000)
                     .map(|i| 10000 + ((start + i) % 51000) as u16)
@@ -95,9 +106,9 @@ async fn expose(
             }
         };
         ports.push(ServicePort {
-            name: Some(format!("tcp-{port}")),
+            name: Some(format!("{}-{port}", transport.protocol().to_ascii_lowercase())),
             port: i32::from(port),
-            protocol: Some("TCP".into()),
+            protocol: Some(transport.protocol().into()),
             target_port: Some(IntOrString::Int(i32::from(local))),
             ..Default::default()
         });
@@ -186,7 +197,15 @@ pub async fn plans(
                         addresses = spec.cluster_ips;
                         for p in spec.ports.into_iter().flatten() {
                             if let Some(t) = target(&p) {
-                                mapping.insert(p.port as u16, t);
+                                mapping.insert(
+                                    (
+                                        Transport::for_protocol(
+                                            p.protocol.as_deref().unwrap_or("TCP"),
+                                        ),
+                                        p.port as u16,
+                                    ),
+                                    t,
+                                );
                             }
                         }
                     }
@@ -197,7 +216,9 @@ pub async fn plans(
                 }
             }
             available = addresses.as_ref().is_some_and(|a| !a.is_empty())
-                && g.spec.listeners.iter().all(|l| mapping.contains_key(&l.port));
+                && g.spec.listeners.iter().all(|l| {
+                    mapping.contains_key(&(Transport::for_protocol(&l.protocol), l.port))
+                });
             if !available {
                 addresses = Some(Vec::new());
             }
@@ -206,10 +227,24 @@ pub async fn plans(
         for l in &g.spec.listeners {
             let address = SocketAddr::new(
                 selection.bind_ip,
-                mapping.get(&l.port).copied().unwrap_or(l.port),
+                mapping
+                    .get(&(Transport::for_protocol(&l.protocol), l.port))
+                    .copied()
+                    .unwrap_or(l.port),
             );
             let mut result = compile(stores, &g, l, address);
-            if available && result.accepted {
+            if available
+                && result.accepted
+                && matches!(l.protocol.as_str(), "TCP" | "UDP")
+            {
+                snapshot.streams.insert(
+                    (result.transport, address),
+                    StreamListener {
+                        gateway_uid: uid.clone(),
+                        route: Arc::new(result.stream.take().unwrap_or_default()),
+                    },
+                );
+            } else if available && result.accepted {
                 let socket =
                     snapshot.sockets.entry(address).or_insert_with(|| SocketRoutes {
                         listener: Listener {
