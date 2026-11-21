@@ -93,6 +93,21 @@ fn unsupported_rule(rule: &HttpRouteRules) -> bool {
         })
 }
 
+/// a redirect hostname is a DNS name without a wildcard, userinfo or port.
+fn valid_redirect_hostname(host: &str) -> bool {
+    host.len() <= 253
+        && host.parse::<IpAddr>().is_err()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
 fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
     use weiche_gtwapi::v1::httproutes::HttpRouteRulesFiltersType as Kind;
     let invalid = ResolveError::UnsupportedValue;
@@ -125,7 +140,13 @@ fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
             }
             Kind::RequestRedirect => {
                 let r = filter.request_redirect.as_ref().ok_or(invalid)?;
-                if r.path.is_some() || r.scheme.is_some() || r.port.is_some() {
+                if r.path.is_some()
+                    || r.scheme.is_some()
+                    || r.port.is_some()
+                    || r.hostname
+                        .as_deref()
+                        .is_some_and(|host| !valid_redirect_hostname(host))
+                {
                     return Err(invalid);
                 }
                 let status = match r.status_code.unwrap_or(302) {

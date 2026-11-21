@@ -17,7 +17,8 @@ use super::{
 use bytes::Bytes;
 use compio::runtime::time::timeout;
 use http::{
-    HeaderMap, Request, Response, StatusCode, Uri, Version, header, uri::Authority,
+    HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
+    uri::Authority,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -195,10 +196,12 @@ impl ProxyService {
                 format!(":{port}")
             };
             let path = request.uri().path_and_query().map_or("/", |p| p.as_str());
-            return Err(ProxyError::Redirect(
-                redirect.status,
-                format!("{scheme}://{host}{suffix}{path}"),
-            ));
+            // an asterisk targets the whole server and has no path to append.
+            let path = if path == "*" { "/" } else { path };
+            let location =
+                HeaderValue::try_from(format!("{scheme}://{host}{suffix}{path}"))
+                    .map_err(|_| ProxyError::InvalidTarget)?;
+            return Err(ProxyError::Redirect(redirect.status, location));
         }
         for change in &action.headers {
             match change {
@@ -237,7 +240,11 @@ impl ProxyService {
             Err(error) => return Ok(error.response()),
         };
         let downstream_version = request.version();
-        prepare_request(&mut request, authority, endpoint.key.protocol, listener.tls);
+        if let Err(error) =
+            prepare_request(&mut request, authority, endpoint.key.protocol, listener.tls)
+        {
+            return Ok(error.response());
+        }
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
             Ok(Ok(response)) => {
@@ -261,7 +268,8 @@ impl ProxyService {
 }
 
 enum ProxyError {
-    Redirect(StatusCode, String),
+    Redirect(StatusCode, HeaderValue),
+    InvalidTarget,
     UnsupportedUpgrade,
     InvalidHost,
     NoRoute,
@@ -275,15 +283,12 @@ impl ProxyError {
     fn response(self) -> Response<Body> {
         let (status, text) = match self {
             Self::Redirect(status, location) => {
-                return Response::builder()
-                    .status(status)
-                    .header(header::LOCATION, location)
-                    .body(Box::pin(
-                        Full::new(Bytes::new())
-                            .map_err(|never| -> hyper::Error { never }),
-                    ) as Body)
-                    .unwrap();
+                let mut response = Response::new(full_body(Bytes::new()));
+                *response.status_mut() = status;
+                response.headers_mut().insert(header::LOCATION, location);
+                return response;
             }
+            Self::InvalidTarget => (StatusCode::BAD_REQUEST, "invalid request target\n"),
             Self::UnsupportedUpgrade => (
                 StatusCode::NOT_IMPLEMENTED,
                 "HTTP upgrades and CONNECT are unsupported\n",
@@ -305,15 +310,19 @@ impl ProxyError {
                 (StatusCode::GATEWAY_TIMEOUT, "backend response headers timed out\n")
             }
         };
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Box::pin(
-                Full::new(Bytes::from_static(text.as_bytes()))
-                    .map_err(|never| -> hyper::Error { never }),
-            ) as Body)
-            .unwrap()
+        let mut response = Response::new(full_body(Bytes::from_static(text.as_bytes())));
+        *response.status_mut() = status;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        response
     }
+}
+
+/// build a complete local response without involving an upstream stream.
+fn full_body(bytes: Bytes) -> Body {
+    Box::pin(Full::new(bytes).map_err(|never| -> hyper::Error { never }))
 }
 
 fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, ProxyError> {
@@ -357,7 +366,7 @@ fn prepare_request(
     authority: Authority,
     protocol: Protocol,
     downstream_tls: bool,
-) {
+) -> Result<(), ProxyError> {
     let trailers = request
         .headers()
         .get_all(header::TE)
@@ -376,7 +385,8 @@ fn prepare_request(
         .headers_mut()
         .insert(header::HOST, authority.as_str().parse().unwrap());
     let mut uri = request.uri().clone().into_parts();
-    uri.path_and_query.get_or_insert_with(|| "/".parse().unwrap());
+    uri.path_and_query
+        .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
     match protocol {
         Protocol::Http1 => {
             *request.version_mut() = Version::HTTP_11;
@@ -407,7 +417,8 @@ fn prepare_request(
             uri.authority = Some(authority);
         }
     }
-    *request.uri_mut() = Uri::from_parts(uri).unwrap();
+    *request.uri_mut() = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
+    Ok(())
 }
 
 pub fn strip_hop_headers(headers: &mut HeaderMap) {
