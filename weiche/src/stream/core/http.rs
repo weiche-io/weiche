@@ -4,7 +4,10 @@ mod router;
 use super::{
     super::{
         super::{
-            ir::{Protocol, PublishedSnapshot, Revision, Route, RouteAction},
+            ir::{
+                HeaderChange, Listener, Protocol, PublishedSnapshot, Revision, Route,
+                RouteAction,
+            },
             rtconf::RuntimeConfig,
         },
         up::{ConnectionPool, Endpoint, UpstreamClient},
@@ -21,7 +24,7 @@ use hyper::body::Incoming;
 use router::Router;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     pin::Pin,
     rc::Rc,
@@ -35,13 +38,17 @@ pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = hyper::Error
 struct WorkerView {
     revision: Revision,
     deadline: Duration,
-    route: Option<tcp::Route<Router>>,
+    routes: BTreeMap<SocketAddr, tcp::Route<Vec<(String, Router)>>>,
 }
 
 impl WorkerView {
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "TLS configuration identity hashes only immutable certificate and protocol data"
+    )]
     fn prepare(
         snapshot: &PublishedSnapshot,
-        previous: Option<&tcp::Route<Router>>,
+        previous: Option<&WorkerView>,
     ) -> anyhow::Result<(Self, HashSet<EndpointKey>)> {
         let gateway = &snapshot.gateway;
         anyhow::ensure!(
@@ -50,43 +57,76 @@ impl WorkerView {
         );
         let mut clusters: HashMap<_, _> = previous
             .into_iter()
-            .flat_map(|route| route.target.routes())
-            .filter_map(|route| match &route.action {
-                RouteAction::Forward(cluster) => {
-                    Some((cluster.spec.clone(), cluster.clone()))
-                }
-                RouteAction::RejectInvalidBackend => None,
-            })
+            .flat_map(|view| view.routes.values())
+            .flat_map(|socket| &socket.target)
+            .flat_map(|(_, router)| router.routes())
+            .flat_map(|route| &route.action.backends)
+            .filter_map(|(_, target)| target.as_ref().ok())
+            .map(|c| (c.spec.clone(), c.clone()))
             .collect();
         let mut endpoints = HashSet::new();
-        let router = Router::compile(gateway.routes.iter().map(|route| {
-            let action = match &route.action {
-                RouteAction::Forward(spec) => {
-                    if gateway.listener.is_some() {
-                        endpoints.extend(spec.endpoints.iter().map(|&address| {
-                            EndpointKey { address, protocol: spec.protocol }
-                        }));
+        let mut routes = BTreeMap::new();
+        for (address, socket) in &gateway.sockets {
+            let mut hosts = Vec::new();
+            for (hostname, rules) in &socket.hosts {
+                let router = Router::compile(rules.iter().map(|route| {
+                    let backends = route
+                        .action
+                        .backends
+                        .iter()
+                        .map(|(weight, target)| {
+                            (
+                                *weight,
+                                target
+                                    .as_ref()
+                                    .map(|spec| {
+                                        endpoints.extend(spec.endpoints.iter().map(
+                                            |&address| EndpointKey {
+                                                address,
+                                                protocol: spec.protocol,
+                                                tls: spec.tls.clone(),
+                                            },
+                                        ));
+                                        clusters
+                                            .entry(spec.clone())
+                                            .or_insert_with(|| {
+                                                Rc::new(Cluster::new(spec.clone()))
+                                            })
+                                            .clone()
+                                    })
+                                    .map_err(|e| *e),
+                            )
+                        })
+                        .collect();
+                    let action = RouteAction {
+                        backends,
+                        headers: route.action.headers.clone(),
+                        redirect: route.action.redirect.clone(),
+                    };
+                    Route {
+                        hostname: route.hostname.clone(),
+                        http: route.http.clone(),
+                        action,
                     }
-                    let cluster = clusters
-                        .entry(spec.clone())
-                        .or_insert_with(|| Rc::new(Cluster::new(spec.clone())));
-                    RouteAction::Forward(cluster.clone())
-                }
-                RouteAction::RejectInvalidBackend => RouteAction::RejectInvalidBackend,
-            };
-            Route {
-                hostname: route.hostname.clone(),
-                http: route.http.clone(),
-                action,
+                }));
+                hosts.push((hostname.clone(), router));
             }
-        }));
+            hosts.sort_by_key(|(name, _)| {
+                std::cmp::Reverse((
+                    !name.is_empty() && !name.starts_with("*."),
+                    name.len(),
+                ))
+            });
+            routes.insert(
+                *address,
+                tcp::Route { listener: socket.listener.clone(), target: hosts },
+            );
+        }
         Ok((
             Self {
                 revision: snapshot.revision,
                 deadline: gateway.forwarding.response_header_timeout,
-                route: gateway
-                    .listener
-                    .map(|listener| tcp::Route { listener, target: router }),
+                routes,
             },
             endpoints,
         ))
@@ -121,24 +161,21 @@ impl ProxyService {
         }
         // preparation cannot mutate the live view or retire its connections.
         let (next, endpoints) =
-            WorkerView::prepare(&snapshot, self.view.borrow().route.as_ref())?;
+            WorkerView::prepare(&snapshot, Some(&self.view.borrow()))?;
         // commit has no await or fallible operation; requests observe one complete local view.
         self.pool.reconcile(&endpoints);
         *self.view.borrow_mut() = next;
         Ok(snapshot.revision)
     }
 
-    pub fn listener(&self) -> Option<SocketAddr> {
-        self.view.borrow().route.as_ref().map(|route| route.listener)
-    }
     pub fn close(&self) {
         self.pool.close();
     }
 
     fn select(
         &self,
-        listener: SocketAddr,
-        request: &Request<Incoming>,
+        listener: &Listener,
+        request: &mut Request<Incoming>,
         authority: &Authority,
     ) -> Result<(Rc<Endpoint>, Duration), ProxyError> {
         if request.method() == http::Method::CONNECT
@@ -147,19 +184,56 @@ impl ProxyService {
             return Err(ProxyError::UnsupportedUpgrade);
         }
         let host = authority.host().to_ascii_lowercase();
-        // no shared locks or Arc clones on requests; release this borrow before I/O.
+        // release the worker-local routing view before starting I/O.
         let view = self.view.borrow();
         let router = view
-            .route
-            .as_ref()
+            .routes
+            .get(&listener.address)
             .and_then(|route| route.find(listener))
+            .and_then(|hosts| {
+                hosts.iter().find(|(name, _)| {
+                    super::super::super::ir::hostname_matches(name, &host)
+                })
+            })
+            .map(|(_, router)| router)
             .ok_or(ProxyError::NoRoute)?;
         let action = router
             .find(&host, request.uri().path(), request.method(), request.headers())
             .ok_or(ProxyError::NoRoute)?;
-        let RouteAction::Forward(cluster) = action else {
-            return Err(ProxyError::InvalidBackend);
-        };
+        if let Some(redirect) = &action.redirect {
+            let scheme = if !listener.tls.is_empty() { "https" } else { "http" };
+            let host = redirect.hostname.as_deref().unwrap_or_else(|| authority.host());
+            let port = listener.port;
+            let suffix = if (scheme == "http" && port == 80)
+                || (scheme == "https" && port == 443)
+            {
+                String::new()
+            } else {
+                format!(":{port}")
+            };
+            let path = request.uri().path_and_query().map_or("/", |p| p.as_str());
+            return Err(ProxyError::Redirect(
+                redirect.status,
+                format!("{scheme}://{host}{suffix}{path}"),
+            ));
+        }
+        for change in &action.headers {
+            match change {
+                HeaderChange::Remove(k) => {
+                    request.headers_mut().remove(k);
+                }
+                HeaderChange::Add(k, v) => {
+                    request.headers_mut().append(k, v.clone());
+                }
+                HeaderChange::Set(k, v) => {
+                    request.headers_mut().insert(k, v.clone());
+                }
+            }
+        }
+        let target = super::super::super::ir::weighted(&action.backends);
+        let cluster = target
+            .and_then(|t| t.as_ref().ok())
+            .ok_or(ProxyError::InvalidBackend)?;
         let address = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(address).ok_or(ProxyError::NoEndpoints)?;
         Ok((endpoint, view.deadline))
@@ -168,19 +242,24 @@ impl ProxyService {
     /// routing and forwarding failures become HTTP responses rather than service errors.
     pub async fn call(
         &self,
-        listener: SocketAddr,
+        listener: &Listener,
         mut request: Request<Incoming>,
     ) -> Result<Response<Body>, !> {
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
             Err(error) => return Ok(error.response()),
         };
-        let (endpoint, deadline) = match self.select(listener, &request, &authority) {
+        let (endpoint, deadline) = match self.select(listener, &mut request, &authority) {
             Ok(selected) => selected,
             Err(error) => return Ok(error.response()),
         };
         let downstream_version = request.version();
-        prepare_request(&mut request, authority, endpoint.key.protocol);
+        prepare_request(
+            &mut request,
+            authority,
+            endpoint.key.protocol,
+            !listener.tls.is_empty(),
+        );
         let address = endpoint.key.address;
         match timeout(deadline, self.upstream.send(endpoint, request)).await {
             Ok(Ok(response)) => {
@@ -204,6 +283,7 @@ impl ProxyService {
 }
 
 enum ProxyError {
+    Redirect(StatusCode, String),
     UnsupportedUpgrade,
     InvalidHost,
     NoRoute,
@@ -216,6 +296,16 @@ enum ProxyError {
 impl ProxyError {
     fn response(self) -> Response<Body> {
         let (status, text) = match self {
+            Self::Redirect(status, location) => {
+                return Response::builder()
+                    .status(status)
+                    .header(header::LOCATION, location)
+                    .body(Box::pin(
+                        Full::new(Bytes::new())
+                            .map_err(|never| -> hyper::Error { never }),
+                    ) as Body)
+                    .unwrap();
+            }
             Self::UnsupportedUpgrade => (
                 StatusCode::NOT_IMPLEMENTED,
                 "HTTP upgrades and CONNECT are unsupported\n",
@@ -288,6 +378,7 @@ fn prepare_request(
     request: &mut Request<Incoming>,
     authority: Authority,
     protocol: Protocol,
+    downstream_tls: bool,
 ) {
     let trailers = request
         .headers()
@@ -330,7 +421,11 @@ fn prepare_request(
             *request.version_mut() = Version::HTTP_2;
             // encode authority once; some HTTP/2 servers reject a duplicate Host field.
             request.headers_mut().remove(header::HOST);
-            uri.scheme.get_or_insert(http::uri::Scheme::HTTP);
+            uri.scheme.get_or_insert(if downstream_tls {
+                http::uri::Scheme::HTTPS
+            } else {
+                http::uri::Scheme::HTTP
+            });
             uri.authority = Some(authority);
         }
     }

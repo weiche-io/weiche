@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weiche-gateway-controller
+rules:
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses, gateways, httproutes, tcproutes, udproutes, referencegrants, backendtlspolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses/status, gateways/status, httproutes/status, tcproutes/status, udproutes/status, backendtlspolicies/status]
+    verbs: [get, patch]
+  - apiGroups: ['']
+    resources: [services, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [configmaps, secrets]
+    verbs: [list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: weiche-gateway-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: weiche-gateway-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name | quote }}
+    namespace: {{ .Release.Namespace | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-election
+  namespace: {{ .Release.Namespace | quote }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [weiche-controller]
+    verbs: [get, patch]
+  # Retire GatewayClass-owned Services left by the shared proxy deployment.
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-election
+  namespace: {{ .Release.Namespace | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name | quote }}
+    namespace: {{ .Release.Namespace | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weiche-gateway-provisioner
+rules:
+  - apiGroups: ['']
+    resources: [services, secrets, configmaps, serviceaccounts]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, create, patch, delete]
+{{- range .Values.gatewayNamespaces | default (list .Release.Namespace) | uniq }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: weiche-gateway-provisioner
+  namespace: {{ . | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: weiche-gateway-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Release.Name | quote }}
+    namespace: {{ $.Release.Namespace | quote }}
+{{- end }}

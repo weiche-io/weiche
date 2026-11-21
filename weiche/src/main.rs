@@ -1,6 +1,6 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use tracing_subscriber::EnvFilter;
-use weiche::{control::Selection, gateway, rtconf::RuntimeConfig};
+use weiche::{control, gateway, proxy, rtconf::RuntimeConfig};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -8,12 +8,19 @@ fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    let config = RuntimeConfig::from_env()?;
-    let workers = config.workers.get();
-    let selection = Selection::from_env()?;
-    let runtime =
-        compio::runtime::Runtime::new().context("create main compio runtime")?;
-    tracing::info!(worker = 0, workers, driver = ?runtime.driver_type(), "starting compio data plane");
-    runtime.block_on(gateway::run(selection, config))
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [role] if role == "controller" => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(control::run()),
+        [role, resource] if role == "proxy" => {
+            let runtime = RuntimeConfig::from_env()?;
+            let io = compio::runtime::Runtime::new().context("create proxy runtime")?;
+            tracing::info!(workers=runtime.workers.get(), driver=?io.driver_type(), "starting data plane");
+            io.block_on(gateway::run(resource.clone(), runtime))
+        }
+        [role] if role == "ready" => proxy::ready(),
+        _ => bail!("usage: weiche controller | proxy <gateway-resource-name> | ready"),
+    }
 }

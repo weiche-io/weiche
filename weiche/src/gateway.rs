@@ -1,8 +1,7 @@
 //! supervise compio workers and a dedicated Tokio control thread.
 use super::{
-    control::{self, Selection},
     ir::GatewaySnapshot,
-    routing,
+    proxy, routing,
     rtconf::RuntimeConfig,
     stream::{WorkerGroup, down::WorkerGroupState},
 };
@@ -10,7 +9,7 @@ use anyhow::Context;
 use std::thread;
 use tokio::sync::{oneshot, watch};
 
-pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result<()> {
+pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
     let (config_tx, config_rx) = routing::channel(GatewaySnapshot::default());
     let (listener_tx, listener_rx) = watch::channel(WorkerGroupState::default());
     let (stop, stopped) = watch::channel(false);
@@ -18,19 +17,14 @@ pub async fn run(selection: Selection, runtime: RuntimeConfig) -> anyhow::Result
     let (done_tx, mut done_rx) = oneshot::channel();
     let group = WorkerGroup::new(runtime, config_rx, listener_tx)?;
     let control = thread::Builder::new()
-        .name("weiche-control".into())
+        .name("weiche-proxy-watch".into())
         .spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .context("create control-plane Tokio runtime")?;
-                runtime.block_on(control::run(
-                    selection,
-                    config_tx,
-                    listener_rx,
-                    control_stop,
-                ))
+                runtime.block_on(proxy::run(name, config_tx, listener_rx, control_stop))
             })();
             let _ = done_tx.send(result);
         })

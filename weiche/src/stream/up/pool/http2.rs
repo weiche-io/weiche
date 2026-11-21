@@ -50,7 +50,7 @@ impl ConnectionPool {
                     endpoint.budget.changed.notify_waiters();
                 });
                 let transport = self
-                    .dial(endpoint, self.connector.connect_http2(endpoint.key.address))
+                    .dial(endpoint, self.connector.connect_http2(&endpoint.key))
                     .await?;
                 let connection = Rc::new(Http2Connection {
                     transport,

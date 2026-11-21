@@ -1,10 +1,14 @@
 //! Kubernetes watches and their live resource caches.
+mod cleanup;
 mod compile;
 mod reconcile;
+mod service;
 mod status;
+mod tls;
 mod tryfrom;
+mod workload;
 
-pub use compile::{CONTROLLER_NAME, Compiled, Selection, compile};
+pub use compile::{CONTROLLER_NAME, Compiled, compile};
 pub use reconcile::run;
 pub use tryfrom::{Resolve, ResolveError};
 
@@ -12,7 +16,10 @@ use futures::{
     StreamExt,
     stream::{BoxStream, select_all},
 };
-use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
+use k8s_openapi::api::{
+    core::v1::{ConfigMap, Namespace, Secret, Service},
+    discovery::v1::EndpointSlice,
+};
 use kube::{
     Api, Client, Resource, ResourceExt,
     runtime::{
@@ -25,7 +32,9 @@ use serde::de::DeserializeOwned;
 use std::{fmt::Debug, future::ready};
 use tokio::sync::watch;
 use weiche_gtwapi::v1::{
-    gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HttpRoute,
+    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
+    gateways::Gateway, httproutes::HttpRoute, referencegrants::ReferenceGrant,
+    tcproutes::TcpRoute, udproutes::UdpRoute,
 };
 
 /// Live snapshots maintained by kube-runtime, including updates and deletions.
@@ -35,7 +44,14 @@ use weiche_gtwapi::v1::{
 pub struct GatewayStores {
     pub gateway_classes: Store<GatewayClass>,
     pub gateways: Store<Gateway>,
+    pub tcp_routes: Store<TcpRoute>,
+    pub udp_routes: Store<UdpRoute>,
     pub http_routes: Store<HttpRoute>,
+    pub secrets: Store<Secret>,
+    pub namespaces: Store<Namespace>,
+    pub grants: Store<ReferenceGrant>,
+    pub config_maps: Store<ConfigMap>,
+    pub tls_policies: Store<BackendTlsPolicy>,
     pub services: Store<Service>,
     pub endpoint_slices: Store<EndpointSlice>,
 }
@@ -48,16 +64,33 @@ pub struct GatewayController {
 }
 impl GatewayController {
     pub fn new(client: Client) -> Self {
-        let (gateway_classes, classes_watch) = cache(Api::all(client.clone()));
-        let (gateways, gateways_watch) = cache(Api::all(client.clone()));
-        let (http_routes, routes_watch) = cache(Api::all(client.clone()));
-        let (services, services_watch) = cache(Api::all(client.clone()));
-        let (endpoint_slices, endpoints_watch) = cache(Api::all(client));
+        let defaults = watcher::Config::default;
+        let (gateway_classes, classes_watch) =
+            cache(Api::all(client.clone()), defaults());
+        let (gateways, gateways_watch) = cache(Api::all(client.clone()), defaults());
+        let (tcp_routes, tcp_watch) = cache(Api::all(client.clone()), defaults());
+        let (udp_routes, udp_watch) = cache(Api::all(client.clone()), defaults());
+        let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
+        let (secrets, secrets_watch) =
+            cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
+        let (namespaces, namespaces_watch) = cache(Api::all(client.clone()), defaults());
+        let (grants, grants_watch) = cache(Api::all(client.clone()), defaults());
+        let (config_maps, maps_watch) = cache(Api::all(client.clone()), defaults());
+        let (tls_policies, policies_watch) = cache(Api::all(client.clone()), defaults());
+        let (services, services_watch) = cache(Api::all(client.clone()), defaults());
+        let (endpoint_slices, endpoints_watch) = cache(Api::all(client), defaults());
         Self {
             stores: GatewayStores {
                 gateway_classes,
                 gateways,
                 http_routes,
+                tcp_routes,
+                udp_routes,
+                secrets,
+                namespaces,
+                grants,
+                config_maps,
+                tls_policies,
                 services,
                 endpoint_slices,
             },
@@ -65,6 +98,13 @@ impl GatewayController {
                 classes_watch,
                 gateways_watch,
                 routes_watch,
+                tcp_watch,
+                udp_watch,
+                secrets_watch,
+                namespaces_watch,
+                grants_watch,
+                maps_watch,
+                policies_watch,
                 services_watch,
                 endpoints_watch,
             ],
@@ -87,7 +127,7 @@ impl GatewayController {
     }
 }
 
-fn cache<K>(api: Api<K>) -> (Store<K>, BoxStream<'static, ()>)
+fn cache<K>(api: Api<K>, config: watcher::Config) -> (Store<K>, BoxStream<'static, ()>)
 where
     K: Resource<DynamicType = ()>
         + Clone
@@ -98,7 +138,7 @@ where
         + 'static,
 {
     let (reader, writer) = reflector::store();
-    let stream = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()))
+    let stream = reflector::reflector(writer, watcher::watcher(api, config))
         .default_backoff()
         .filter_map(|result| ready(match result {
             Ok(watcher::Event::Apply(resource) | watcher::Event::Delete(resource)) => {
@@ -113,4 +153,32 @@ where
             }
         })).boxed();
     (reader, stream)
+}
+
+impl GatewayStores {
+    /// authorize a core resource reference using grants in the target namespace.
+    pub fn permits(
+        &self,
+        from: &str,
+        source_kind: &str,
+        target: &str,
+        kind: &str,
+        name: &str,
+    ) -> bool {
+        from == target
+            || self.grants.state().iter().any(|grant| {
+                grant.metadata.namespace.as_deref() == Some(target)
+                    && grant.metadata.deletion_timestamp.is_none()
+                    && grant.spec.from.iter().any(|r| {
+                        r.group == "gateway.networking.k8s.io"
+                            && r.kind == source_kind
+                            && r.namespace == from
+                    })
+                    && grant.spec.to.iter().any(|r| {
+                        r.group.is_empty()
+                            && r.kind == kind
+                            && r.name.as_deref().is_none_or(|n| n == name)
+                    })
+            })
+    }
 }

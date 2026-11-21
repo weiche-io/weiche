@@ -1,11 +1,12 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::rtconf::RuntimeConfig,
+    super::{ir::Listener, rtconf::RuntimeConfig},
     core::{http::ProxyService, tcp::Permit},
-    up::io,
+    io::socket,
 };
+use super::tls;
 use compio::{net::TcpStream, runtime::time::timeout};
-use cyper_core::{CompioExecutor, CompioTimer};
+use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
 use hyper::service::service_fn;
 use hyper_util::server::conn::auto::Builder;
 use std::{net::SocketAddr, rc::Rc, time::Duration};
@@ -15,6 +16,7 @@ pub(super) struct Server {
     pub service: ProxyService,
     builder: Builder<CompioExecutor>,
     drain_timeout: Duration,
+    handshake_timeout: Duration,
 }
 
 impl Server {
@@ -34,32 +36,61 @@ impl Server {
             service,
             builder,
             drain_timeout: config.connection_drain_timeout,
+            handshake_timeout: config.tls_handshake_timeout,
         }
     }
 
     pub async fn serve(
         self: Rc<Self>,
-        listener: SocketAddr,
+        listener: Listener,
         stream: TcpStream,
         peer: SocketAddr,
         _permit: Permit,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || shutdown.has_changed().unwrap_or(true) {
             return;
         }
-        let stream = match stream.set_nodelay(true).and_then(|()| io(stream)) {
+        let stream = match socket(stream) {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
                 return;
             }
         };
+        let (stream, builder) = if !listener.tls.is_empty() {
+            let handshake = tokio::select! {
+                _ = shutdown.changed() => return,
+                result = timeout(self.handshake_timeout, tls::accept(stream, &listener.tls)) => result,
+            };
+            let stream = match handshake {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    tracing::debug!(%peer, %error, "TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(%peer, "TLS handshake timed out");
+                    return;
+                }
+            };
+            let h2 = stream.negotiated_alpn().as_deref() == Some(b"h2");
+            let builder = if h2 {
+                self.builder.clone().http2_only()
+            } else {
+                self.builder.clone().http1_only()
+            };
+            (stream, builder)
+        } else {
+            (HyperStream::new_plain(stream), self.builder.clone())
+        };
+        let listener = Rc::new(listener);
         let service = service_fn(|request| {
             let server = self.clone();
-            async move { server.service.call(listener, request).await }
+            let listener = listener.clone();
+            async move { server.service.call(&listener, request).await }
         });
-        let connection = self.builder.serve_connection(stream, service);
+        let connection = builder.serve_connection(stream, service);
         tokio::pin!(connection);
         tokio::select! {
             result = &mut connection => {

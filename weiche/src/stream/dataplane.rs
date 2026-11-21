@@ -28,11 +28,8 @@ impl WorkerGroup {
 
     pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let Self { runtime, mut config, state } = self;
-        let listeners = Arc::new(ListenerGroup::new(
-            runtime.workers.get(),
-            config.clone(),
-            state.clone(),
-        ));
+        let listeners =
+            Arc::new(ListenerGroup::new(runtime.workers.get(), state.clone()));
         let admission =
             Arc::new(Admission::new(runtime.downstream_connections_global.get()));
         let (stop, stopped_rx) = watch::channel(false);

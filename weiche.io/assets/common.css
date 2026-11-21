@@ -1,0 +1,459 @@
+/*!
+Paper palette and typography pairing (IBM Plex Sans + Chakra Petch) adapted
+from the OINK Hugo theme (https://github.com/pgsty/oink, commit ef3f119,
+assets/scss/td/_presets.scss and _brand.scss).
+
+Copyright 2026 PGSTY contributors (derived from Docsy, Copyright 2018 Google
+LLC and Docsy contributors). Licensed under the Apache License, Version 2.0.
+*/
+
+@font-face {
+  font-family: "Plex Sans";
+  src: url("fonts/plex-sans.woff2") format("woff2");
+  font-weight: 100 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Chakra Petch";
+  src: url("fonts/chakra-petch.woff2") format("woff2");
+  font-weight: 700;
+  font-display: swap;
+}
+:root {
+  color-scheme: light dark;
+  --paper: #f7f6f3;
+  --panel: #fff;
+  --inset: #efede8;
+  --ink: #21201c;
+  --muted: #56534c;
+  --line: #d9d7d1;
+  --link: #2b5f8c;
+  --action: #2b5f8c;
+  --on-action: #fff;
+  --copper: #9c5530;
+  --grid: rgba(33, 32, 28, 0.055);
+  --shade: rgba(48, 46, 39, 0.09);
+  --sans: "Plex Sans", system-ui, sans-serif;
+  --display: "Chakra Petch", var(--sans);
+  --mono: ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #161513;
+    --panel: #201f1c;
+    --inset: #292824;
+    --ink: #ece9e3;
+    --muted: #b6b1a7;
+    --line: #393934;
+    --link: #8cbce4;
+    --action: #8cbce4;
+    --on-action: #141c24;
+    --copper: #d99a6c;
+    --grid: rgba(236, 233, 227, 0.045);
+    --shade: rgba(0, 0, 0, 0.3);
+  }
+}
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html {
+  scroll-padding-top: 5rem;
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  color: var(--ink);
+  font: 1rem/1.6 var(--sans);
+}
+.wrap {
+  padding-inline: max(1.25rem, (100% - 72rem) / 2);
+}
+main {
+  flex: 1;
+  min-width: 0;
+}
+h1,
+h2,
+h3,
+p,
+figure,
+pre {
+  margin: 0;
+}
+h1,
+h2,
+h3 {
+  line-height: 1.15;
+  text-wrap: balance;
+}
+a {
+  color: var(--link);
+  text-underline-offset: 0.18em;
+}
+a:hover {
+  text-decoration: underline;
+}
+:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 4px;
+}
+.skip-link {
+  position: fixed;
+  top: 0.6rem;
+  left: 0.6rem;
+  transform: translateY(-180%);
+  background: var(--panel);
+  padding: 0.5rem 1rem;
+  z-index: 5;
+}
+.skip-link:focus {
+  transform: none;
+}
+.site-header,
+.site-footer,
+.site-header nav,
+.site-footer nav,
+.brand,
+.actions,
+.crumbs {
+  display: flex;
+  align-items: center;
+}
+.site-header,
+.site-footer {
+  justify-content: space-between;
+  gap: 1rem;
+}
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  min-height: 4rem;
+  flex-wrap: wrap;
+  padding-block: 0.35rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+.brand,
+.footer-brand {
+  font: 700 1.42rem/1 var(--display);
+  letter-spacing: -0.04em;
+  color: var(--ink);
+  text-decoration: none;
+}
+.brand {
+  gap: 0.55rem;
+}
+.brand:hover,
+.footer-brand:hover {
+  text-decoration: none;
+}
+.site-header nav,
+.site-footer nav {
+  flex-wrap: wrap;
+  gap: 0.25rem 1.8rem;
+}
+.site-header nav a,
+.site-footer nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.94rem;
+}
+.site-header nav a {
+  padding-block: 0.5rem;
+  font-weight: 550;
+}
+.site-header nav a[aria-current],
+.site-header nav a:hover,
+.site-footer nav a:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+.site-footer {
+  padding-block: 1.45rem;
+  border-top: 1px solid var(--line);
+}
+.footer-brand {
+  font-size: 1.05rem;
+}
+
+.hero {
+  padding-block: clamp(2.5rem, 5vw, 4.5rem);
+  border-bottom: 1px solid var(--line);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.hero h1 {
+  font: 700 clamp(4rem, 7.5vw, 7rem)/1 var(--display);
+  letter-spacing: -0.065em;
+}
+.lede {
+  color: var(--muted);
+  font-size: clamp(1.1rem, 1.8vw, 1.35rem);
+  line-height: 1.48;
+}
+.hero .lede {
+  max-width: 56ch;
+  margin-top: 1rem;
+}
+.actions {
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.8rem;
+}
+.button {
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  padding: 0.58rem 1.15rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+.primary {
+  color: var(--on-action);
+  background: var(--action);
+  border-color: var(--action);
+}
+.secondary {
+  color: var(--ink);
+  background: var(--panel);
+}
+.button:hover {
+  box-shadow: 0 3px 10px var(--shade);
+  text-decoration: underline;
+}
+
+.routes {
+  padding-block: clamp(2.5rem, 6vw, 5rem);
+}
+.routes h2 {
+  margin-bottom: 1.5rem;
+  font-size: clamp(1.7rem, 3vw, 2.35rem);
+  letter-spacing: -0.04em;
+}
+.route-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: clamp(1rem, 3vw, 2.5rem);
+}
+.route-list li {
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+.route-list h3 {
+  font: 600 1.1rem/1.4 var(--mono);
+}
+.route-list a {
+  text-decoration: none;
+}
+.route-list a:hover {
+  text-decoration: underline;
+}
+.route-list p {
+  margin-top: 0.5rem;
+  max-width: 34ch;
+  color: var(--muted);
+}
+
+.reader {
+  display: grid;
+  grid-template-columns: minmax(0, 46rem) minmax(10rem, 14rem);
+  grid-template-areas: "intro toc" "article toc";
+  justify-content: space-between;
+  align-content: start;
+  gap: 2rem clamp(2rem, 5vw, 6rem);
+  padding-block: 2.6rem 4.5rem;
+}
+.page-intro {
+  grid-area: intro;
+}
+.crumbs {
+  gap: 0.7rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+.crumbs a {
+  text-decoration: none;
+}
+.crumbs span::before {
+  content: "/";
+  margin-right: 0.7rem;
+  color: var(--copper);
+}
+.page-intro h1 {
+  font-size: clamp(2.5rem, 4.6vw, 4rem);
+  letter-spacing: -0.055em;
+  margin: 1.25rem 0 0.75rem;
+}
+.toc {
+  grid-area: toc;
+  align-self: start;
+  position: sticky;
+  top: 6.5rem;
+  border-left: 1px solid var(--line);
+  padding-left: 1.2rem;
+}
+.toc p {
+  font-size: 0.85rem;
+  font-weight: 650;
+  margin-bottom: 0.55rem;
+}
+.toc nav {
+  display: grid;
+  gap: 0.4rem;
+}
+.toc a {
+  font-size: 0.9rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+.toc a:hover,
+.crumbs a:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+.prose {
+  grid-area: article;
+  min-width: 0;
+  line-height: 1.7;
+}
+.prose h2:not(:first-child) {
+  margin-top: 2rem;
+}
+.prose h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.45rem;
+  font-size: 1.6rem;
+  letter-spacing: -0.035em;
+  margin-bottom: 0.75rem;
+}
+.prose h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1.18rem;
+  letter-spacing: -0.02em;
+}
+.prose p + p,
+.prose ul + p,
+.prose ol + p,
+.prose pre + p,
+.prose table + p {
+  margin-top: 0.9rem;
+}
+.prose ul,
+.prose ol {
+  margin: 0.75rem 0 1rem;
+  padding-left: 1.4rem;
+}
+.prose li + li {
+  margin-top: 0.35rem;
+}
+.prose table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 1rem 0 1.25rem;
+  font-size: 0.94rem;
+}
+.prose th,
+.prose td {
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line);
+}
+.prose th {
+  font-weight: 600;
+  border-bottom-width: 2px;
+  white-space: nowrap;
+}
+pre {
+  margin: 0.9rem 0 1.2rem;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--panel);
+  box-shadow: 0 2px 6px var(--shade);
+}
+code {
+  font: 0.9em/1.7 var(--mono);
+}
+pre code span {
+  color: inherit !important;
+}
+code:not(pre code) {
+  padding: 0.1rem 0.28rem;
+  border-radius: 0.25rem;
+  background: var(--inset);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 48rem) {
+  .reader {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+  .toc {
+    position: static;
+    align-self: stretch;
+  }
+  .toc nav {
+    display: flex;
+    gap: 0.35rem 1rem;
+    flex-wrap: wrap;
+  }
+}
+@media (max-width: 36rem) {
+  .route-list {
+    grid-template-columns: 1fr;
+  }
+  .route-list p {
+    max-width: none;
+  }
+  .site-header nav,
+  .site-footer nav {
+    gap: 1rem;
+  }
+}
+@media print {
+  :root {
+    color-scheme: light;
+    --paper: white;
+    --ink: black;
+    --muted: #333;
+    --line: #bbb;
+    --link: #222;
+    --panel: white;
+    --inset: #eee;
+  }
+  .site-header,
+  .site-footer,
+  .toc,
+  .crumbs,
+  .skip-link,
+  .actions {
+    display: none;
+  }
+  .reader {
+    display: block;
+  }
+  .wrap {
+    padding: 0;
+  }
+  pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    box-shadow: none;
+  }
+}

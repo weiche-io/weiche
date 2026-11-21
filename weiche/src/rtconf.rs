@@ -8,6 +8,8 @@ pub struct RuntimeConfig {
     pub downstream_connections_global: NonZeroUsize,
     pub upstream_connections_per_worker: NonZeroUsize,
     pub upstream_idle_timeout: Duration,
+    /// maximum time a downstream socket may occupy a permit before TLS completes.
+    pub tls_handshake_timeout: Duration,
     pub connection_drain_timeout: Duration,
     pub worker_drain_timeout: Duration,
     pub listener_retry_interval: Duration,
@@ -23,6 +25,7 @@ impl RuntimeConfig {
             downstream_connections_global: NonZeroUsize::new(1024).unwrap(),
             upstream_connections_per_worker: NonZeroUsize::new(1024).unwrap(),
             upstream_idle_timeout: Duration::from_secs(30),
+            tls_handshake_timeout: Duration::from_secs(10),
             connection_drain_timeout: Duration::from_secs(5),
             worker_drain_timeout: Duration::from_secs(6),
             listener_retry_interval: Duration::from_millis(250),

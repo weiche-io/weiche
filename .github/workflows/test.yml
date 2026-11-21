@@ -1,0 +1,38 @@
+name: test
+on: pull_request
+permissions:
+  contents: read
+concurrency:
+  group: test-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: make conformance-source
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: target/conformance/gateway-api/go.work
+          cache-dependency-path: target/conformance/gateway-api/conformance/go.sum
+      - run: make conformance
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && hashFiles('target/conformance/report.yaml') != '' }}
+        with:
+          name: gateway-api-conformance
+          path: target/conformance/report.yaml
+          if-no-files-found: error
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: typst-community/setup-typst@48aeee7543d37f01afd1ffb27307dc277387ba13 # v4
+        with:
+          typst-version: 0.15.1
+      - run: sudo apt-get update && sudo apt-get install -y minify
+      - run: make MINIFY=y full
