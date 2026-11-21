@@ -45,7 +45,6 @@
       site.repository + "/blob/" + site.source-ref + "/weiche.io/" + source-path
     }
     html.a(href: source)[Source]
-    html.a(href: root + "weiche.svg")[Project logo]
     html.a(href: site.repository + "/issues")[Issues]
   })
 })
