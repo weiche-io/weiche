@@ -1,8 +1,10 @@
 //! apply validated HTTPRoute filters without decoding the request path or query.
 use super::super::super::ir::{Binding, Filters, HeaderChange, PathModifier, Redirect};
+use super::super::up::Exchange;
+use super::router::Selection;
 use super::wire::{ProxyError, host_authority, strip_hop_headers};
 use http::{
-    HeaderMap, HeaderValue, Uri, header,
+    HeaderMap, HeaderValue, Request, Uri, Version, header,
     uri::{Authority, PathAndQuery},
 };
 use std::net::SocketAddr;
@@ -35,15 +37,19 @@ fn supports_trailers(headers: &HeaderMap) -> bool {
 }
 
 /// preserve the original authority and TE semantics while applying request filters.
-pub fn request_headers(
-    headers: &mut HeaderMap,
+pub fn request_headers<B>(
+    request: &mut Request<B>,
     peer: SocketAddr,
     original: &Authority,
     tls: bool,
     rule: &Filters,
     backend: &Filters,
 ) -> Result<(Authority, bool), ProxyError> {
-    let trailers = supports_trailers(headers);
+    // an HTTP/3 client can receive trailers without an explicit TE field.
+    let implicit_trailers = request.version() == Version::HTTP_3
+        && !request.headers().contains_key(header::TE);
+    let headers = request.headers_mut();
+    let trailers = implicit_trailers || supports_trailers(headers);
     strip_hop_headers(headers);
     forwarded(headers, peer, original, tls);
     if rule.headers.is_empty() && backend.headers.is_empty() {
@@ -66,6 +72,33 @@ pub fn request_headers(
     let trailers = supports_trailers(headers);
     strip_hop_headers(headers);
     Ok((authority, trailers))
+}
+
+/// apply backend and rule filters before restoring downstream framing and CORS headers.
+pub fn response(exchange: &mut Exchange, version: Version, selection: Selection) {
+    let response = &mut exchange.response;
+    *response.version_mut() = version;
+    let headers = response.headers_mut();
+    let backend_changes = selection
+        .backend
+        .as_ref()
+        .map_or(&[][..], |(_, filters)| filters.response_headers.as_slice());
+    if !backend_changes.is_empty() || !selection.rule.response_headers.is_empty() {
+        modify(headers, backend_changes);
+        modify(headers, &selection.rule.response_headers);
+        strip_hop_headers(headers);
+    }
+    if !matches!(version, Version::HTTP_2 | Version::HTTP_3)
+        && headers.contains_key(header::TRAILER)
+    {
+        headers.remove(header::CONTENT_LENGTH);
+    }
+    if let Some(tunnel) = &exchange.tunnel {
+        tunnel.restore(headers);
+    }
+    if let Some(cors) = selection.cors {
+        cors.apply(headers);
+    }
 }
 
 /// add proxy metadata before configured header changes, preserving all earlier hops.

@@ -13,8 +13,7 @@ use super::{
     up::{ConnectionPool, Exchange, UpstreamClient},
 };
 pub use body::{RequestBody, ResponseBody};
-use bytes::Bytes;
-use http::{HeaderValue, Request, Response, StatusCode, Version, header, uri::Authority};
+use http::{HeaderValue, Request, StatusCode, Version, header, uri::Authority};
 use router::{Hosts, Router, Selection};
 use std::{
     cell::RefCell,
@@ -251,38 +250,14 @@ impl ProxyService {
             Err(error) => return advertise(error.for_request(grpc)),
         };
         let exchange = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
-            let mut response = Response::new(ResponseBody::full(Bytes::new()));
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            Exchange::local(response)
+            Exchange::local(wire::empty_response(StatusCode::NO_CONTENT))
         } else {
             self.forward(listener, peer, request, &authority, &selection)
                 .await
                 .unwrap_or_else(|error| error.for_request(selection.grpc))
         };
         let mut exchange = advertise(exchange);
-        let response = &mut exchange.response;
-        *response.version_mut() = version;
-        let headers = response.headers_mut();
-        let backend_changes = selection
-            .backend
-            .as_ref()
-            .map_or(&[][..], |(_, filters)| filters.response_headers.as_slice());
-        if !backend_changes.is_empty() || !selection.rule.response_headers.is_empty() {
-            filter::modify(headers, backend_changes);
-            filter::modify(headers, &selection.rule.response_headers);
-            strip_hop_headers(headers);
-        }
-        if !matches!(version, Version::HTTP_2 | Version::HTTP_3)
-            && response.headers().contains_key(header::TRAILER)
-        {
-            response.headers_mut().remove(header::CONTENT_LENGTH);
-        }
-        if let Some(tunnel) = &exchange.tunnel {
-            tunnel.restore(response.headers_mut());
-        }
-        if let Some(cors) = selection.cors {
-            cors.apply(response.headers_mut());
-        }
+        filter::response(&mut exchange, version, selection);
         exchange
     }
 
@@ -307,15 +282,8 @@ impl ProxyService {
         let key = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(key).ok_or(ProxyError::NoEndpoints)?;
         let upgrade = wire::take_upgrade(&mut request, endpoint.key.protocol)?;
-        if request.version() == Version::HTTP_3 {
-            // http/3 can receive trailers even without an explicit TE field.
-            request
-                .headers_mut()
-                .entry(header::TE)
-                .or_insert(HeaderValue::from_static("trailers"));
-        }
         let (authority, trailers) = filter::request_headers(
-            request.headers_mut(),
+            &mut request,
             peer,
             original,
             listener.tls,
@@ -345,17 +313,7 @@ impl ProxyService {
             .upstream
             .send(endpoint, request, upgrade, selection.budget)
             .await
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
-                {
-                    ProxyError::Timeout
-                } else {
-                    tracing::warn!(%address, %error, "http backend request failed");
-                    ProxyError::Upstream
-                }
-            })?;
+            .map_err(|error| ProxyError::backend(address, error))?;
         strip_hop_headers(exchange.response.headers_mut());
         Ok(exchange)
     }

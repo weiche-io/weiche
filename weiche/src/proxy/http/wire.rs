@@ -10,6 +10,7 @@ use http::{
     HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
     uri::Authority,
 };
+use std::{io, net::SocketAddr};
 
 /// errors mapped to local HTTP responses.
 pub enum ProxyError {
@@ -54,6 +55,19 @@ pub fn is_grpc<B>(request: &Request<B>) -> bool {
 }
 
 impl ProxyError {
+    /// distinguish an expired dispatch from a failed backend transport.
+    pub fn backend(address: SocketAddr, error: anyhow::Error) -> Self {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::TimedOut)
+        {
+            Self::Timeout
+        } else {
+            tracing::warn!(%address, %error, "http backend request failed");
+            Self::Upstream
+        }
+    }
+
     /// emit a trailers-only gRPC response when a call cannot be dispatched.
     pub fn for_request(self, grpc: bool) -> Exchange {
         if grpc {
@@ -63,7 +77,7 @@ impl ProxyError {
                 Self::Timeout => "4",
                 _ => return self.response(),
             };
-            let mut response = Response::new(ResponseBody::full(Bytes::new()));
+            let mut response = empty_response(StatusCode::OK);
             *response.version_mut() = Version::HTTP_2;
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -81,8 +95,7 @@ impl ProxyError {
     pub fn response(self) -> Exchange {
         let (status, text) = match self {
             Self::Redirect(status, location) => {
-                let mut response = Response::new(ResponseBody::full(Bytes::new()));
-                *response.status_mut() = status;
+                let mut response = empty_response(status);
                 response.headers_mut().insert(header::LOCATION, location);
                 return Exchange::local(response);
             }
@@ -114,6 +127,13 @@ impl ProxyError {
         );
         Exchange::local(response)
     }
+}
+
+/// build a header-only response for redirects, preflights and local gRPC status.
+pub fn empty_response(status: StatusCode) -> Response<ResponseBody> {
+    let mut response = Response::new(ResponseBody::full(Bytes::new()));
+    *response.status_mut() = status;
+    response
 }
 
 /// parse the single Host field used by HTTP/1 or supplied by a route filter.
