@@ -259,6 +259,44 @@ impl RefError {
     }
 }
 
+/// application protocol declared on a backend Service port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppProtocol {
+    /// the route selects the wire protocol.
+    None,
+    /// serve HTTP with optional transport security.
+    Http,
+    /// secure HTTP.
+    Https,
+    /// negotiate HTTP/2 over TLS.
+    H2,
+    /// cleartext HTTP/2.
+    H2c,
+    /// cleartext WebSocket.
+    Ws,
+    /// secure WebSocket.
+    Wss,
+    /// unrecognized service name or domain-prefixed protocol.
+    Unsupported,
+}
+
+impl AppProtocol {
+    /// recognize case-insensitive IANA names and exact Kubernetes protocol names.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::None,
+            Some("kubernetes.io/http") => Self::Http,
+            Some("kubernetes.io/h2c") => Self::H2c,
+            Some("kubernetes.io/ws") => Self::Ws,
+            Some("kubernetes.io/wss") => Self::Wss,
+            Some(name) if name.eq_ignore_ascii_case("http") => Self::Http,
+            Some(name) if name.eq_ignore_ascii_case("https") => Self::Https,
+            Some(name) if name.eq_ignore_ascii_case("h2") => Self::H2,
+            Some(_) => Self::Unsupported,
+        }
+    }
+}
+
 /// resolve a Service backend into a validated cluster or a Gateway API status reason.
 fn resolve_backend(
     stores: &GatewayStores,
@@ -267,42 +305,30 @@ fn resolve_backend(
     source: &str,
     reference: ServiceRef<'_>,
 ) -> Result<ClusterSpec, RefError> {
-    let (service, mut port) =
-        reference.resolve(stores, namespace, source, Transport::Tcp)?;
+    let (service, port) = reference.resolve(stores, namespace, source, Transport::Tcp)?;
     let namespace = reference.namespace.unwrap_or(namespace);
-    // unprefixed appProtocol values are case-insensitive IANA service names.
-    if let Some(name) = &mut port.app_protocol
-        && !name.contains('/')
-    {
-        name.make_ascii_lowercase();
-    }
-    // a gRPC route selects HTTP/2 even when the Service omits appProtocol.
-    let app = port.app_protocol.as_deref();
-    let protocol = match (source, app) {
-        (
-            "GRPCRoute",
-            None
-            | Some("http" | "https" | "kubernetes.io/http" | "kubernetes.io/h2c" | "h2"),
-        ) => Protocol::Http2,
-        (
-            "HTTPRoute",
-            None
-            | Some(
-                "http" | "kubernetes.io/http" | "https" | "kubernetes.io/ws"
-                | "kubernetes.io/wss",
-            ),
-        ) => Protocol::Http1,
-        ("HTTPRoute", Some("kubernetes.io/h2c" | "h2")) => Protocol::Http2,
-        _ => return Err(RefError::UnsupportedProtocol),
-    };
+    let app = AppProtocol::parse(port.app_protocol.as_deref());
+    let protocol =
+        if source == "GRPCRoute" || matches!(app, AppProtocol::H2 | AppProtocol::H2c) {
+            Protocol::Http2
+        } else {
+            Protocol::Http1
+        };
+    // record the policy's Gateway ancestor even if this route cannot use the port.
     let tls =
-        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol)?;
-    match (source, app, &tls) {
-        (_, Some("https" | "h2" | "kubernetes.io/wss"), None)
-        | ("HTTPRoute", Some("kubernetes.io/h2c" | "kubernetes.io/ws"), Some(_)) => {
-            return Err(RefError::UnsupportedProtocol);
-        }
-        _ => {}
+        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol);
+    if app == AppProtocol::Unsupported
+        || (source == "GRPCRoute" && matches!(app, AppProtocol::Ws | AppProtocol::Wss))
+    {
+        return Err(RefError::UnsupportedProtocol);
+    }
+    let tls = tls?;
+    if matches!(
+        (app, &tls),
+        (AppProtocol::Https | AppProtocol::H2 | AppProtocol::Wss, None)
+            | (AppProtocol::H2c | AppProtocol::Ws, Some(_))
+    ) {
+        return Err(RefError::UnsupportedProtocol);
     }
     let endpoints = endpoints(stores, namespace, reference.name, &port, Transport::Tcp);
     Ok(ClusterSpec { endpoints, protocol, tls })
@@ -376,6 +402,7 @@ struct ServiceRef<'a> {
 macro_rules! service_ref {
     ($ty:ty) => {
         impl<'a> From<&'a $ty> for ServiceRef<'a> {
+            /// borrow the backend identity and port from the route reference.
             fn from(r: &'a $ty) -> Self {
                 Self {
                     group: r.group.as_deref(),
