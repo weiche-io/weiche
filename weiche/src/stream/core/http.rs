@@ -1,4 +1,5 @@
 //! worker-local service composition; keep-alive requests borrow the current view.
+mod cors;
 mod filter;
 mod router;
 
@@ -7,7 +8,7 @@ use super::{
         super::{
             ir::{
                 Backend, Binding, Filters, HeaderChange, Protocol, PublishedSnapshot,
-                Revision, Route, RouteAction, weighted_by,
+                Revision, Route, RouteAction,
             },
             rtconf::RuntimeConfig,
         },
@@ -111,7 +112,7 @@ impl WorkerView {
                     http: route.http.clone(),
                     action,
                 }
-            }));
+            }))?;
             routes.insert(
                 *address,
                 tcp::Route { binding: socket.listener.binding(), target: router },
@@ -173,7 +174,7 @@ impl ProxyService {
         self.pool.close();
     }
 
-    /// select one weighted backend against the original host, path and headers.
+    /// select the route, backend and CORS policy against the original request.
     fn select(
         &self,
         listener: &Binding,
@@ -187,19 +188,26 @@ impl ProxyService {
             .get(&listener.address)
             .and_then(|r| r.find(listener))
             .ok_or(ProxyError::NoRoute)?;
-        let action = router
+        let (action, backend) = router
             .find(
                 &authority.host().to_ascii_lowercase(),
-                request.uri().path(),
+                request.uri(),
                 request.method(),
                 request.headers(),
             )
             .ok_or(ProxyError::NoRoute)?;
-        let backend = weighted_by(&action.backends, |b| b.weight)
+        let cors = backend
+            .and_then(|b| b.filters.cors.as_ref())
+            .or(action.filters.cors.as_ref())
+            .map(|policy| {
+                cors::Decision::new(policy, request.method(), request.headers())
+            });
+        let backend = backend
             .and_then(|b| Some((b.cluster.as_ref().ok()?.clone(), b.filters.clone())));
         Ok(Selection {
             rule: action.filters.clone(),
             backend,
+            cors,
             budget: Deadlines::new(start, action.timeouts, view.deadline),
         })
     }
@@ -224,10 +232,16 @@ impl ProxyService {
             Ok(s) => s,
             Err(error) => return (error.response(), None),
         };
-        let (mut response, tunnel) = self
-            .forward(listener, peer, request, &authority, &selection)
-            .await
-            .unwrap_or_else(|error| (error.response(), None));
+        let (mut response, tunnel) =
+            if selection.cors.as_ref().is_some_and(|c| c.preflight) {
+                let mut response = Response::new(full_body(Bytes::new()));
+                *response.status_mut() = StatusCode::NO_CONTENT;
+                (response, None)
+            } else {
+                self.forward(listener, peer, request, &authority, &selection)
+                    .await
+                    .unwrap_or_else(|error| (error.response(), None))
+            };
         *response.version_mut() = version;
         let headers = response.headers_mut();
         let backend_changes = selection
@@ -246,6 +260,9 @@ impl ProxyService {
         }
         if let Some(tunnel) = &tunnel {
             tunnel.restore(response.headers_mut());
+        }
+        if let Some(cors) = selection.cors {
+            cors.apply(response.headers_mut());
         }
         (response, tunnel)
     }
@@ -331,6 +348,8 @@ struct Selection {
     rule: Arc<Filters>,
     /// selected target and backend-specific filters.
     backend: Option<(Rc<Cluster>, Arc<Filters>)>,
+    /// cross-origin decision made before request filters or upstream forwarding.
+    cors: Option<cors::Decision>,
     /// request and attempt deadlines.
     budget: Deadlines,
 }

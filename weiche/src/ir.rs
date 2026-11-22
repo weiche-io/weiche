@@ -1,5 +1,6 @@
 //! configuration-independent gateway model.
 mod backend;
+mod cors;
 mod route;
 mod snapshot;
 mod tls;
@@ -7,7 +8,8 @@ mod transport;
 pub mod wire;
 pub use transport::{StreamListener, StreamRoute, Transport, weighted, weighted_by};
 
-pub use backend::{ClusterSpec, Http, Protocol, RefError};
+pub use backend::{ClusterSpec, Http, PathMatch, Protocol, RefError, ValueMatch};
+pub use cors::{Cors, Origin};
 pub use route::{
     Backend, Filters, HeaderChange, PathModifier, Redirect, Route, RouteAction, Timeouts,
     hostname_matches,

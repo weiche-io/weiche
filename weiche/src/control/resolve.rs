@@ -3,8 +3,8 @@ mod filters;
 
 use super::{
     super::ir::{
-        Backend, ClusterSpec, Http, Protocol, RefError, RouteAction, StreamRoute,
-        Timeouts, Transport,
+        Backend, ClusterSpec, Http, PathMatch, Protocol, RefError, RouteAction,
+        StreamRoute, Timeouts, Transport, ValueMatch,
     },
     GatewayStores,
     tls::Policies,
@@ -12,6 +12,7 @@ use super::{
 use k8s_openapi::api::core::v1::{Service, ServicePort};
 use kube::{ResourceExt, runtime::reflector::ObjectRef};
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -20,6 +21,7 @@ use weiche_gtwapi::v1::httproutes::{
     HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeadersType as HeaderType,
     HttpRouteRulesMatchesMethod as Method, HttpRouteRulesMatchesPathType as PathType,
+    HttpRouteRulesMatchesQueryParamsType as QueryType,
 };
 use weiche_gtwapi::v1::{
     tcproutes::{TcpRoute, TcpRouteRulesBackendRefs},
@@ -61,9 +63,13 @@ impl GatewayStores {
         rule: &HttpRouteRules,
         policies: &mut Policies,
     ) -> Result<HttpRule, ResolveError> {
-        if unsupported_rule(rule) {
+        if rule.retry.is_some() {
             return Err(ResolveError::UnsupportedValue);
         }
+        let matches = match rule.matches.as_deref() {
+            None | Some([]) => vec![Http::default()],
+            Some(matches) => matches.iter().map(http_match).collect::<Result<_, _>>()?,
+        };
         let timeouts = timeouts(rule)?;
         let filters =
             filters::rule_filters(rule, rule.filters.as_deref().unwrap_or_default())?;
@@ -94,10 +100,6 @@ impl GatewayStores {
                 filters: Arc::new(backend),
             })
             .collect();
-        let matches = rule.matches.as_deref().filter(|m| !m.is_empty()).map_or_else(
-            || vec![Http::default()],
-            |m| m.iter().map(http_match).collect(),
-        );
         Ok(HttpRule {
             matches,
             action: RouteAction { backends, filters: Arc::new(filters), timeouts },
@@ -145,34 +147,50 @@ fn timeouts(rule: &HttpRouteRules) -> Result<Timeouts, ResolveError> {
     Ok(Timeouts { request, backend_request })
 }
 
-/// reject match and retry modes without a corresponding data-plane implementation.
-fn unsupported_rule(rule: &HttpRouteRules) -> bool {
-    rule.retry.is_some()
-        || rule.matches.iter().flatten().any(|predicate| {
-            predicate
-                .query_params
-                .as_ref()
-                .is_some_and(|params| !params.is_empty())
-                || matches!(
-                    predicate.path.as_ref().and_then(|path| path.r#type.as_ref()),
-                    Some(PathType::RegularExpression)
-                )
-                || predicate.headers.iter().flatten().any(|header| {
-                    matches!(header.r#type, Some(HeaderType::RegularExpression))
-                })
-        })
+/// validate the same unanchored Rust regex that the worker will compile.
+fn regex(pattern: &str) -> Result<String, ResolveError> {
+    regex::Regex::new(pattern).map_err(|_| ResolveError::UnsupportedValue)?;
+    Ok(pattern.to_owned())
 }
 
-/// normalize path elements, method and header predicates for the worker.
-fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
+/// retain the first predicate per name, ignoring later entries even for validation.
+fn named_matches<'a>(
+    predicates: impl Iterator<Item = (String, &'a str, bool)>,
+) -> Result<Vec<(String, ValueMatch<String>)>, ResolveError> {
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for (name, value, regular) in predicates {
+        if seen.insert(name.clone()) {
+            let predicate = if regular {
+                ValueMatch::RegularExpression { regex: regex(value)? }
+            } else {
+                ValueMatch::Exact(value.into())
+            };
+            matches.push((name, predicate));
+        }
+    }
+    Ok(matches)
+}
+
+/// normalize path elements and named predicates before resolving any backend.
+fn http_match(predicate: &HttpRouteRulesMatches) -> Result<Http, ResolveError> {
     let path = predicate.path.as_ref();
-    let exact =
-        matches!(path.and_then(|path| path.r#type.as_ref()), Some(PathType::Exact));
-    let path = path.and_then(|path| path.value.as_deref()).unwrap_or("/");
-    let path = if exact { path } else { path.trim_end_matches('/') };
-    Http {
-        path: if path.is_empty() { "/".into() } else { path.into() },
-        exact,
+    let value = path.and_then(|p| p.value.as_deref()).unwrap_or("/");
+    let path = match path.and_then(|p| p.r#type.as_ref()) {
+        Some(PathType::RegularExpression) => {
+            PathMatch::RegularExpression { regex: regex(value)? }
+        }
+        Some(PathType::Exact) => PathMatch::Literal { path: value.into(), exact: true },
+        None | Some(PathType::PathPrefix) => {
+            let prefix = value.trim_end_matches('/');
+            PathMatch::Literal {
+                path: if prefix.is_empty() { "/" } else { prefix }.into(),
+                exact: false,
+            }
+        }
+    };
+    Ok(Http {
+        path,
         method: predicate.method.as_ref().map(|method| {
             match method {
                 Method::Get => "GET",
@@ -187,13 +205,21 @@ fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
             }
             .into()
         }),
-        headers: predicate
-            .headers
-            .iter()
-            .flatten()
-            .map(|header| (header.name.to_ascii_lowercase(), header.value.clone()))
-            .collect(),
-    }
+        headers: named_matches(predicate.headers.iter().flatten().map(|h| {
+            (
+                h.name.to_ascii_lowercase(),
+                h.value.as_str(),
+                matches!(h.r#type, Some(HeaderType::RegularExpression)),
+            )
+        }))?,
+        query_params: named_matches(predicate.query_params.iter().flatten().map(|p| {
+            (
+                p.name.clone(),
+                p.value.as_str(),
+                matches!(p.r#type, Some(QueryType::RegularExpression)),
+            )
+        }))?,
+    })
 }
 
 impl RefError {

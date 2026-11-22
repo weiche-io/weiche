@@ -1,5 +1,7 @@
 //! compile the parallel rule and backend filter schemas into the same operations.
-use super::super::super::ir::{Filters, HeaderChange, PathModifier, Redirect};
+use super::super::super::ir::{
+    Cors, Filters, HeaderChange, Origin, PathModifier, Redirect,
+};
 use super::{HttpRouteRules, PathType, ResolveError};
 use http::{HeaderName, HeaderValue, StatusCode, header};
 use std::{collections::HashSet, net::IpAddr};
@@ -110,6 +112,76 @@ macro_rules! modifier {
     };
 }
 
+/// check the set bounds and wildcard combinations of Gateway API CORS lists.
+fn cors_list(
+    values: &[String],
+    limit: usize,
+    exclusive_wildcard: bool,
+) -> Result<(), ResolveError> {
+    if values.len() > limit
+        || values.iter().collect::<HashSet<_>>().len() != values.len()
+        || (exclusive_wildcard && values.len() > 1 && values.iter().any(|v| v == "*"))
+    {
+        return Err(ResolveError::UnsupportedValue);
+    }
+    Ok(())
+}
+
+/// validate both generated CORS schemas against the same origin, token and age rules.
+fn cors(
+    origins: &[String],
+    methods: &[String],
+    headers: &[String],
+    expose: &[String],
+    credentials: bool,
+    max_age: u32,
+) -> Result<Cors, ResolveError> {
+    let invalid = ResolveError::UnsupportedValue;
+    cors_list(origins, 64, true)?;
+    cors_list(methods, 9, true)?;
+    cors_list(headers, 64, true)?;
+    cors_list(expose, 64, false)?;
+    if !(1..=i32::MAX as u32).contains(&max_age)
+        || !methods.iter().all(|m| {
+            matches!(
+                m.as_str(),
+                "*" | "GET"
+                    | "HEAD"
+                    | "POST"
+                    | "PUT"
+                    | "DELETE"
+                    | "CONNECT"
+                    | "OPTIONS"
+                    | "TRACE"
+                    | "PATCH"
+            )
+        })
+        || !headers
+            .iter()
+            .chain(expose)
+            .all(|h| h.len() <= 256 && h.parse::<HeaderName>().is_ok())
+    {
+        return Err(invalid);
+    }
+    let origins = origins
+        .iter()
+        .map(|o| {
+            if o.len() > 253 {
+                return Err(invalid);
+            }
+            Origin::parse(o).ok_or(invalid)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Cors {
+        origins,
+        methods: methods.to_vec(),
+        headers: headers.to_vec(),
+        expose: expose.to_vec(),
+        credentials,
+        max_age,
+    })
+}
+
 /// compile identical filter semantics for both generated Gateway API shapes.
 macro_rules! filters {
     ($name:ident, $filter:ty, $kind:ident, $scheme:ident, $redirect:ident, $rewrite:ident) => {
@@ -127,6 +199,17 @@ macro_rules! filters {
                     return Err(ResolveError::IncompatibleFilters);
                 }
                 match f.r#type {
+                    Kind::Cors => {
+                        let c = f.cors.as_ref().ok_or(invalid)?;
+                        result.cors = Some(cors(
+                            c.allow_origins.as_deref().unwrap_or_default(),
+                            c.allow_methods.as_deref().unwrap_or_default(),
+                            c.allow_headers.as_deref().unwrap_or_default(),
+                            c.expose_headers.as_deref().unwrap_or_default(),
+                            c.allow_credentials.unwrap_or(false),
+                            c.max_age.unwrap_or(5),
+                        )?);
+                    }
                     Kind::RequestHeaderModifier => result.headers.extend(changes!(
                         f.request_header_modifier.as_ref().ok_or(invalid)?
                     )),

@@ -16,6 +16,7 @@ compio = { version = "0.20.0-beta.1", features = ["net", "time", "ring"] }
 cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "dde9bdc7787effd98c4dff18b8b58970ec10b5f6", default-features = false }
 fastrand = "2"
 flate2 = "1"
+form_urlencoded = "1.2.2"
 futures = "0.3"
 http = "1"
 http-serde-ext = "1"
@@ -32,6 +33,7 @@ kube = { version = "5", default-features = false, features = [
     "ring",
 ] }
 kube-lease-manager = "0.13"
+regex = "1.13.1"
 ring = "0.17"
 rmp-serde = "1"
 rustls-native-certs = "0.8"

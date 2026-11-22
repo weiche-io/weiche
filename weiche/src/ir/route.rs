@@ -1,5 +1,5 @@
 //! route definitions shared by the control plane and protocol filters.
-use super::{ClusterSpec, Http, RefError};
+use super::{ClusterSpec, Cors, Http, RefError};
 use http::{HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -51,6 +51,8 @@ pub struct Filters {
     pub redirect: Option<Redirect>,
     /// replacement for the upstream path.
     pub path: Option<PathModifier>,
+    /// cross-origin sharing policy for the selected resource.
+    pub cors: Option<Cors>,
 }
 
 /// validated response status and target components.
@@ -102,11 +104,11 @@ pub enum HeaderChange {
 
 /// resolved HTTP match and its forwarding action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Route<T = Arc<ClusterSpec>> {
+pub struct Route<T = Arc<ClusterSpec>, R = String> {
     /// listener and route hostname intersection.
     pub hostname: String,
     /// predicates which select this rule.
-    pub http: Http,
+    pub http: Http<R>,
     /// transformations and forwarding targets.
     pub action: RouteAction<T>,
 }
