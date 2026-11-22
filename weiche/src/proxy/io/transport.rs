@@ -32,7 +32,9 @@ fn immediate(result: io::Result<usize>) -> io::Result<Option<usize>> {
 /// either half can drive the same send while the other is waiting on it.
 #[derive(Default)]
 struct SendWake {
+    /// task polling the read half.
     reader: AtomicWaker,
+    /// task polling the write half.
     writer: AtomicWaker,
 }
 
@@ -45,14 +47,21 @@ impl ArcWake for SendWake {
 
 /// keep one receive and one send in flight with buffers owned until completion.
 pub struct Transport {
+    /// socket shared with outstanding compio operations.
     pub socket: Rc<TcpStream>,
+    /// received records and the next unread byte.
     pub input: Cursor<Vec<u8>>,
     /// try socket I/O in the caller's poll after negotiating h2.
     pub try_immediate_io: bool,
+    /// pending ciphertext available for the next send.
     output: Vec<u8>,
+    /// outstanding read and its owned buffer.
     recv: Option<LocalBoxFuture<'static, BufResult<usize, Vec<u8>>>>,
+    /// outstanding write and its owned buffer.
     send: Option<LocalBoxFuture<'static, BufResult<(), Vec<u8>>>>,
+    /// first terminal write error.
     send_error: Option<Arc<io::Error>>,
+    /// wake both halves when a shared send completes.
     wake: Arc<SendWake>,
 }
 
@@ -119,6 +128,7 @@ impl Transport {
         }
     }
 
+    /// retain a terminal send error for the other half of the connection.
     fn fail_send(&mut self, error: io::Error) -> io::Error {
         let error = Arc::new(error);
         self.send_error = Some(error.clone());

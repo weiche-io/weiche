@@ -1,9 +1,12 @@
 //! adapt compio sockets for worker-local HTTP and TLS connections.
+mod handshake;
 mod plain;
 mod tls;
+mod transport;
 
+pub use handshake::AcceptedTls;
 pub use plain::PlainIo;
-pub use tls::{AcceptedTls, TlsIo};
+pub use tls::TlsIo;
 
 use compio::net::TcpStream;
 use hyper::rt::{Read, ReadBufCursor, Write};

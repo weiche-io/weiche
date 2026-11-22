@@ -1,6 +1,5 @@
 //! adapt rustls plaintext to hyper while compio owns the ciphertext in flight.
-mod handshake;
-mod transport;
+use super::transport::Transport;
 
 use compio::{
     BufResult,
@@ -8,33 +7,70 @@ use compio::{
     runtime::{Submit, submit},
     tls::rustls::{self, Connection},
 };
-pub use handshake::AcceptedTls;
 use hyper::rt::{Read, ReadBufCursor, Write as HyperWrite};
 use socket2::Socket;
 use std::{
+    future::poll_fn,
     io::{self, BufRead, IoSlice, Write},
     net::Shutdown,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
 };
-use transport::Transport;
 
-fn tls_error(error: rustls::Error) -> io::Error {
+/// convert a rustls protocol failure to an invalid-data socket error.
+pub fn tls_error(error: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 /// worker-local TLS stream with immediate h2 reads and writes and io_uring fallback.
 pub struct TlsIo {
+    /// buffered ciphertext and the underlying compio socket.
     transport: Transport,
+    /// rustls session owning decrypted application data.
     conn: Connection,
+    /// whether close_notify has been queued.
     closing: bool,
+    /// in-flight shutdown of the socket write half.
     shutdown: Option<Submit<ShutdownSocket<SharedFd<Socket>>>>,
+    /// whether the write half has finished shutting down.
     closed: bool,
+    /// terminal record error preserved across subsequent reads.
     read_error: Option<Arc<io::Error>>,
 }
 
 impl TlsIo {
+    /// send the final flight, or a queued fatal alert, before handing the socket back.
+    pub async fn handshake(transport: Transport, conn: Connection) -> io::Result<Self> {
+        let mut stream = Self {
+            transport,
+            conn,
+            closing: false,
+            shutdown: None,
+            closed: false,
+            read_error: None,
+        };
+        let result: io::Result<()> = async {
+            stream.conn.process_new_packets().map_err(tls_error)?;
+            while stream.conn.is_handshaking() {
+                poll_fn(|cx| stream.poll_output(cx, false)).await?;
+                if !poll_fn(|cx| stream.poll_packet(cx)).await?
+                    && stream.conn.is_handshaking()
+                {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let sent = poll_fn(|cx| stream.poll_output(cx, false)).await;
+        result?;
+        sent?;
+        // let multiplexed h2 streams consume ready data and flush it in the same poll.
+        stream.transport.try_immediate_io = stream.negotiated_alpn() == Some(b"h2");
+        Ok(stream)
+    }
+
     /// return the ALPN protocol negotiated during the TLS handshake.
     pub fn negotiated_alpn(&self) -> Option<&[u8]> {
         self.conn.alpn_protocol()

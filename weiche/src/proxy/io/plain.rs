@@ -21,10 +21,15 @@ use std::{
 
 /// worker-local nonblocking TCP stream for hyper without zero-fill or thread checks.
 pub struct PlainIo {
+    /// nonblocking socket registered with this worker.
     socket: SharedFd<Socket>,
+    /// pending poll for read readiness.
     read_wait: Option<Submit<PollOnce<SharedFd<Socket>>>>,
+    /// pending poll for write readiness.
     write_wait: Option<Submit<PollOnce<SharedFd<Socket>>>>,
+    /// whether a read can be attempted immediately.
     read_ready: bool,
+    /// whether a write can be attempted immediately.
     write_ready: bool,
 }
 
@@ -43,6 +48,7 @@ impl PlainIo {
         })
     }
 
+    /// retry interrupted operations and wait for readiness after backpressure.
     fn poll_io<R>(
         socket: &SharedFd<Socket>,
         wait: &mut Option<Submit<PollOnce<SharedFd<Socket>>>>,
