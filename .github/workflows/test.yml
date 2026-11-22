@@ -1,14 +1,17 @@
 name: test
 on:
   pull_request:
-    paths-ignore: &web
-      - 'weiche.io/**'
-      - 'mk/site.mk'
-      - '.github/workflows/web.yml'
+    paths: &weiche
+      - 'weiche/**'
+      - 'weiche-gtwapi/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test.yml'
+      - 'rust-toolchain.toml'
   # warm branch caches on master so new pull requests reuse them.
   push:
     branches: [master]
-    paths-ignore: *web
+    paths: *weiche
 permissions:
   contents: read
 concurrency:
