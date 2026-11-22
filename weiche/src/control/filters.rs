@@ -1,10 +1,9 @@
 //! compile the parallel rule and backend filter schemas into the same operations.
-use super::super::super::ir::{
-    Cors, Filters, HeaderChange, Origin, PathModifier, Redirect,
-};
-use super::{HttpRouteRules, PathType, ResolveError};
+use super::super::ir::{Cors, Filters, HeaderChange, Origin, PathModifier, Redirect};
+use super::ResolveError;
 use http::{HeaderName, HeaderValue, StatusCode, header};
 use std::{collections::HashSet, net::IpAddr};
+use weiche_gtwapi::v1::httproutes::HttpRouteRulesMatchesPathType as PathType;
 use weiche_gtwapi::v1::{grpcroutes::*, httproutes::*};
 
 /// validate an explicit Gateway API precise hostname.
