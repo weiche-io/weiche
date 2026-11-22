@@ -1,7 +1,7 @@
 //! exclusive HTTP/1 leases and idle connection reuse.
 use super::{
-    super::connector::Connected, ConnectionPool, Endpoint, PooledBody, ResponseLease,
-    Slot,
+    super::{connector::Connected, deadline::TimedBody},
+    ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use compio::runtime;
 use hyper::{body::Incoming, client::conn::http1::SendRequest};
@@ -10,14 +10,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// a transport and its exclusive connection slot.
 struct Connection {
+    /// upstream HTTP/1 sender and its driver.
     transport: Connected,
+    /// reserved worker capacity.
     _slot: Slot,
 }
 
 /// idle HTTP/1 connection waiting for reuse or expiration.
 pub struct Idle {
+    /// exclusive upstream connection.
     connection: Connection,
+    /// instant at which the connection became idle.
     pub since: Instant,
 }
 
@@ -29,6 +34,7 @@ impl Idle {
 }
 
 impl Endpoint {
+    /// publish a reusable connection and notify waiting requests.
     fn put(&self, connection: Connection) {
         if self.enabled.get() && connection.transport.sender.is_ready() {
             self.idle
@@ -40,6 +46,7 @@ impl Endpoint {
 }
 
 impl ConnectionPool {
+    /// reuse an idle socket when permitted or dial within the worker budget.
     pub async fn acquire(
         &self,
         endpoint: Rc<Endpoint>,
@@ -72,19 +79,26 @@ impl ConnectionPool {
     }
 }
 
+/// exclusive ownership of an HTTP/1 connection.
 pub struct Lease {
+    /// exclusive upstream connection.
     connection: Connection,
+    /// endpoint generation to which this connection belongs.
     endpoint: Rc<Endpoint>,
+    /// whether this request acquired an idle socket.
     reused: bool,
 }
 
 impl Lease {
-    pub fn sender(&mut self) -> &mut SendRequest<Incoming> {
+    /// borrow the sender for dispatch.
+    pub fn sender(&mut self) -> &mut SendRequest<TimedBody<Incoming>> {
         &mut self.connection.transport.sender
     }
+    /// report whether a stale idle socket can justify a retry.
     pub fn reused(&self) -> bool {
         self.reused
     }
+    /// retain this lease until response framing completes.
     pub fn into_body(self, body: Incoming) -> PooledBody {
         PooledBody::new(body, ResponseLease::Http1(self))
     }

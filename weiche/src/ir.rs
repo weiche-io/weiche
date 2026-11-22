@@ -5,10 +5,13 @@ mod snapshot;
 mod tls;
 mod transport;
 pub mod wire;
-pub use transport::{StreamListener, StreamRoute, Transport, weighted};
+pub use transport::{StreamListener, StreamRoute, Transport, weighted, weighted_by};
 
 pub use backend::{ClusterSpec, Http, Protocol, RefError};
-pub use route::{HeaderChange, Redirect, Route, RouteAction, hostname_matches};
+pub use route::{
+    Backend, Filters, HeaderChange, PathModifier, Redirect, Route, RouteAction, Timeouts,
+    hostname_matches,
+};
 pub use snapshot::{
     Binding, ForwardingPolicy, GatewaySnapshot, Listener, PublishedSnapshot, Revision,
     SocketRoutes,

@@ -1,8 +1,10 @@
 //! translate watched route resources against the controller's local stores.
+mod filters;
+
 use super::{
     super::ir::{
-        ClusterSpec, HeaderChange, Http, Protocol, Redirect, RefError, RouteAction,
-        StreamRoute, Transport,
+        Backend, ClusterSpec, Http, Protocol, RefError, RouteAction, StreamRoute,
+        Timeouts, Transport,
     },
     GatewayStores,
     tls::Policies,
@@ -12,9 +14,10 @@ use kube::{ResourceExt, runtime::reflector::ObjectRef};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 use weiche_gtwapi::v1::httproutes::{
-    HttpRoute, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
+    HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeadersType as HeaderType,
     HttpRouteRulesMatchesMethod as Method, HttpRouteRulesMatchesPathType as PathType,
 };
@@ -26,58 +29,125 @@ use weiche_gtwapi::v1::{
 /// errors which prevent the route itself from being accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveError {
+    /// a match, filter value or timeout cannot be implemented.
     UnsupportedValue,
+    /// a rule combines filters that cannot coexist.
+    IncompatibleFilters,
+}
+
+impl ResolveError {
+    /// gateway API reason for rejecting the route.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnsupportedValue => "UnsupportedValue",
+            Self::IncompatibleFilters => "IncompatibleFilters",
+        }
+    }
 }
 
 /// resolved matches and action for one HTTPRoute rule.
 pub struct HttpRule {
+    /// alternative predicates that select this action.
     pub matches: Vec<Http>,
+    /// shared forwarding and filter configuration.
     pub action: RouteAction,
 }
 
 impl GatewayStores {
-    /// retain policy status for the Service ports used by accepted routes.
+    /// resolve one rule independently so a bad filter cannot detach sibling rules.
     pub fn resolve_http(
         &self,
-        route: &HttpRoute,
+        namespace: &str,
+        rule: &HttpRouteRules,
         policies: &mut Policies,
-    ) -> Result<Vec<HttpRule>, ResolveError> {
-        let rules = route.spec.rules.as_deref().unwrap_or_default();
-        if rules.iter().any(unsupported_rule) {
+    ) -> Result<HttpRule, ResolveError> {
+        if unsupported_rule(rule) {
             return Err(ResolveError::UnsupportedValue);
         }
-
-        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        rules
-            .iter()
-            .map(|rule| {
-                let mut action = filters(rule)?;
-                for backend in rule.backend_refs.iter().flatten() {
-                    action.backends.push((
-                        backend.weight.unwrap_or(1),
-                        resolve_backend(self, policies, namespace, backend).map(Arc::new),
-                    ));
-                }
-                Ok(HttpRule {
-                    matches: rule.matches.as_ref().map_or_else(
-                        || vec![Http::default()],
-                        |m| m.iter().map(http_match).collect(),
-                    ),
-                    action,
-                })
+        let timeouts = timeouts(rule)?;
+        let filters =
+            filters::rule_filters(rule, rule.filters.as_deref().unwrap_or_default())?;
+        let references = rule.backend_refs.as_deref().unwrap_or_default();
+        if filters.redirect.is_some() && !references.is_empty() {
+            return Err(ResolveError::IncompatibleFilters);
+        }
+        // validate the entire rule before recording any backend TLS policy status.
+        let mut validated = Vec::with_capacity(references.len());
+        for reference in references {
+            let backend = filters::backend_filters(
+                rule,
+                reference.filters.as_deref().unwrap_or_default(),
+            )?;
+            if backend.redirect.is_some()
+                && rule.filters.iter().flatten().any(|f| f.url_rewrite.is_some())
+            {
+                return Err(ResolveError::IncompatibleFilters);
+            }
+            validated.push((reference, backend));
+        }
+        let backends = validated
+            .into_iter()
+            .map(|(reference, backend)| Backend {
+                weight: reference.weight.unwrap_or(1),
+                cluster: resolve_backend(self, policies, namespace, reference)
+                    .map(Arc::new),
+                filters: Arc::new(backend),
             })
-            .collect()
+            .collect();
+        let matches = rule.matches.as_deref().filter(|m| !m.is_empty()).map_or_else(
+            || vec![Http::default()],
+            |m| m.iter().map(http_match).collect(),
+        );
+        Ok(HttpRule {
+            matches,
+            action: RouteAction { backends, filters: Arc::new(filters), timeouts },
+        })
     }
 }
 
+/// parse one to four GEP-2257 components, each with one to five decimal digits.
+fn duration(mut input: &str) -> Result<Duration, ResolveError> {
+    let mut millis = 0;
+    for _ in 0..4 {
+        let digits = input.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=5).contains(&digits) {
+            break;
+        }
+        let (value, suffix) = input.split_at(digits);
+        let Some((unit, scale)) =
+            [("ms", 1), ("s", 1000), ("m", 60_000), ("h", 3_600_000)]
+                .into_iter()
+                .find(|(unit, _)| suffix.starts_with(unit))
+        else {
+            break;
+        };
+        millis +=
+            value.parse::<u64>().map_err(|_| ResolveError::UnsupportedValue)? * scale;
+        input = &suffix[unit.len()..];
+        if input.is_empty() {
+            return Ok(Duration::from_millis(millis));
+        }
+    }
+    Err(ResolveError::UnsupportedValue)
+}
+
+/// validate the request budget and preserve explicit zero durations.
+fn timeouts(rule: &HttpRouteRules) -> Result<Timeouts, ResolveError> {
+    let Some(t) = &rule.timeouts else { return Ok(Timeouts::default()) };
+    let request = t.request.as_deref().map(duration).transpose()?;
+    let backend_request = t.backend_request.as_deref().map(duration).transpose()?;
+    if let (Some(total), Some(attempt)) = (request, backend_request)
+        && !total.is_zero()
+        && attempt > total
+    {
+        return Err(ResolveError::UnsupportedValue);
+    }
+    Ok(Timeouts { request, backend_request })
+}
+
+/// reject match and retry modes without a corresponding data-plane implementation.
 fn unsupported_rule(rule: &HttpRouteRules) -> bool {
     rule.retry.is_some()
-        || rule.timeouts.is_some()
-        || rule
-            .backend_refs
-            .iter()
-            .flatten()
-            .any(|b| b.filters.as_ref().is_some_and(|f| !f.is_empty()))
         || rule.matches.iter().flatten().any(|predicate| {
             predicate
                 .query_params
@@ -93,75 +163,7 @@ fn unsupported_rule(rule: &HttpRouteRules) -> bool {
         })
 }
 
-/// a redirect hostname is a DNS name without a wildcard, userinfo or port.
-fn valid_redirect_hostname(host: &str) -> bool {
-    host.len() <= 253
-        && host.parse::<IpAddr>().is_err()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-}
-
-fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
-    use weiche_gtwapi::v1::httproutes::HttpRouteRulesFiltersType as Kind;
-    let invalid = ResolveError::UnsupportedValue;
-    let mut action = RouteAction {
-        backends: Vec::new(),
-        headers: Vec::new(),
-        redirect: None,
-    };
-    for filter in rule.filters.iter().flatten() {
-        match filter.r#type {
-            Kind::RequestHeaderModifier => {
-                let h = filter.request_header_modifier.as_ref().ok_or(invalid)?;
-                for entry in h.set.iter().flatten() {
-                    action.headers.push(HeaderChange::Set(
-                        entry.name.parse().map_err(|_| invalid)?,
-                        entry.value.parse().map_err(|_| invalid)?,
-                    ));
-                }
-                for entry in h.add.iter().flatten() {
-                    action.headers.push(HeaderChange::Add(
-                        entry.name.parse().map_err(|_| invalid)?,
-                        entry.value.parse().map_err(|_| invalid)?,
-                    ));
-                }
-                for name in h.remove.iter().flatten() {
-                    action
-                        .headers
-                        .push(HeaderChange::Remove(name.parse().map_err(|_| invalid)?));
-                }
-            }
-            Kind::RequestRedirect => {
-                let r = filter.request_redirect.as_ref().ok_or(invalid)?;
-                if r.path.is_some()
-                    || r.scheme.is_some()
-                    || r.port.is_some()
-                    || r.hostname
-                        .as_deref()
-                        .is_some_and(|host| !valid_redirect_hostname(host))
-                {
-                    return Err(invalid);
-                }
-                let status = match r.status_code.unwrap_or(302) {
-                    301 => http::StatusCode::MOVED_PERMANENTLY,
-                    302 => http::StatusCode::FOUND,
-                    _ => return Err(invalid),
-                };
-                action.redirect = Some(Redirect { status, hostname: r.hostname.clone() });
-            }
-            _ => return Err(invalid),
-        }
-    }
-    Ok(action)
-}
-
+/// normalize path elements, method and header predicates for the worker.
 fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
     let path = predicate.path.as_ref();
     let exact =
@@ -220,14 +222,19 @@ fn resolve_backend(
     let namespace = reference.namespace.unwrap_or(namespace);
     // https and h2 require an authenticated transport; h2c explicitly uses cleartext.
     let protocol = match port.app_protocol.as_deref() {
-        None | Some("http" | "kubernetes.io/http" | "https") => Protocol::Http1,
+        None
+        | Some(
+            "http" | "kubernetes.io/http" | "https" | "kubernetes.io/ws"
+            | "kubernetes.io/wss",
+        ) => Protocol::Http1,
         Some("kubernetes.io/h2c" | "h2") => Protocol::Http2,
         _ => return Err(RefError::UnsupportedProtocol),
     };
     let tls =
         policies.backend(stores, namespace, &service, port.name.as_deref(), protocol)?;
     match (port.app_protocol.as_deref(), &tls) {
-        (Some("https" | "h2"), None) | (Some("kubernetes.io/h2c"), Some(_)) => {
+        (Some("https" | "h2" | "kubernetes.io/wss"), None)
+        | (Some("kubernetes.io/h2c" | "kubernetes.io/ws"), Some(_)) => {
             return Err(RefError::UnsupportedProtocol);
         }
         _ => {}
@@ -289,12 +296,18 @@ fn endpoints(
 
 /// the identical core Service reference fields generated for each Route kind.
 struct ServiceRef<'a> {
+    /// referenced API group.
     group: Option<&'a str>,
+    /// referenced resource kind.
     kind: Option<&'a str>,
+    /// target namespace when different from the route.
     namespace: Option<&'a str>,
+    /// referenced Service name.
     name: &'a str,
+    /// requested Service port.
     port: Option<u16>,
 }
+/// borrow common Service reference fields from each generated type.
 macro_rules! service_ref {
     ($ty:ty) => {
         impl<'a> From<&'a $ty> for ServiceRef<'a> {
@@ -315,6 +328,7 @@ service_ref!(TcpRouteRulesBackendRefs);
 service_ref!(UdpRouteRulesBackendRefs);
 
 impl ServiceRef<'_> {
+    /// check the grant and locate the requested Service port.
     fn resolve(
         &self,
         stores: &GatewayStores,
@@ -351,6 +365,7 @@ impl ServiceRef<'_> {
             .ok_or(RefError::BackendNotFound)?;
         Ok((service, port))
     }
+    /// resolve a transport reference to its ready endpoint addresses.
     fn stream(
         &self,
         stores: &GatewayStores,
@@ -370,6 +385,7 @@ impl ServiceRef<'_> {
 }
 
 impl GatewayStores {
+    /// retain the weights of valid and invalid stream backends.
     fn resolve_stream<'a>(
         &self,
         namespace: &str,

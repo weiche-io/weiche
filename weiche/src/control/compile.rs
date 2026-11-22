@@ -37,36 +37,60 @@ fn intersection(a: &str, b: &str) -> Option<String> {
 /// reconciliation status for one route parent.
 #[derive(Clone, Debug)]
 pub struct RouteReport {
+    /// route UID used to associate reports with the current resource.
     pub uid: Option<String>,
+    /// original parent reference for status publication.
     pub parent: serde_json::Value,
+    /// whether the controller accepted this attachment or listener.
     pub accepted: bool,
+    /// gateway API reason for the condition.
     pub reason: &'static str,
+    /// whether all backend references resolved.
     pub resolved: bool,
+    /// reason for the ResolvedRefs condition.
     pub refs_reason: &'static str,
+    /// explanation required when valid rules survive alongside invalid rules.
+    pub partially_invalid: Option<String>,
+    /// description published with the condition.
     pub message: String,
 }
 
 /// listener ResolvedRefs failure reason and status message.
 #[derive(Clone, Debug)]
 pub struct RefsError {
+    /// gateway API reason for the condition.
     pub reason: &'static str,
+    /// description published with the condition.
     pub message: String,
 }
 
 /// data plane snapshot and corresponding control plane status.
 pub struct Compiled {
+    /// backend TLS policy results referenced by this listener.
     pub policies: Policies,
+    /// listener reference validation failure.
     pub refs_error: Option<RefsError>,
+    /// local listening address.
     pub address: SocketAddr,
+    /// terminating TLS configuration when configured.
     pub tls: Option<Arc<super::super::ir::ServerTls>>,
+    /// protocol or hostname collision on the listener port.
     pub conflict: Option<&'static str>,
+    /// route kind attachable to this listener.
     pub supported_kind: Option<&'static str>,
+    /// selected raw transport route.
     pub stream: Option<StreamRoute>,
+    /// underlying socket protocol.
     pub transport: Transport,
+    /// resolved HTTP routes in attachment precedence order.
     pub routes: Vec<Route>,
+    /// conditions collected for the matching route parents.
     pub reports: Vec<RouteReport>,
+    /// whether the controller accepted this attachment or listener.
     pub accepted: bool,
+    /// gateway API reason for the condition.
     pub reason: &'static str,
+    /// description published with the condition.
     pub message: String,
 }
 
@@ -179,9 +203,13 @@ pub fn compile(
 
 /// expose common attachment fields without coupling generated resource types to each other.
 trait Routed: Resource<DynamicType = ()> {
+    /// generated parent reference type.
     type Parent: Serialize;
+    /// enumerate the declared parents.
     fn parents(&self) -> &[Self::Parent];
+    /// borrow common parent fields.
     fn parent(p: &Self::Parent) -> Parent<'_>;
+    /// attach this resource to a listener and record its status.
     fn bind(
         &self,
         stores: &GatewayStores,
@@ -190,14 +218,22 @@ trait Routed: Resource<DynamicType = ()> {
         report: &mut RouteReport,
     ) -> Result<(), ResolveError>;
 }
+/// borrowed parent reference fields shared across route kinds.
 struct Parent<'a> {
+    /// target API group.
     group: Option<&'a str>,
+    /// target resource kind.
     kind: Option<&'a str>,
+    /// namespace override for the parent.
     namespace: Option<&'a str>,
+    /// name of the referenced gateway.
     name: &'a str,
+    /// optional listener name.
     section: Option<&'a str>,
+    /// optional listener port.
     port: Option<u16>,
 }
+/// adapt generated parent references into the common attachment interface.
 macro_rules! parents {
     ($parent:ty) => {
         type Parent = $parent;
@@ -217,16 +253,15 @@ macro_rules! parents {
     };
 }
 impl RouteReport {
+    /// mark an attachment as unaccepted.
     fn reject(&mut self, reason: &'static str, message: &str) {
         self.accepted = false;
         self.reason = reason;
         self.message = message.into();
     }
-    fn references<T>(
-        &mut self,
-        backends: &[(u32, Result<T, super::super::ir::RefError>)],
-    ) {
-        if let Some(error) = backends.iter().find_map(|(_, r)| r.as_ref().err()) {
+    /// record the first unresolved backend reference.
+    fn references(&mut self, error: Option<&super::super::ir::RefError>) {
+        if let Some(error) = error {
             self.resolved = false;
             self.refs_reason = error.reason();
         }
@@ -257,8 +292,22 @@ impl Routed for HttpRoute {
             );
             return Ok(());
         }
-        for rule in stores.resolve_http(self, &mut result.policies)? {
-            report.references(&rule.action.backends);
+        let rules = self.spec.rules.as_deref().unwrap_or_default();
+        let namespace = self.namespace().unwrap_or_default();
+        let mut dropped = Vec::new();
+        let mut rejection = None;
+        for (index, rule) in rules.iter().enumerate() {
+            let rule = match stores.resolve_http(&namespace, rule, &mut result.policies) {
+                Ok(rule) => rule,
+                Err(error) => {
+                    dropped.push(format!("rules[{index}] ({})", error.reason()));
+                    rejection.get_or_insert(error);
+                    continue;
+                }
+            };
+            report.references(
+                rule.action.backends.iter().find_map(|b| b.cluster.as_ref().err()),
+            );
             for http in rule.matches {
                 for hostname in &hosts {
                     result.routes.push(Route {
@@ -269,9 +318,17 @@ impl Routed for HttpRoute {
                 }
             }
         }
+        if let Some(error) = rejection {
+            if dropped.len() == rules.len() {
+                return Err(error);
+            }
+            report.partially_invalid =
+                Some(format!("Dropped Rule: {}", dropped.join(", ")));
+        }
         Ok(())
     }
 }
+/// bind a raw transport route to its first eligible listener target.
 macro_rules! stream_route {
     ($route:ty,$parent:ty,$resolve:ident) => {
         impl Routed for $route {
@@ -284,7 +341,9 @@ macro_rules! stream_route {
                 report: &mut RouteReport,
             ) -> Result<(), ResolveError> {
                 let backend = stores.$resolve(self)?;
-                report.references(&backend.backends);
+                report.references(
+                    backend.backends.iter().find_map(|(_, b)| b.as_ref().err()),
+                );
                 // routes arrive oldest first. every allowed parent receives a status entry.
                 result.stream.get_or_insert(backend);
                 Ok(())
@@ -295,6 +354,7 @@ macro_rules! stream_route {
 stream_route!(TcpRoute, TcpRouteParentRefs, resolve_tcp);
 stream_route!(UdpRoute, UdpRouteParentRefs, resolve_udp);
 
+/// evaluate matching parent references in stable route precedence order.
 fn collect<R: Routed>(
     mut routes: Vec<Arc<R>>,
     stores: &GatewayStores,
@@ -328,6 +388,7 @@ fn collect<R: Routed>(
                 message: "route attached to listener".into(),
                 resolved: true,
                 refs_reason: "ResolvedRefs",
+                partially_invalid: None,
             };
             if p.section.is_some_and(|n| n != l.name)
                 || p.port.is_some_and(|port| port != l.port)
@@ -340,14 +401,15 @@ fn collect<R: Routed>(
                     "NotAllowedByListeners",
                     "listener does not allow this route namespace or kind",
                 );
-            } else if route.bind(stores, l, result, &mut report).is_err() {
-                report.reject("UnsupportedValue", "unsupported route rule");
+            } else if let Err(error) = route.bind(stores, l, result, &mut report) {
+                report.reject(error.reason(), "unsupported route rule");
             }
             result.reports.push(report);
         }
     }
 }
 
+/// check listener namespace policy against the route namespace.
 fn allows_route(
     stores: &GatewayStores,
     l: &GatewayListeners,

@@ -1,7 +1,7 @@
 //! a shared HTTP/2 connection and its active request and response streams.
 use super::{
-    super::connector::Connected, ConnectionPool, Endpoint, PooledBody, ResponseLease,
-    Slot,
+    super::{connector::Connected, deadline::TimedBody},
+    ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use bytes::Bytes;
 use hyper::{body::Incoming, client::conn::http2};
@@ -15,6 +15,7 @@ use std::{
 };
 
 impl Endpoint {
+    /// remove a stale connection from future stream selection.
     pub fn retire_http2(&self, lease: &Http2Lease) {
         self.http2
             .borrow_mut()
@@ -24,6 +25,7 @@ impl Endpoint {
 }
 
 impl ConnectionPool {
+    /// acquire stream capacity or open a new HTTP/2 transport.
     pub async fn acquire_http2(
         &self,
         endpoint: &Rc<Endpoint>,
@@ -67,9 +69,13 @@ impl ConnectionPool {
 
 /// shared HTTP/2 upstream connection and its active stream counter.
 pub struct Http2Connection {
-    transport: Connected<http2::SendRequest<Upload>>,
+    /// multiplexed sender and its worker driver.
+    transport: Connected<http2::SendRequest<TimedBody<Upload>>>,
+    /// reservation for the underlying connection.
     slot: Slot,
+    /// streams with either upload or response still active.
     active: Cell<usize>,
+    /// last time the final stream completed.
     idle_since: Cell<Instant>,
 }
 
@@ -85,6 +91,7 @@ impl Http2Connection {
         (self.active.get() == 0).then(|| self.idle_since.get())
     }
 
+    /// reserve a stream slot across both halves.
     fn lease(self: &Rc<Self>) -> Http2Lease {
         self.active.set(self.active.get() + 1);
         Http2Lease {
@@ -94,7 +101,7 @@ impl Http2Connection {
     }
 }
 
-// upload and response share this guard. the upload must not keep its driver alive.
+/// upload and response share this guard. the upload must not keep its driver alive.
 struct Stream(Weak<Http2Connection>);
 
 impl Drop for Stream {
@@ -110,31 +117,41 @@ impl Drop for Stream {
     }
 }
 
+/// ownership of an active response stream.
 pub struct Http2Lease {
+    /// shared connection on which the request travels.
     connection: Rc<Http2Connection>,
+    /// stream accounting shared with the upload.
     stream: Rc<Stream>,
 }
 
 impl Http2Lease {
-    pub fn sender(&self) -> http2::SendRequest<Upload> {
+    /// clone the request sender for this stream.
+    pub fn sender(&self) -> http2::SendRequest<TimedBody<Upload>> {
         self.connection.transport.sender.clone()
     }
 
+    /// attach stream accounting before arming the upload deadline.
     pub fn upload(&self, body: Incoming) -> Upload {
         Upload { body, _stream: self.stream.clone() }
     }
 
+    /// retain the HTTP/2 lease during response streaming.
     pub fn into_body(self, body: Incoming) -> PooledBody {
         PooledBody::new(body, ResponseLease::Http2(self))
     }
 }
 
+/// request body retaining stream capacity until upload completion.
 pub struct Upload {
+    /// original streaming upload from the downstream request.
     body: Incoming,
+    /// shared stream accounting guard.
     _stream: Rc<Stream>,
 }
 
 impl Upload {
+    /// recover a body returned before dispatch for a fresh attempt.
     pub fn into_inner(self) -> Incoming {
         self.body
     }

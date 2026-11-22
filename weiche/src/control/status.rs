@@ -12,6 +12,7 @@ use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
 };
 
+/// construct a condition for the observed resource generation.
 fn condition(
     kind: &str,
     status: bool,
@@ -23,7 +24,7 @@ fn condition(
         "message": message, "observedGeneration": generation.unwrap_or(1)})
 }
 
-// keep transition times stable, so reconciliation does not generate status/watch loops.
+/// keep transition times stable, so reconciliation does not generate status/watch loops.
 fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     for condition in &mut conditions {
         let previous = old.and_then(Value::as_array).and_then(|old| {
@@ -52,6 +53,7 @@ fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     json!(conditions)
 }
 
+/// apply changed status with optimistic concurrency.
 async fn patch_status<K>(
     api: Api<K>,
     resource: &K,
@@ -102,7 +104,30 @@ pub async fn update_status(
             )],
             class_old.get("conditions"),
         );
-        class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"},{"name":"TCPRoute"},{"name":"UDPRoute"}]);
+        class_status["supportedFeatures"] = [
+            "Gateway",
+            "HTTPRoute",
+            "HTTPRoute303RedirectStatusCode",
+            "HTTPRoute307RedirectStatusCode",
+            "HTTPRoute308RedirectStatusCode",
+            "HTTPRouteBackendProtocolWebSocket",
+            "HTTPRouteBackendRequestHeaderModification",
+            "HTTPRouteBackendTimeout",
+            "HTTPRouteBackendURLRewrite",
+            "HTTPRouteHostRewrite",
+            "HTTPRoutePathRedirect",
+            "HTTPRoutePathRewrite",
+            "HTTPRoutePortRedirect",
+            "HTTPRouteRequestTimeout",
+            "HTTPRouteResponseHeaderModification",
+            "HTTPRouteSchemeRedirect",
+            "ReferenceGrant",
+            "TCPRoute",
+            "UDPRoute",
+        ]
+        .into_iter()
+        .map(|name| json!({"name":name}))
+        .collect();
         patch_status(
             Api::<GatewayClass>::all(client.clone()),
             class.as_ref(),
@@ -116,6 +141,7 @@ pub async fn update_status(
     }
     update_policies(client, stores, plans).await?;
 
+    /// publish parent conditions for each supported route kind.
     macro_rules! routes {
         ($store:expr) => {
             for route in $store.state() {
@@ -186,25 +212,32 @@ where
         } else {
             "backend reference is missing, unsupported or not permitted"
         };
-        let conditions = stamp(
-            vec![
-                condition(
-                    "Accepted",
-                    report.accepted,
-                    report.reason,
-                    &report.message,
-                    generation,
-                ),
-                condition(
-                    "ResolvedRefs",
-                    report.resolved,
-                    report.refs_reason,
-                    refs_message,
-                    generation,
-                ),
-            ],
-            previous.and_then(|p| p.get("conditions")),
-        );
+        let mut conditions = vec![
+            condition(
+                "Accepted",
+                report.accepted,
+                report.reason,
+                &report.message,
+                generation,
+            ),
+            condition(
+                "ResolvedRefs",
+                report.resolved,
+                report.refs_reason,
+                refs_message,
+                generation,
+            ),
+        ];
+        if let Some(message) = &report.partially_invalid {
+            conditions.push(condition(
+                "PartiallyInvalid",
+                true,
+                "UnsupportedValue",
+                message,
+                generation,
+            ));
+        }
+        let conditions = stamp(conditions, previous.and_then(|p| p.get("conditions")));
         parents.push(json!({
             "controllerName": CONTROLLER_NAME,
             "parentRef": parent,
