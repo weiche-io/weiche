@@ -1,14 +1,11 @@
 //! worker socket lifecycle for HTTP and transport routes.
 use super::{
-    super::http::server::Server,
-    super::{
-        super::ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
-        admission::Admission,
-        config::{self, RuntimeConfig},
-        http::ProxyService,
-        stopped,
-    },
-    ListenerGroup, WorkerStatus, bind_socket, quic,
+    super::ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
+    admission::Admission,
+    config::{self, RuntimeConfig},
+    http::{ProxyService, server::Server},
+    net::{ListenerGroup, WorkerStatus, listen_tcp, quic, tcp, udp},
+    stopped,
 };
 use compio::{
     net::TcpListener,
@@ -21,14 +18,7 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{collections::BTreeMap, io, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::watch;
 
-/// bind a reusable listener on the worker's runtime.
-pub fn listen(address: SocketAddr) -> io::Result<TcpListener> {
-    let socket = bind_socket(address, socket2::Type::STREAM, socket2::Protocol::TCP)?;
-    socket.listen(128)?;
-    TcpListener::from_std(socket.into())
-}
-
-/// run one listener on its owning compio runtime.
+/// reconcile a worker's listeners on their owning compio runtime.
 pub async fn run(
     id: usize,
     mut config: config::Reader,
@@ -75,7 +65,7 @@ pub async fn run(
             if sockets.contains_key(address) {
                 continue;
             }
-            match listen(*address) {
+            match listen_tcp(*address) {
                 Ok(socket) => {
                     let binding = Rc::new(routes.listener.binding());
                     let (certs, rx) =
@@ -172,16 +162,16 @@ pub async fn run(
                 update(tx, socket);
                 continue;
             }
-            match listen(*address) {
+            match listen_tcp(*address) {
                 Ok(listener) => {
                     let (tx, rx) = watch::channel(socket.clone());
                     serving.push(
-                        super::relay::serve(
+                        tcp::serve(
                             listener,
                             rx,
                             admission.clone(),
                             runtime.clone(),
-                            super::passthrough::forward,
+                            tcp::passthrough,
                         )
                         .boxed_local(),
                     );
@@ -200,15 +190,9 @@ pub async fn run(
             let (tx, rx) = watch::channel(listener.route.clone());
             let (transport, address) = key;
             let task = match transport {
-                Transport::Tcp => listen(address).map(|s| {
-                    super::relay::serve(
-                        s,
-                        rx,
-                        admission.clone(),
-                        runtime.clone(),
-                        super::relay::tcp,
-                    )
-                    .boxed_local()
+                Transport::Tcp => listen_tcp(address).map(|s| {
+                    tcp::serve(s, rx, admission.clone(), runtime.clone(), tcp::forward)
+                        .boxed_local()
                 }),
                 Transport::Udp => {
                     let socket = if runtime.http3 {
@@ -217,24 +201,19 @@ pub async fn run(
                             .acquire(address, id, runtime.workers.get(), false)
                             .map(|(socket, reader)| (socket, Some(reader)))
                     } else {
-                        super::udp::listen(address).map(|s| (s, None))
+                        udp::listen(address).map(|s| (s, None))
                     };
                     socket.map(|(socket, reader)| {
                         let admission = admission.clone();
                         let idle = runtime.upstream_idle_timeout;
                         async move {
                             if let Some(_reader) = reader {
-                                let result = super::udp::serve(
-                                    socket.clone(),
-                                    rx,
-                                    admission,
-                                    idle,
-                                )
-                                .await;
+                                let result =
+                                    udp::serve(socket.clone(), rx, admission, idle).await;
                                 socket.close().await?;
                                 result
                             } else {
-                                super::udp::serve(socket, rx, admission, idle).await
+                                udp::serve(socket, rx, admission, idle).await
                             }
                         }
                         .boxed_local()

@@ -1,12 +1,11 @@
 //! adapt HTTP/3 request streams to the worker's shared HTTP service.
-use super::{
-    super::super::{
-        super::ir::Binding,
-        admission::Permit,
-        http::{Body, ProxyService, strip_hop_headers},
-        up::ResponseDeadline,
-    },
-    RuntimeConfig, stopped,
+use super::super::{
+    super::ir::Binding,
+    admission::Permit,
+    config::RuntimeConfig,
+    http::{Body, ProxyService, strip_hop_headers},
+    stopped,
+    up::ResponseDeadline,
 };
 use bytes::{Buf, Bytes};
 use compio::{

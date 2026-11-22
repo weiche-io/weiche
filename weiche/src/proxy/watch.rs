@@ -5,7 +5,7 @@ use super::{
         wire::{self, SNAPSHOT_KEY},
     },
     config,
-    down::WorkerGroupState,
+    net::WorkerGroupState,
     stopped,
 };
 use anyhow::{Context, ensure};

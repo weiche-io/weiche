@@ -1,18 +1,19 @@
 //! supervise the gateway watch and its worker-local compio data planes.
 pub mod admission;
 pub mod config;
-pub mod down;
 pub mod http;
 mod io;
+pub mod net;
 mod up;
 mod watch;
+mod worker;
 
 use super::ir::GatewaySnapshot;
 use admission::Admission;
 use anyhow::Context;
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use config::RuntimeConfig;
-use down::{ListenerGroup, WorkerGroupState, tcp};
+use net::{ListenerGroup, WorkerGroupState};
 use std::{mem::DropGuard, sync::Arc, thread};
 use tokio::sync::watch::{Receiver, Sender, channel};
 pub use watch::ready;
@@ -129,13 +130,13 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
         let started = threads.spawn(format!("weiche-worker-{id}"), move || {
             let io = runtime().context("create worker compio runtime")?;
             tracing::info!(worker = id, driver = ?io.driver_type(), "starting compio worker");
-            io.block_on(tcp::run(id, config, policy, admission, listeners, stop))
+            io.block_on(worker::run(id, config, policy, admission, listeners, stop))
         });
         if started.is_err() {
             return threads.join(started);
         }
     }
     let result =
-        tcp::run(0, reader, policy, admission, listeners.clone(), shutdown).await;
+        worker::run(0, reader, policy, admission, listeners.clone(), shutdown).await;
     threads.join(result.context("worker 0"))
 }

@@ -1,7 +1,5 @@
 //! maintain one QUIC endpoint per terminating HTTPS socket on each worker.
-mod cid;
-mod group;
-mod h3;
+use super::{cid, group, h3};
 
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
@@ -24,7 +22,6 @@ use compio::{
     },
 };
 use futures::{StreamExt, stream::FuturesUnordered};
-pub use group::Groups;
 use std::{
     io,
     net::SocketAddr,

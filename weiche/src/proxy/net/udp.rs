@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
+/// receive buffer capacity for a full datagram.
 const MAX_PACKET: usize = 65535;
 
 /// bind a reusable datagram socket on the worker's runtime.
@@ -30,14 +31,20 @@ pub fn listen(address: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
+/// upstream socket and idle accounting for one downstream peer.
 struct Flow {
+    /// selected backend for this flow.
     target: SocketAddr,
+    /// connected socket for sending and receiving backend datagrams.
     upstream: UdpSocket,
+    /// time of the last successful send in either direction.
     active: Cell<Instant>,
+    /// connection slot held for the lifetime of the flow.
     _permit: Permit,
 }
 
 impl Flow {
+    /// bind in the backend address family and connect the flow.
     async fn connect(target: SocketAddr, permit: Permit) -> io::Result<Self> {
         let ip = if target.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)

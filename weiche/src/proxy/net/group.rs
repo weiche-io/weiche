@@ -1,5 +1,5 @@
 //! coordinate UDP socket ownership across workers and protocol changes.
-use super::{super::bind_socket, cid};
+use super::{bind_socket, cid};
 use compio::net::UdpSocket;
 use socket2::{Protocol, Socket, Type};
 use std::{

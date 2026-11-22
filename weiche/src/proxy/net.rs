@@ -1,12 +1,14 @@
 //! downstream listener transports and per-worker application reports.
-mod passthrough;
+mod cid;
+mod group;
+mod h3;
 pub mod quic;
-mod relay;
 pub mod tcp;
 pub mod udp;
 
 use super::super::ir::{Revision, Transport};
-use std::{collections::BTreeSet, net::SocketAddr, sync::Mutex};
+use compio::net::TcpListener;
+use std::{collections::BTreeSet, io, net::SocketAddr, sync::Mutex};
 use tokio::sync::watch;
 
 /// sockets successfully applied at one worker revision.
@@ -45,7 +47,7 @@ impl WorkerGroupState {
 /// publish consistent binding reports for the worker group.
 pub struct ListenerGroup {
     /// ordered UDP bindings when HTTP/3 shares a worker group with raw UDP.
-    datagrams: quic::Groups,
+    pub datagrams: group::Groups,
     /// latest report at each worker index.
     workers: Mutex<Vec<WorkerStatus>>,
     /// channel carrying combined reports to the readiness monitor.
@@ -55,7 +57,7 @@ impl ListenerGroup {
     /// allocate a status slot for each configured worker.
     pub fn new(count: usize, state: watch::Sender<WorkerGroupState>) -> Self {
         Self {
-            datagrams: quic::Groups::default(),
+            datagrams: group::Groups::default(),
             workers: Mutex::new(vec![WorkerStatus::default(); count]),
             state,
         }
@@ -88,4 +90,11 @@ fn bind_socket(
     socket.set_reuse_port(true)?;
     socket.bind(&address.into())?;
     Ok(socket)
+}
+
+/// bind a reusable listener on the worker's runtime.
+pub fn listen_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = bind_socket(address, socket2::Type::STREAM, socket2::Protocol::TCP)?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
 }
