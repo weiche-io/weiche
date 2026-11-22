@@ -3,7 +3,7 @@ use super::super::{
     super::ir::Binding,
     admission::Permit,
     config::RuntimeConfig,
-    http::{Body, ProxyService, strip_hop_headers},
+    http::{Body, ProxyService, wire::strip_hop_headers},
     stopped,
     up::ResponseDeadline,
 };

@@ -1,7 +1,10 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
 use super::Body;
 use bytes::Bytes;
-use http::{HeaderValue, Request, Response, StatusCode, Version, header};
+use http::{
+    HeaderMap, HeaderValue, Request, Response, StatusCode, Version, header,
+    uri::Authority,
+};
 use http_body_util::{BodyExt, Full};
 
 /// errors mapped to local HTTP responses.
@@ -111,4 +114,64 @@ impl ProxyError {
 /// build a complete local response without involving an upstream stream.
 pub fn full_body(bytes: Bytes) -> Body {
     Box::pin(Full::new(bytes).map_err(|never| -> std::io::Error { never }))
+}
+
+/// parse the single Host field used by HTTP/1 or supplied by a route filter.
+pub fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let value = hosts.next().ok_or(ProxyError::InvalidHost)?;
+    let authority =
+        Authority::try_from(value.as_bytes()).map_err(|_| ProxyError::InvalidHost)?;
+    let host = authority.host();
+    let port = authority.as_str().strip_prefix(host).ok_or(ProxyError::InvalidHost)?;
+    if hosts.next().is_some()
+        || host.is_empty()
+        || authority.as_str().contains(['@', ','])
+        || (!port.is_empty() && (!port.starts_with(':') || authority.port().is_none()))
+    {
+        return Err(ProxyError::InvalidHost);
+    }
+    Ok(authority)
+}
+
+/// expose :authority to header matches and reject conflicting downstream identities.
+pub fn normalize_authority(request: &mut Request<Body>) -> Result<Authority, ProxyError> {
+    if !request.headers().contains_key(header::HOST)
+        && let Some(authority) = request.uri().authority()
+    {
+        let value = HeaderValue::from_str(authority.as_str())
+            .map_err(|_| ProxyError::InvalidHost)?;
+        request.headers_mut().insert(header::HOST, value);
+    }
+    let host = host_authority(request.headers())?;
+    if request.uri().authority().is_some_and(|authority| authority != &host) {
+        return Err(ProxyError::InvalidHost);
+    }
+    Ok(host)
+}
+
+/// remove connection-specific fields and fields nominated by this hop.
+pub fn strip_hop_headers(headers: &mut HeaderMap) {
+    let nominated: Vec<_> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|s| s.trim().parse::<header::HeaderName>().ok())
+        .collect();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
 }

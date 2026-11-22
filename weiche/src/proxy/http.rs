@@ -3,12 +3,12 @@ mod cors;
 mod filter;
 mod router;
 pub mod server;
-mod wire;
+pub mod wire;
 
 use super::{
     super::ir::{
-        Backend, Binding, Filters, HeaderChange, PathMatch, Protocol, PublishedSnapshot,
-        Revision, RouteAction,
+        Backend, Binding, Filters, PathMatch, Protocol, PublishedSnapshot, Revision,
+        RouteAction,
     },
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
@@ -16,8 +16,7 @@ use super::{
 };
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
-    uri::Authority,
+    HeaderValue, Request, Response, StatusCode, Uri, Version, header, uri::Authority,
 };
 use http_body_util::BodyExt;
 use router::{Hosts, Router};
@@ -31,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wire::{ProxyError, full_body, is_grpc};
+use wire::{ProxyError, full_body, is_grpc, normalize_authority, strip_hop_headers};
 
 /// streaming request and response bodies stay on the owning compio worker.
 pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = std::io::Error>>>;
@@ -411,40 +410,6 @@ struct Selection {
     budget: Deadlines,
 }
 
-/// parse the single Host field used by HTTP/1 or supplied by a route filter.
-fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
-    let mut hosts = headers.get_all(header::HOST).iter();
-    let value = hosts.next().ok_or(ProxyError::InvalidHost)?;
-    let authority =
-        Authority::try_from(value.as_bytes()).map_err(|_| ProxyError::InvalidHost)?;
-    let host = authority.host();
-    let port = authority.as_str().strip_prefix(host).ok_or(ProxyError::InvalidHost)?;
-    if hosts.next().is_some()
-        || host.is_empty()
-        || authority.as_str().contains(['@', ','])
-        || (!port.is_empty() && (!port.starts_with(':') || authority.port().is_none()))
-    {
-        return Err(ProxyError::InvalidHost);
-    }
-    Ok(authority)
-}
-
-/// expose :authority to header matches and reject conflicting downstream identities.
-fn normalize_authority(request: &mut Request<Body>) -> Result<Authority, ProxyError> {
-    if !request.headers().contains_key(header::HOST)
-        && let Some(authority) = request.uri().authority()
-    {
-        let value = HeaderValue::from_str(authority.as_str())
-            .map_err(|_| ProxyError::InvalidHost)?;
-        request.headers_mut().insert(header::HOST, value);
-    }
-    let host = host_authority(request.headers())?;
-    if request.uri().authority().is_some_and(|authority| authority != &host) {
-        return Err(ProxyError::InvalidHost);
-    }
-    Ok(host)
-}
-
 /// encode the filtered authority and path for the selected upstream protocol.
 fn prepare_request(
     request: &mut Request<Body>,
@@ -511,30 +476,4 @@ fn prepare_request(
     }
     *request.uri_mut() = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
     Ok(())
-}
-
-/// remove connection-specific fields and fields nominated by this hop.
-pub fn strip_hop_headers(headers: &mut HeaderMap) {
-    let nominated: Vec<_> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|s| s.trim().parse::<header::HeaderName>().ok())
-        .collect();
-    for name in nominated {
-        headers.remove(name);
-    }
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "transfer-encoding",
-        "upgrade",
-    ] {
-        headers.remove(name);
-    }
 }
