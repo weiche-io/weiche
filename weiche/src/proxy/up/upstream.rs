@@ -3,7 +3,7 @@ use super::super::http::{RequestBody, ResponseBody};
 use super::{
     super::super::ir::Protocol,
     deadline::{Deadlines, TimedBody},
-    pool::{ConnectionPool, Endpoint, PooledBody},
+    pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease},
     upgrade::{Tunnel, Upgrade},
 };
 use http::{Request, Response, StatusCode};
@@ -48,18 +48,7 @@ enum Attempt {
     Retry(Request<RequestBody>),
 }
 
-/// dispatch requests using the worker's bounded pool.
-pub struct UpstreamClient {
-    /// worker-local TCP capacity and endpoint generations.
-    pool: Rc<ConnectionPool>,
-}
-
-impl UpstreamClient {
-    /// use the same pool for ordinary traffic and dedicated tunnels.
-    pub fn new(pool: Rc<ConnectionPool>) -> Self {
-        Self { pool }
-    }
-
+impl ConnectionPool {
     /// retain the selected endpoint and overall deadline across one safe retry.
     pub async fn send(
         &self,
@@ -95,12 +84,12 @@ impl UpstreamClient {
         first: bool,
         end: Option<Instant>,
     ) -> anyhow::Result<Attempt> {
-        let mut lease = self.pool.acquire(endpoint, first && upgrade.is_none()).await?;
+        let mut lease = self.acquire(endpoint, first && upgrade.is_none()).await?;
         let request = request.map(|body| TimedBody::new(body, end));
         let mut response = match lease.sender().try_send_request(request).await {
             Ok(response) => response,
             Err(mut error) => {
-                if lease.reused()
+                if lease.reused
                     && let Some(request) = error.take_message()
                 {
                     let (parts, body) = request.into_parts();
@@ -118,7 +107,7 @@ impl UpstreamClient {
             let tunnel = offer.accept(&mut response, lease)?;
             (response.map(PooledBody::upgraded), Some(tunnel))
         } else {
-            (response.map(|b| lease.into_body(b)), None)
+            (response.map(|b| PooledBody::new(b, ResponseLease::Http1(lease))), None)
         };
         Ok(Attempt::Complete(Exchange::upstream(response, tunnel, end)))
     }
@@ -130,14 +119,14 @@ impl UpstreamClient {
         request: Request<RequestBody>,
         end: Option<Instant>,
     ) -> anyhow::Result<Attempt> {
-        let lease = self.pool.acquire_http2(endpoint).await?;
+        let lease = self.acquire_http2(endpoint).await?;
         match lease
             .sender()
             .try_send_request(request.map(|body| TimedBody::new(lease.upload(body), end)))
             .await
         {
             Ok(response) => Ok(Attempt::Complete(Exchange::upstream(
-                response.map(|body| lease.into_body(body)),
+                response.map(|b| PooledBody::new(b, ResponseLease::Http2(lease))),
                 None,
                 end,
             ))),

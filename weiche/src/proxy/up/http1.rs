@@ -3,10 +3,10 @@ use super::{
     super::http::RequestBody,
     connector::Connected,
     deadline::TimedBody,
-    pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot},
+    pool::{ConnectionPool, Endpoint, Slot},
 };
 use compio::runtime;
-use hyper::{body::Incoming, client::conn::http1::SendRequest};
+use hyper::client::conn::http1::SendRequest;
 use std::{
     rc::Rc,
     time::{Duration, Instant},
@@ -88,21 +88,13 @@ pub struct Lease {
     /// endpoint generation to which this connection belongs.
     endpoint: Rc<Endpoint>,
     /// whether this request acquired an idle socket.
-    reused: bool,
+    pub reused: bool,
 }
 
 impl Lease {
     /// borrow the sender for dispatch.
     pub fn sender(&mut self) -> &mut SendRequest<TimedBody<RequestBody>> {
         &mut self.connection.transport.sender
-    }
-    /// report whether a stale idle socket can justify a retry.
-    pub fn reused(&self) -> bool {
-        self.reused
-    }
-    /// retain this lease until response framing completes.
-    pub fn into_body(self, body: Incoming) -> PooledBody {
-        PooledBody::new(body, ResponseLease::Http1(self))
     }
 
     /// return an idle HTTP/1 connection to its endpoint pool once framing completes.

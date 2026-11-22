@@ -3,10 +3,10 @@ use super::{
     super::http::RequestBody,
     connector::Connected,
     deadline::TimedBody,
-    pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot},
+    pool::{ConnectionPool, Endpoint, Slot},
 };
 use bytes::Bytes;
-use hyper::{body::Incoming, client::conn::http2};
+use hyper::client::conn::http2;
 use std::{
     cell::Cell,
     mem::DropGuard,
@@ -140,11 +140,6 @@ impl Http2Lease {
     /// attach stream accounting before arming the upload deadline.
     pub fn upload(&self, body: RequestBody) -> Upload {
         Upload { body, _stream: self.stream.clone() }
-    }
-
-    /// retain the HTTP/2 lease during response streaming.
-    pub fn into_body(self, body: Incoming) -> PooledBody {
-        PooledBody::new(body, ResponseLease::Http2(self))
     }
 }
 

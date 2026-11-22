@@ -10,7 +10,7 @@ use super::{
     super::ir::{Backend, Binding, PublishedSnapshot, Revision, RouteAction},
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
-    up::{ConnectionPool, Exchange, UpstreamClient},
+    up::{ConnectionPool, Exchange},
 };
 pub use body::{RequestBody, ResponseBody};
 use http::{HeaderValue, Request, StatusCode, Version, header, uri::Authority};
@@ -134,8 +134,6 @@ pub struct ProxyService {
     view: RefCell<WorkerView>,
     /// pool reconciled when the active snapshot changes.
     pool: Rc<ConnectionPool>,
-    /// client dispatching on the worker runtime.
-    upstream: UpstreamClient,
     /// alternative services for the HTTPS sockets with a bound QUIC endpoint.
     advertised: RefCell<BTreeMap<SocketAddr, (Rc<Binding>, HeaderValue)>>,
 }
@@ -152,7 +150,6 @@ impl ProxyService {
         Ok(Self {
             view: RefCell::new(view),
             advertised: RefCell::default(),
-            upstream: UpstreamClient::new(pool.clone()),
             pool,
         })
     }
@@ -309,7 +306,7 @@ impl ProxyService {
         }
         let address = endpoint.key.address;
         let mut exchange = self
-            .upstream
+            .pool
             .send(endpoint, request, upgrade, selection.budget)
             .await
             .map_err(|error| ProxyError::backend(address, error))?;
