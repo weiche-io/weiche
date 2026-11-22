@@ -8,7 +8,9 @@ use k8s_openapi::{
     ByteString,
     api::{
         core::v1::{
-            ConfigMap, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
+            Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, ExecAction,
+            ObjectFieldSelector, Probe, Secret, SecurityContext, Service, ServiceAccount,
+            ServicePort, ServiceSpec, VolumeMount,
         },
         rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject},
     },
@@ -155,6 +157,43 @@ impl Target<'_> {
         BTreeMap::from([(OWNER.into(), self.owner.uid.clone())])
     }
 
+    /// configure the proxy process, readiness command and container privileges.
+    pub fn container(&self, settings: &Settings) -> Container {
+        Container {
+            name: "proxy".into(),
+            image: Some(settings.image.clone()),
+            image_pull_policy: Some(settings.pull_policy.clone()),
+            args: Some(vec!["proxy".into(), self.name.into()]),
+            resources: Some(settings.resources.clone()),
+            env: Some(proxy_env(settings)),
+            volume_mounts: Some(vec![VolumeMount {
+                name: "run".into(),
+                mount_path: "/run/weiche".into(),
+                ..Default::default()
+            }]),
+            readiness_probe: Some(Probe {
+                exec: Some(ExecAction {
+                    command: Some(vec!["/usr/local/bin/weiche".into(), "ready".into()]),
+                }),
+                period_seconds: Some(1),
+                failure_threshold: Some(1),
+                ..Default::default()
+            }),
+            security_context: Some(SecurityContext {
+                run_as_non_root: Some(true),
+                run_as_user: Some(65532),
+                allow_privilege_escalation: Some(false),
+                capabilities: Some(Capabilities {
+                    drop: Some(vec!["ALL".into()]),
+                    add: settings.host_network.then(|| vec!["NET_BIND_SERVICE".into()]),
+                }),
+                seccomp_profile: Some(settings.seccomp_profile.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     /// expose listener ports with the installation's address and traffic policies.
     pub fn service(
         &self,
@@ -200,6 +239,46 @@ impl Target<'_> {
             ..Default::default()
         }
     }
+}
+
+/// assemble the proxy environment with platform-supplied overrides in declaration order.
+fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
+    let literal = |name: &str, value: String| EnvVar {
+        name: name.into(),
+        value: Some(value),
+        ..Default::default()
+    };
+    let mut env = vec![
+        literal("WEICHE_WORKERS", settings.workers.to_string()),
+        literal("WEICHE_PROVISIONER_BINDING", settings.provisioner_binding.clone()),
+        EnvVar {
+            name: "POD_UID".into(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "metadata.uid".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ];
+    if settings.http3.enabled {
+        env.push(literal("WEICHE_HTTP3", "true".into()));
+        if let Some(port) = settings.http3.advertised_port {
+            env.push(literal("WEICHE_HTTP3_PORT", port.to_string()));
+        }
+    }
+    if !settings.log.level.is_empty()
+        && !settings.extra_env.iter().any(|var| var.name == "RUST_LOG")
+    {
+        env.push(literal("RUST_LOG", settings.log.level.clone()));
+    }
+    if !settings.extra_env.iter().any(|var| var.name == "WEICHE_LOG_FORMAT") {
+        env.push(literal("WEICHE_LOG_FORMAT", settings.log.format.clone()));
+    }
+    env.extend_from_slice(&settings.extra_env);
+    env
 }
 
 /// return the Kubernetes IP family name for an IP address.

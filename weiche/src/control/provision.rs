@@ -277,61 +277,13 @@ fn proxy_deployment(
     let mut node_selector = settings.node_selector.clone();
     node_selector.insert("kubernetes.io/os".into(), "linux".into());
 
-    let mut env = vec![
-        json!({"name": "WEICHE_WORKERS", "value": settings.workers.to_string()}),
-        json!({"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding}),
-        json!({"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}}),
-    ];
-    if settings.http3.enabled {
-        env.push(json!({"name": "WEICHE_HTTP3", "value": "true"}));
-        if let Some(port) = settings.http3.advertised_port {
-            env.push(json!({"name": "WEICHE_HTTP3_PORT", "value": port.to_string()}));
-        }
-    }
-    if !settings.log.level.is_empty()
-        && !settings.extra_env.iter().any(|v| v.name == "RUST_LOG")
-    {
-        env.push(json!({"name": "RUST_LOG", "value": settings.log.level}));
-    }
-    if !settings.extra_env.iter().any(|v| v.name == "WEICHE_LOG_FORMAT") {
-        env.push(json!({"name": "WEICHE_LOG_FORMAT", "value": settings.log.format}));
-    }
-    for var in &settings.extra_env {
-        env.push(json!(var));
-    }
-
-    let capabilities = if settings.host_network {
-        json!({"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]})
-    } else {
-        json!({"drop": ["ALL"]})
-    };
     let mut pod_spec = json!({
         "serviceAccountName": name,
         "nodeSelector": node_selector,
         "imagePullSecrets": settings.pull_secrets,
         "terminationGracePeriodSeconds": settings.termination_grace_period_seconds,
         "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
-        "containers": [{
-            "name": "proxy",
-            "image": settings.image,
-            "imagePullPolicy": settings.pull_policy,
-            "args": ["proxy", name],
-            "resources": settings.resources,
-            "env": env,
-            "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
-            "readinessProbe": {
-                "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
-                "periodSeconds": 1,
-                "failureThreshold": 1,
-            },
-            "securityContext": {
-                "runAsNonRoot": true,
-                "runAsUser": 65532,
-                "allowPrivilegeEscalation": false,
-                "capabilities": capabilities,
-                "seccompProfile": settings.seccomp_profile,
-            },
-        }],
+        "containers": [target.container(settings)],
     });
     if settings.host_network {
         pod_spec["hostNetwork"] = json!(true);
