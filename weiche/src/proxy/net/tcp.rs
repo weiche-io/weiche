@@ -68,7 +68,8 @@ pub async fn accept<T, S: Stream + Unpin>(
                 if changed.is_err() { return Ok(()) }
                 continue;
             }
-            Some(_) = tasks.next() => continue,
+            // both task streams have an exact size, including the empty HTTP queue.
+            Some(_) = tasks.next(), if tasks.size_hint().1 != Some(0) => continue,
             result = &mut accepting => result?,
         };
         accepting.set(socket.accept());

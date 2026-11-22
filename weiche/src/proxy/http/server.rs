@@ -72,7 +72,7 @@ impl Worker {
                 &worker,
                 socket,
                 &mut rx,
-                &mut stream::pending::<()>(),
+                &mut stream::empty::<()>(),
                 |(stream, peer), certs, permit, _| {
                     let connection = worker.clone().serve(
                         binding.clone(),
