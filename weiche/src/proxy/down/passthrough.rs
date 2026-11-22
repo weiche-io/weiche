@@ -1,8 +1,5 @@
 //! inspect a bounded ClientHello and replay its original TLS records to the selected backend.
-use super::{
-    super::super::{ir::TlsSocket, rtconf::RuntimeConfig},
-    relay,
-};
+use super::{super::super::ir::TlsSocket, super::config::RuntimeConfig, relay};
 use compio::{
     BufResult,
     buf::{IntoInner, IoBufExt},

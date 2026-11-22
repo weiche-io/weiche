@@ -1,6 +1,9 @@
-//! process policy; connection budgets explicitly distinguish global and worker scope.
+//! configure the workers and publish immutable gateway snapshots.
+use super::super::ir::{GatewaySnapshot, PublishedSnapshot, Revision};
 use anyhow::Context;
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+
+use tokio::sync::watch;
 
 /// process-wide limits and downstream listener policy.
 #[derive(Clone, Debug)]
@@ -106,5 +109,55 @@ impl RuntimeConfig {
             "worker drain must allow connection drain to finish"
         );
         Ok(())
+    }
+}
+
+/// single-writer handle owned by the proxy watch thread.
+pub struct Writer {
+    /// publishes the current snapshot to all workers.
+    tx: watch::Sender<Arc<PublishedSnapshot>>,
+}
+
+/// worker-side handle observing the latest published snapshot.
+#[derive(Clone)]
+pub struct Reader {
+    /// observes the most recently published revision.
+    rx: watch::Receiver<Arc<PublishedSnapshot>>,
+}
+
+/// create a snapshot publication channel starting at revision zero.
+pub fn channel(initial: GatewaySnapshot) -> (Writer, Reader) {
+    let initial = Arc::new(PublishedSnapshot { revision: 0, gateway: initial });
+    let (tx, rx) = watch::channel(initial);
+    (Writer { tx }, Reader { rx })
+}
+
+impl Writer {
+    /// publish a new revision unless the snapshot is identical to the current one.
+    pub fn publish(&mut self, gateway: GatewaySnapshot) -> Revision {
+        let current = self.tx.borrow();
+        if current.gateway == gateway {
+            return current.revision;
+        }
+        let next = current
+            .revision
+            .checked_add(1)
+            .expect("configuration revision exhausted");
+        drop(current);
+        self.tx
+            .send_replace(Arc::new(PublishedSnapshot { revision: next, gateway }));
+        next
+    }
+}
+
+impl Reader {
+    /// clone the latest published snapshot and mark it observed.
+    pub fn snapshot(&mut self) -> Arc<PublishedSnapshot> {
+        self.rx.borrow_and_update().clone()
+    }
+
+    /// wait until a newer snapshot is published or the writer closes.
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.rx.changed().await
     }
 }

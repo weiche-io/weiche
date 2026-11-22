@@ -1,6 +1,6 @@
 //! supervise a group of compio workers; worker zero runs on the caller's runtime.
 use super::{
-    super::{routing, rtconf::RuntimeConfig},
+    config::{self, RuntimeConfig},
     core::tcp::Admission,
     down::{ListenerGroup, WorkerGroupState, tcp},
     stopped,
@@ -31,14 +31,14 @@ pub fn runtime() -> io::Result<Runtime> {
 
 pub struct WorkerGroup {
     runtime: Arc<RuntimeConfig>,
-    config: routing::Reader,
+    config: config::Reader,
     state: watch::Sender<WorkerGroupState>,
 }
 
 impl WorkerGroup {
     pub fn new(
         runtime: RuntimeConfig,
-        config: routing::Reader,
+        config: config::Reader,
         state: watch::Sender<WorkerGroupState>,
     ) -> anyhow::Result<Self> {
         runtime.validate()?;

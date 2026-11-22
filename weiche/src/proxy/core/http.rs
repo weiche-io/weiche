@@ -5,13 +5,11 @@ mod router;
 
 use super::{
     super::{
-        super::{
-            ir::{
-                Backend, Binding, Filters, HeaderChange, PathMatch, Protocol,
-                PublishedSnapshot, Revision, RouteAction,
-            },
-            rtconf::RuntimeConfig,
+        super::ir::{
+            Backend, Binding, Filters, HeaderChange, PathMatch, Protocol,
+            PublishedSnapshot, Revision, RouteAction,
         },
+        config::RuntimeConfig,
         up::{ConnectionPool, Deadlines, Tunnel, Upgrade, UpstreamClient},
     },
     Cluster, EndpointKey, tcp,

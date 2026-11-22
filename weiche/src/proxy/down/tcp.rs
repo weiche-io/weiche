@@ -1,11 +1,8 @@
 //! worker socket lifecycle for HTTP and transport routes.
 use super::{
     super::{
-        super::{
-            ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
-            routing,
-            rtconf::RuntimeConfig,
-        },
+        super::ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
+        config::{self, RuntimeConfig},
         core::{http::ProxyService, tcp::Admission},
         stopped,
     },
@@ -34,7 +31,7 @@ pub fn listen(address: SocketAddr) -> io::Result<TcpListener> {
 /// run one listener on its owning compio runtime.
 pub async fn run(
     id: usize,
-    mut config: routing::Reader,
+    mut config: config::Reader,
     runtime: Arc<RuntimeConfig>,
     admission: Arc<Admission>,
     listeners: Arc<ListenerGroup>,

@@ -1,9 +1,7 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::{
-        ir::{Binding, ServerTls},
-        rtconf::RuntimeConfig,
-    },
+    super::ir::{Binding, ServerTls},
+    config::RuntimeConfig,
     core::{http::ProxyService, tcp::Permit},
     io::Io,
     stopped,

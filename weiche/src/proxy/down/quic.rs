@@ -4,10 +4,8 @@ mod group;
 mod h3;
 
 use super::super::{
-    super::{
-        ir::{Binding, ServerTls, hostname_matches},
-        rtconf::RuntimeConfig,
-    },
+    super::ir::{Binding, ServerTls, hostname_matches},
+    config::RuntimeConfig,
     core::{http::ProxyService, tcp::Admission},
     stopped,
 };

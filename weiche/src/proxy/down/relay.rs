@@ -1,8 +1,5 @@
 //! forward opaque TCP connections, retaining half-close semantics in both directions.
-use super::super::{
-    super::{ir::StreamRoute, rtconf::RuntimeConfig},
-    core::tcp::Admission,
-};
+use super::super::{super::ir::StreamRoute, config::RuntimeConfig, core::tcp::Admission};
 use compio::{
     io::{AsyncWriteExt, copy},
     net::{TcpListener, TcpStream},

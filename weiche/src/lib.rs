@@ -4,12 +4,7 @@
 compile_error!("weiche supports only Linux");
 
 pub mod control;
-pub mod gateway;
 pub mod ir;
-pub mod routing;
-pub mod rtconf;
-pub mod stream;
-
 pub mod proxy;
 
 /// wait for Kubernetes termination or a foreground interrupt.

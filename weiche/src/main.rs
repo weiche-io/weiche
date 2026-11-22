@@ -1,7 +1,12 @@
+//! dispatch the controller, proxy and readiness probe commands.
 use anyhow::{Context, bail};
 use tracing_subscriber::EnvFilter;
-use weiche::{control, gateway, proxy, rtconf::RuntimeConfig, stream};
+use weiche::{
+    control,
+    proxy::{self, config::RuntimeConfig},
+};
 
+/// configure logging and start the requested process role.
 fn main() -> anyhow::Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -23,9 +28,9 @@ fn main() -> anyhow::Result<()> {
             .block_on(control::run()),
         [role, resource] if role == "proxy" => {
             let runtime = RuntimeConfig::from_env()?;
-            let io = stream::runtime().context("create proxy runtime")?;
+            let io = proxy::runtime().context("create proxy runtime")?;
             tracing::info!(workers=runtime.workers.get(), driver=?io.driver_type(), "starting data plane");
-            io.block_on(gateway::run(resource.clone(), runtime))
+            io.block_on(proxy::run(resource.clone(), runtime))
         }
         [role] if role == "ready" => proxy::ready(),
         _ => bail!("usage: weiche controller | proxy <gateway-resource-name> | ready"),
