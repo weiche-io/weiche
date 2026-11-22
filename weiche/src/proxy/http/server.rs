@@ -1,20 +1,21 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::ir::{Binding, ServerTls, hostname_matches},
-    admission::{Admission, Permit},
+    super::ir::{Binding, Listener, ServerTls, hostname_matches},
+    admission::Permit,
     config::RuntimeConfig,
     io::{AcceptedTls, Io, TlsIo},
     net::tcp,
     stopped,
     up::Tunnel,
+    worker::{HttpListener, Task, Worker},
 };
 use super::{ProxyService, RequestBody};
 use compio::{
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     runtime::{self, time::timeout},
 };
 use cyper_core::{CompioExecutor, CompioTimer};
-use futures::stream;
+use futures::{FutureExt, stream};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::server::conn::auto::Builder;
 use std::{io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
@@ -28,10 +29,6 @@ pub struct Server {
     http1: http1::Builder,
     /// cleartext protocol detection and HTTP/2 configuration.
     builder: Builder<CompioExecutor>,
-    /// maximum grace period after listener shutdown.
-    drain_timeout: Duration,
-    /// maximum duration of a frontend TLS handshake.
-    handshake_timeout: Duration,
 }
 
 impl Server {
@@ -52,48 +49,49 @@ impl Server {
         http1
             .max_headers(config.http_max_headers)
             .max_buf_size(config.http_max_buffer);
-        Self {
-            http1,
-            service: Rc::new(service),
-            builder,
-            drain_timeout: config.connection_drain_timeout,
-            handshake_timeout: config.tls_handshake_timeout,
-        }
+        Self { http1, service: Rc::new(service), builder }
     }
+}
 
-    /// own the accept future and drain only the connections belonging to this binding.
-    pub async fn accept(
-        self: Rc<Self>,
-        socket: TcpListener,
-        binding: Rc<Binding>,
-        admission: Arc<Admission>,
-        mut certs: watch::Receiver<Rc<[Arc<ServerTls>]>>,
-        drain: Duration,
-    ) -> io::Result<()> {
-        let (connections, _) = watch::channel(false);
-        // HTTP connections run independently so upgrades can outlive the hyper connection.
-        tcp::accept(
-            socket,
-            &mut certs,
-            &mut stream::pending::<()>(),
-            |(stream, peer), certs, _| {
-                if let Some(permit) = admission.acquire() {
-                    runtime::spawn(self.clone().serve(
+impl Worker {
+    /// bind an HTTP socket and watch its certificate table until the accept loop drains.
+    pub fn bind_http(
+        self: &Rc<Self>,
+        address: SocketAddr,
+        listener: &Listener,
+    ) -> io::Result<(HttpListener, Task)> {
+        let socket = tcp::listen(address)?;
+        let binding = Rc::new(listener.binding());
+        let (certs, mut rx) = watch::channel(Rc::from(listener.tls.as_slice()));
+        let http = HttpListener { binding: binding.clone(), certs };
+        let worker = self.clone();
+        let task = async move {
+            let (connections, _) = watch::channel(false);
+            // hyper connections run independently so upgraded tunnels can finish draining.
+            tcp::accept(
+                &worker,
+                socket,
+                &mut rx,
+                &mut stream::pending::<()>(),
+                |(stream, peer), certs, permit, _| {
+                    let connection = worker.clone().serve(
                         binding.clone(),
                         certs.borrow().clone(),
                         stream,
                         peer,
                         permit,
                         connections.subscribe(),
-                    ))
-                    .detach();
-                }
-            },
-        )
-        .await?;
-        connections.send_replace(true);
-        let _ = timeout(drain, connections.closed()).await;
-        Ok(())
+                    );
+                    runtime::spawn(connection).detach();
+                },
+            )
+            .await?;
+            connections.send_replace(true);
+            let _ =
+                timeout(worker.runtime.worker_drain_timeout, connections.closed()).await;
+            Ok(())
+        };
+        Ok((http, task.boxed_local()))
     }
 
     /// retain admission through HTTP serving and any subsequent tunnel.
@@ -112,7 +110,7 @@ impl Server {
         let (stream, h2) = if listener.tls {
             let stream = tokio::select! {
                 _ = shutdown.changed() => return,
-                result = timeout(self.handshake_timeout, accept_tls(stream, &certs)) => match result {
+                result = timeout(self.runtime.tls_handshake_timeout, accept_tls(stream, &certs)) => match result {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
                         tracing::debug!(%peer, %error, "tls handshake failed");
@@ -135,18 +133,14 @@ impl Server {
             (stream, None)
         };
         drop(certs);
-        let owner = Rc::new(Owner {
-            _permit: permit,
-            shutdown: shutdown.clone(),
-            drain: self.drain_timeout,
-        });
+        let drain = self.runtime.connection_drain_timeout;
+        let owner = Rc::new(Owner { _permit: permit, shutdown: shutdown.clone(), drain });
         let service = service_fn(|request| {
-            let server = self.clone();
+            let service = self.server.service.clone();
             let listener = listener.clone();
             let owner = owner.clone();
             async move {
-                let exchange = server
-                    .service
+                let exchange = service
                     .call(&listener, peer, request.map(RequestBody::Incoming))
                     .await;
                 if let Some(tunnel) = exchange.tunnel {
@@ -167,20 +161,23 @@ impl Server {
                     }
                     _ = shutdown.changed() => {
                         connection.as_mut().graceful_shutdown();
-                        let _ = timeout(self.drain_timeout, connection).await;
+                        let _ = timeout(drain, connection).await;
                     }
                 }
             }};
         }
+        let server = &self.server;
         match h2 {
             Some(true) => {
-                let builder = self.builder.clone().http2_only();
+                let builder = server.builder.clone().http2_only();
                 serve!(builder.serve_connection(stream, service));
             }
             Some(false) => {
-                serve!(self.http1.serve_connection(stream, service).with_upgrades())
+                serve!(server.http1.serve_connection(stream, service).with_upgrades())
             }
-            None => serve!(self.builder.serve_connection_with_upgrades(stream, service)),
+            None => {
+                serve!(server.builder.serve_connection_with_upgrades(stream, service))
+            }
         }
     }
 }

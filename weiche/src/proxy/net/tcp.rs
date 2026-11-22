@@ -1,6 +1,7 @@
 //! relay opaque TCP and TLS passthrough connections with bidirectional half-close.
 use super::super::{
     super::ir::{StreamRoute, TlsSocket},
+    admission::Permit,
     config::RuntimeConfig,
     worker::{Task, Worker},
 };
@@ -14,52 +15,50 @@ use compio::{
     tls::rustls::pki_types::DnsName,
 };
 use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-/// bind a stream socket and keep the worker resources alive in its accept loop.
-pub fn bind<T: 'static>(
-    worker: &Worker,
-    address: SocketAddr,
+/// serve a stream socket and keep the worker resources alive in its accept loop.
+pub fn serve<T: 'static>(
+    worker: &Rc<Worker>,
+    socket: TcpListener,
     mut routes: watch::Receiver<T>,
     forward: impl AsyncFn(TcpStream, watch::Receiver<T>, &RuntimeConfig) -> io::Result<()>
     + 'static,
-) -> io::Result<Task> {
-    let socket = listen(address)?;
-    let admission = worker.admission.clone();
-    let config = worker.runtime.clone();
-    Ok(async move {
+) -> Task {
+    let worker = worker.clone();
+    async move {
         let mut connections = FuturesUnordered::new();
         let result = accept(
+            &worker,
             socket,
             &mut routes,
             &mut connections,
-            |(client, _), routes, tasks| {
-                if let Some(permit) = admission.acquire() {
-                    let connection = forward(client, routes.clone(), &config);
-                    tasks.push(async move {
-                        let _permit = permit;
-                        let _ = connection.await;
-                    });
-                }
+            |(client, _), routes, permit, tasks| {
+                let connection = forward(client, routes.clone(), &worker.runtime);
+                tasks.push(async move {
+                    let _permit = permit;
+                    let _ = connection.await;
+                });
             },
         )
         .await;
-        let _ = timeout(config.connection_drain_timeout, async {
+        let _ = timeout(worker.runtime.connection_drain_timeout, async {
             while connections.next().await.is_some() {}
         })
         .await;
         result
     }
-    .boxed_local())
+    .boxed_local()
 }
 
 /// keep the same compio accept pending across route changes and connection completions.
 pub async fn accept<T, S: Stream + Unpin>(
+    worker: &Worker,
     socket: TcpListener,
     routes: &mut watch::Receiver<T>,
     tasks: &mut S,
-    mut admit: impl FnMut((TcpStream, SocketAddr), &watch::Receiver<T>, &mut S),
+    mut admit: impl FnMut((TcpStream, SocketAddr), &watch::Receiver<T>, Permit, &mut S),
 ) -> io::Result<()> {
     let mut accepting = std::pin::pin!(socket.accept());
     loop {
@@ -73,7 +72,9 @@ pub async fn accept<T, S: Stream + Unpin>(
             result = &mut accepting => result?,
         };
         accepting.set(socket.accept());
-        admit(pair, routes, tasks);
+        if let Some(permit) = worker.admission.acquire() {
+            admit(pair, routes, permit, tasks);
+        }
     }
 }
 

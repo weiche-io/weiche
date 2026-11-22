@@ -43,12 +43,7 @@ pub fn bind(
     if !worker.runtime.http3 {
         return Ok(serve(listen(address)?, routes, admission, idle).boxed_local());
     }
-    let (socket, reader) = worker.group.datagrams.acquire(
-        address,
-        worker.id,
-        worker.runtime.workers.get(),
-        false,
-    )?;
+    let (socket, reader) = worker.datagram(address, false)?;
     Ok(async move {
         let result = serve(socket.clone(), routes, admission, idle).await;
         socket.close().await?;

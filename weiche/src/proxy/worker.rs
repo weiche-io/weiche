@@ -11,7 +11,7 @@ use super::{
     stopped,
 };
 use compio::runtime::time::sleep;
-use futures::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
+use futures::{StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     io,
@@ -38,13 +38,10 @@ impl HttpListener {
         if listener.binding() != *self.binding {
             return false;
         }
-        self.certs.send_if_modified(|current| {
-            if current.as_ref() == listener.tls.as_slice() {
-                return false;
-            }
-            *current = Rc::from(listener.tls.as_slice());
-            true
-        });
+        let certs = listener.tls.as_slice();
+        if self.certs.borrow().as_ref() != certs {
+            self.certs.send_replace(Rc::from(certs));
+        }
         true
     }
 }
@@ -68,7 +65,7 @@ pub struct Worker {
     /// datagram reservations and status reports for the group.
     pub group: Arc<ListenerGroup>,
     /// worker-local HTTP service shared by TCP and QUIC listeners.
-    pub server: Rc<Server>,
+    pub server: Server,
 }
 
 /// active bindings and their serving tasks on one worker.
@@ -92,7 +89,7 @@ impl Listeners {
     /// apply routes and report actual bindings after retiring obsolete socket owners.
     fn reconcile(
         &mut self,
-        worker: &Worker,
+        worker: &Rc<Worker>,
         snapshot: Arc<PublishedSnapshot>,
     ) -> anyhow::Result<bool> {
         worker.server.service.apply(&snapshot)?;
@@ -125,8 +122,9 @@ impl Listeners {
             &gateway.tls,
             update,
             |address, socket| {
+                let listener = tcp::listen(address)?;
                 let (tx, rx) = watch::channel(socket.clone());
-                Ok((tx, tcp::bind(worker, address, rx, tcp::passthrough)?))
+                Ok((tx, tcp::serve(worker, listener, rx, tcp::passthrough)))
             },
             |address, error| tracing::warn!(%address, %error, "tls listener bind failed"),
         );
@@ -138,7 +136,9 @@ impl Listeners {
             |(transport, address), next| {
                 let (routes, rx) = watch::channel(next.route.clone());
                 let task = match transport {
-                    Transport::Tcp => tcp::bind(worker, address, rx, tcp::forward)?,
+                    Transport::Tcp => {
+                        tcp::serve(worker, tcp::listen(address)?, rx, tcp::forward)
+                    }
                     Transport::Udp => udp::bind(worker, address, rx)?,
                 };
                 Ok((
@@ -159,7 +159,7 @@ impl Listeners {
     /// follow terminating HTTP bindings unless an explicit UDP route owns the address.
     fn reconcile_http3(
         &mut self,
-        worker: &Worker,
+        worker: &Rc<Worker>,
         gateway: &GatewaySnapshot,
         changed: bool,
     ) -> bool {
@@ -224,27 +224,6 @@ impl Listeners {
     }
 }
 
-impl Worker {
-    /// bind an HTTP socket with a certificate watch for new handshakes.
-    fn bind_http(
-        &self,
-        address: SocketAddr,
-        listener: &Listener,
-    ) -> io::Result<(HttpListener, Task)> {
-        let socket = tcp::listen(address)?;
-        let binding = Rc::new(listener.binding());
-        let (certs, rx) = watch::channel(Rc::from(listener.tls.as_slice()));
-        let task = self.server.clone().accept(
-            socket,
-            binding.clone(),
-            self.admission.clone(),
-            rx,
-            self.runtime.worker_drain_timeout,
-        );
-        Ok((HttpListener { binding, certs }, task.boxed_local()))
-    }
-}
-
 /// release missing or incompatible owners before opening any replacement sockets.
 fn retain<K: Ord, L, D>(
     live: &mut BTreeMap<K, L>,
@@ -286,13 +265,9 @@ fn bind_listeners<'a, K: Ord + Copy + 'a, L, D: 'a>(
 
 /// notify an existing socket only when its forwarding table changes.
 fn update<T: PartialEq>(tx: &watch::Sender<Arc<T>>, desired: &Arc<T>) {
-    tx.send_if_modified(|current| {
-        if current == desired {
-            return false;
-        }
-        *current = desired.clone();
-        true
-    });
+    if *tx.borrow() != *desired {
+        tx.send_replace(desired.clone());
+    }
 }
 
 /// drive reconciliation, serving tasks and retry timers until this worker is stopped.
@@ -307,8 +282,8 @@ pub async fn run(
     let retry_interval = runtime.listener_retry_interval;
     let snapshot = config.borrow_and_update().clone();
     let service = ProxyService::new(snapshot, &runtime)?;
-    let server = Rc::new(Server::new(service, &runtime));
-    let worker = Worker { id, runtime, admission, group, server };
+    let server = Server::new(service, &runtime);
+    let worker = Rc::new(Worker { id, runtime, admission, group, server });
     let mut listeners = Listeners::default();
     let stopping = stopped(stop);
     tokio::pin!(stopping);

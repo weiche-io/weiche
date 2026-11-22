@@ -1,8 +1,6 @@
 //! maintain one QUIC endpoint per terminating HTTPS socket on each worker.
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
-    admission::Admission,
-    config::RuntimeConfig,
     http::ProxyService,
     stopped,
     worker::{HttpListener, Task, Worker},
@@ -70,7 +68,7 @@ pub struct Listener {
     /// dynamically reloadable SNI resolver.
     pub certificates: Arc<Certificates>,
     /// closing this channel stops new handshakes and drains active connections.
-    stop: watch::Sender<bool>,
+    _stop: watch::Sender<bool>,
 }
 
 impl Drop for Listener {
@@ -83,17 +81,12 @@ impl Drop for Listener {
 impl Listener {
     /// configure the TLS identity, QUIC version and transport limits before accepting.
     pub fn bind(
-        worker: &Worker,
+        worker: &Rc<Worker>,
         address: SocketAddr,
         http: &HttpListener,
     ) -> io::Result<(Self, Task)> {
         let runtime = &worker.runtime;
-        let (socket, reader) = worker.group.datagrams.acquire(
-            address,
-            worker.id,
-            runtime.workers.get(),
-            true,
-        )?;
+        let (socket, reader) = worker.datagram(address, true)?;
         let certificates = Arc::new(Certificates::default());
         let binding = http.binding.clone();
         certificates.update(&http.certs.borrow());
@@ -119,70 +112,61 @@ impl Listener {
             endpoint.cid_generator(move || Box::new(cid::Generator(worker)));
         }
         let endpoint = Endpoint::new(socket, endpoint, Some(config), None)?;
-        let (stop, _) = watch::channel(false);
+        let (stop, shutdown) = watch::channel(false);
         let service = worker.server.service.clone();
         service.set_http3(
             &binding,
             Some(runtime.http3_advertised_port.unwrap_or(binding.port)),
         );
-        let listener = Self { binding, service, certificates, stop };
-        let task =
-            listener.serve(endpoint, worker.admission.clone(), runtime.clone(), reader);
-        Ok((listener, task.boxed_local()))
+        let task = serve(endpoint, worker.clone(), binding.clone(), shutdown, reader);
+        Ok((Self { binding, service, certificates, _stop: stop }, task.boxed_local()))
     }
+}
 
-    /// drive admissions concurrently, then bound the lifetime of all remaining work.
-    fn serve(
-        &self,
-        endpoint: Endpoint,
-        admission: Arc<Admission>,
-        config: Arc<RuntimeConfig>,
-        reader: group::Reader,
-    ) -> impl Future<Output = io::Result<()>> + use<> {
-        let binding = self.binding.clone();
-        let service = self.service.clone();
-        let shutdown = self.stop.subscribe();
-        async move {
-            let stopping = stopped(shutdown.clone());
-            tokio::pin!(stopping);
-            let mut connections = FuturesUnordered::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut stopping => break,
-                    Some(()) = connections.next(), if !connections.is_empty() => {},
-                    incoming = endpoint.wait_incoming() => {
-                        let Some(incoming) = incoming else { break };
-                        if let Some(permit) = admission.acquire() {
-                            connections.push(h3::serve(incoming, &service, &binding,
-                                &config, permit, shutdown.clone()));
-                        } else {
-                            incoming.refuse();
-                        }
-                    }
+/// drive admissions concurrently, then bound the lifetime of all remaining work.
+async fn serve(
+    endpoint: Endpoint,
+    worker: Rc<Worker>,
+    binding: Rc<Binding>,
+    shutdown: watch::Receiver<bool>,
+    reader: group::Reader,
+) -> io::Result<()> {
+    let stopping = stopped(shutdown.clone());
+    tokio::pin!(stopping);
+    let mut connections = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stopping => break,
+            Some(()) = connections.next(), if !connections.is_empty() => {},
+            incoming = endpoint.wait_incoming() => {
+                let Some(incoming) = incoming else { break };
+                if let Some(permit) = worker.admission.acquire() {
+                    connections.push(h3::serve(incoming, &worker.server.service, &binding,
+                        &worker.runtime, permit, shutdown.clone()));
+                } else {
+                    incoming.refuse();
                 }
             }
-            endpoint.set_server_config(None);
-            let deadline = Instant::now() + config.worker_drain_timeout;
-            let _ = timeout_at(deadline, async {
-                while connections.next().await.is_some() {}
-            })
-            .await;
-            drop(connections);
-            endpoint.close(0x100u32.into(), b"listener removed");
-            let mut closing = Box::pin(async move {
-                let result = endpoint.shutdown().await;
-                drop(reader);
-                result
-            });
-            match timeout_at(deadline, &mut closing).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // keep the UDP slot reserved until the driver actually releases it.
-                    runtime::spawn(closing).detach();
-                    Ok(())
-                }
-            }
+        }
+    }
+    endpoint.set_server_config(None);
+    let deadline = Instant::now() + worker.runtime.worker_drain_timeout;
+    let _ =
+        timeout_at(deadline, async { while connections.next().await.is_some() {} }).await;
+    drop(connections);
+    endpoint.close(0x100u32.into(), b"listener removed");
+    let mut closing = Box::pin(async move {
+        let result = endpoint.shutdown().await;
+        drop(reader);
+        result
+    });
+    match timeout_at(deadline, &mut closing).await {
+        Ok(result) => result,
+        Err(_) => {
+            // keep the UDP slot reserved until the driver actually releases it.
+            runtime::spawn(closing).detach();
+            Ok(())
         }
     }
 }

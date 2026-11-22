@@ -1,5 +1,5 @@
 //! coordinate UDP socket ownership across workers and protocol changes.
-use super::{bind_socket, cid};
+use super::{super::worker::Worker, bind_socket, cid};
 use compio::net::UdpSocket;
 use socket2::{Protocol, Socket, Type};
 use std::{
@@ -75,19 +75,21 @@ impl Drop for Reader {
     }
 }
 
-impl Groups {
-    /// give the worker an exclusive reader and a descriptor for its compio runtime.
-    pub fn acquire(
+impl Worker {
+    /// reserve this worker's reader and a descriptor in the ordered UDP group.
+    pub fn datagram(
         &self,
         addr: SocketAddr,
-        id: usize,
-        workers: usize,
         quic: bool,
     ) -> io::Result<(UdpSocket, Reader)> {
-        let mut groups = self.0.lock().unwrap();
+        let registry = &self.group.datagrams;
+        let id = self.id;
+        let mut groups = registry.0.lock().unwrap();
         let group = match groups.entry(addr) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(Group::bind(addr, workers, quic)?),
+            Entry::Vacant(entry) => {
+                entry.insert(Group::bind(addr, self.runtime.workers.get(), quic)?)
+            }
         };
         let slot = &mut group.sockets[id];
         if group.quic != quic || slot.busy {
@@ -98,7 +100,7 @@ impl Groups {
         }
         let socket = slot.socket.try_clone();
         slot.busy = true;
-        let reader = Reader { groups: self.clone(), addr, id };
+        let reader = Reader { groups: registry.clone(), addr, id };
         drop(groups);
         Ok((UdpSocket::from_std(socket?.into())?, reader))
     }
