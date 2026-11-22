@@ -5,7 +5,7 @@ use super::{
         wire::{self, SNAPSHOT_KEY},
     },
     CONTROLLER_NAME, GatewayStores,
-    service::{OWNER, Plan},
+    service::{GATEWAY_NAME, OWNER, Plan, controlled_by},
 };
 use anyhow::{Context, ensure};
 use k8s_openapi::{
@@ -19,6 +19,7 @@ use k8s_openapi::{
         },
         rbac::v1::{Role, RoleBinding},
     },
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -85,6 +86,7 @@ pub struct LogSettings {
 }
 
 impl Default for LogSettings {
+    /// use the installation's default proxy log level and format.
     fn default() -> Self {
         Self {
             level: default_log_level(),
@@ -97,9 +99,9 @@ impl Default for LogSettings {
 #[derive(Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServiceSettings {
-    /// Kubernetes Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
+    /// gateway Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
     pub r#type: String,
-    /// Kubernetes IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
+    /// gateway IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
     pub ip_family_policy: String,
     /// optional ordered IP families (`IPv4`, `IPv6`).
     pub ip_families: Vec<String>,
@@ -110,6 +112,7 @@ pub struct ServiceSettings {
 }
 
 impl Default for ServiceSettings {
+    /// prefer dual-stack allocation and leave the Service type to installation settings.
     fn default() -> Self {
         Self {
             r#type: String::new(),
@@ -143,7 +146,7 @@ pub struct Settings {
     pub namespaces: BTreeSet<String>,
     /// container image rendered into per-Gateway proxy Deployments.
     image: String,
-    /// Kubernetes image pull policy for proxy containers.
+    /// image pull policy for proxy containers.
     pull_policy: String,
     /// image pull secrets copied onto proxy pods.
     pull_secrets: Vec<LocalObjectReference>,
@@ -191,7 +194,7 @@ pub struct Settings {
     /// extra environment variables appended to proxy containers.
     #[serde(default)]
     extra_env: Vec<EnvVar>,
-    /// Service networking defaults for every Gateway.
+    /// networking defaults for every Gateway Service.
     #[serde(default)]
     service: ServiceSettings,
     /// legacy flat serviceType field retained for backward compatibility.
@@ -309,10 +312,12 @@ struct Target<'a> {
     namespace: &'a str,
     /// deterministic resource name (`weiche-gw-<uid>`).
     name: &'a str,
-    /// Helm release instance label isolating multi-release ownership.
+    /// gateway name used in the standard infrastructure label.
+    gateway_name: &'a str,
+    /// release instance label isolating multi-release ownership.
     instance: &'a str,
     /// controller ownerReference pointing back to the Gateway.
-    owner: &'a Value,
+    owner: &'a OwnerReference,
     /// optional Gateway-level labels and annotations to propagate.
     infra: Option<&'a GatewayInfrastructure>,
 }
@@ -325,6 +330,12 @@ impl Applied {
     /// forget cached applies after the drift check interval.
     pub fn expire(&mut self) {
         self.0.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(30));
+    }
+
+    /// forget retired resources so an eligible gateway can recreate them immediately.
+    pub fn forget(&mut self, namespace: &str, name: &str) {
+        self.0
+            .retain(|(ns, resource, _), _| ns != namespace || resource != name);
     }
 
     /// create or update fields owned by this gateway.
@@ -349,6 +360,7 @@ impl Applied {
                 }
             }
         }
+        fields["metadata"]["labels"][GATEWAY_NAME] = json!(target.gateway_name);
         fields["metadata"]["labels"]["app.kubernetes.io/managed-by"] = json!("weiche");
         fields["metadata"]["labels"]["app.kubernetes.io/instance"] =
             json!(target.instance);
@@ -368,10 +380,7 @@ impl Applied {
         );
         if let Some(old) = api.get_opt(target.name).await? {
             ensure!(
-                old.owner_references()
-                    .iter()
-                    .any(|r| r.controller == Some(true)
-                        && json!(r.uid) == target.owner["uid"]),
+                controlled_by(&old, &target.owner.uid),
                 "{} {}/{} has another owner",
                 kind.kind,
                 target.namespace,
@@ -407,36 +416,54 @@ pub async fn reconcile(
     plan: &mut Plan,
     snapshot: &GatewaySnapshot,
 ) -> anyhow::Result<()> {
+    plan.programmed = false;
+    plan.addresses.clear();
     let g = &plan.gateway;
     let ns = g.namespace().context("missing gateway namespace")?;
     let uid = g.uid().context("missing gateway uid")?;
     // a distinct prefix also allows migration from the legacy GatewayClass-owned Services.
     let name = format!("weiche-gw-{uid}");
-    let mut owner = g.controller_owner_ref(&()).context("missing gateway owner")?;
-    owner.block_owner_deletion = None;
-    let owner = json!(owner);
-    let labels = json!({(OWNER):uid});
-    // withdraw the previous routes if an oversized replacement cannot be delivered.
-    let payload = snapshot.encode().or_else(|err| {
-        plan.issue = Some(err.to_string());
-        GatewaySnapshot::default().encode()
-    })?;
-    let revision = wire::version(&payload);
-    let infra = g.spec.infrastructure.as_ref();
+    let existing_service = stores
+        .services
+        .get(&ObjectRef::new(&name).within(&ns))
+        .filter(|service| controlled_by(service.as_ref(), &uid));
+    let existing_report = stores
+        .config_maps
+        .get(&ObjectRef::new(&name).within(&ns))
+        .filter(|report| controlled_by(report.as_ref(), &uid));
     let requested_ips = match requested_addresses(g, &settings.service) {
-        Ok(ips) => ips,
+        Ok(ips) => Some(ips),
         Err(message) => {
             plan.issue_reason = Some("AddressNotAssigned");
             plan.issue = Some(message);
-            return Ok(());
+            None
         }
     };
+    let payload = if plan.accepted() && plan.issue.is_none() && !snapshot.is_empty() {
+        snapshot
+            .encode()
+            .inspect_err(|err| plan.issue = Some(err.to_string()))
+            .ok()
+    } else {
+        None
+    };
+    let active = payload.is_some();
+    let payload = match payload {
+        Some(payload) => payload,
+        None if existing_service.is_none() && existing_report.is_none() => return Ok(()),
+        // withdraw routes and private keys when a provisioned gateway cannot serve.
+        None => GatewaySnapshot::default().encode()?,
+    };
+    let revision = wire::version(&payload);
+    let mut owner = g.controller_owner_ref(&()).context("missing gateway owner")?;
+    owner.block_owner_deletion = None;
     let target = Target {
         namespace: &ns,
         name: &name,
+        gateway_name: &g.name_any(),
         instance: &settings.release,
         owner: &owner,
-        infra,
+        infra: g.spec.infrastructure.as_ref(),
     };
     applied.ensure::<ConfigMap>(client, &target, json!({})).await?;
     applied
@@ -455,41 +482,27 @@ pub async fn reconcile(
     applied
         .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
         .await?;
-    // an empty snapshot has no sockets for a proxy to serve or acknowledge.
-    let replicas = if plan.issue.is_none() && plan.listeners.iter().any(|l| l.accepted) {
-        settings.replicas
-    } else {
-        0
-    };
+    let replicas = if active { settings.replicas } else { 0 };
+    let selector = json!({(OWNER):uid});
     applied
         .ensure::<Deployment>(
             client,
             &target,
-            proxy_deployment(&name, &uid, &labels, settings, infra, replicas),
+            proxy_deployment(&target, &selector, settings, replicas),
         )
         .await?;
-    applied
-        .ensure::<Service>(
-            client,
-            &target,
-            proxy_service(
-                &labels,
-                plan.ports(settings.http3.enabled),
-                settings,
-                &requested_ips,
-            ),
-        )
-        .await?;
-    let Some(service) = stores.services.get(&ObjectRef::new(&name).within(&ns)) else {
-        return Ok(());
-    };
-    if !service
-        .owner_references()
-        .iter()
-        .any(|r| r.uid == uid && r.controller == Some(true))
-    {
-        return Ok(());
+    let Some(ips) = requested_ips else { return Ok(()) };
+    let ports = plan.ports(settings.http3.enabled);
+    if !ports.is_empty() {
+        applied
+            .ensure::<Service>(
+                client,
+                &target,
+                proxy_service(&selector, ports, settings, &ips),
+            )
+            .await?;
     }
+    let Some(service) = existing_service else { return Ok(()) };
     plan.addresses = if settings.service.r#type == "LoadBalancer" {
         service
             .status
@@ -514,14 +527,14 @@ pub async fn reconcile(
             .map(|ip| ("IPAddress".into(), ip.clone()))
             .collect()
     };
-    let Some(report) = stores.config_maps.get(&ObjectRef::new(&name).within(&ns)) else {
-        return Ok(());
-    };
+    let Some(report) = existing_report else { return Ok(()) };
     let acknowledgements = report.data.as_ref();
     let service_uid = service.uid().context("missing service uid")?;
     let mut members = BTreeSet::new();
+    let mut acknowledged = false;
     for slice in stores.endpoint_slices.state() {
         if slice.namespace().as_deref() != Some(&ns)
+            || slice.metadata.deletion_timestamp.is_some()
             || !slice.owner_references().iter().any(|r| r.uid == service_uid)
         {
             continue;
@@ -537,7 +550,7 @@ pub async fn reconcile(
                 .is_some_and(|c| c.ready == Some(true) && c.terminating != Some(true))
                 && acknowledgements.and_then(|a| a.get(pod)) == Some(&revision)
             {
-                plan.programmed = !plan.addresses.is_empty();
+                acknowledged = true;
             }
         }
     }
@@ -561,6 +574,7 @@ pub async fn reconcile(
             )
             .await?;
     }
+    plan.programmed = active && !plan.addresses.is_empty() && acknowledged;
     Ok(())
 }
 
@@ -674,18 +688,19 @@ fn requested_addresses(
 
 /// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
 fn proxy_deployment(
-    name: &str,
-    uid: &str,
+    target: &Target<'_>,
     selector: &Value,
     settings: &Settings,
-    infra: Option<&GatewayInfrastructure>,
     replicas: i32,
 ) -> Value {
+    let name = target.name;
+    let infra = target.infra;
     let mut pod_labels = settings.pod_labels.clone();
     if let Some(labels) = infra.and_then(|i| i.labels.as_ref()) {
         pod_labels.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    pod_labels.insert(OWNER.into(), uid.into());
+    pod_labels.insert(OWNER.into(), target.owner.uid.clone());
+    pod_labels.insert(GATEWAY_NAME.into(), target.gateway_name.into());
     pod_labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
     pod_labels.insert("app.kubernetes.io/instance".into(), settings.release.clone());
 

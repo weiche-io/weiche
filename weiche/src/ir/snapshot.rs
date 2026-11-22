@@ -12,6 +12,7 @@ pub struct ForwardingPolicy {
 }
 
 impl Default for ForwardingPolicy {
+    /// allow ten seconds to receive upstream response headers.
     fn default() -> Self {
         Self { response_header_timeout: Duration::from_secs(10) }
     }
@@ -82,6 +83,11 @@ pub struct GatewaySnapshot {
 }
 
 impl GatewaySnapshot {
+    /// check whether the snapshot has any listeners for a worker to bind.
+    pub fn is_empty(&self) -> bool {
+        self.sockets.is_empty() && self.streams.is_empty() && self.tls.is_empty()
+    }
+
     /// prefer exact SNI, then the longest wildcard suffix, then an unrestricted listener.
     pub fn order_certificates(&mut self) {
         for socket in self.sockets.values_mut() {

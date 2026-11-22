@@ -89,7 +89,10 @@ impl Desired {
                     .filter(|(_, s)| http3 && !s.listener.tls.is_empty())
                     .map(|(addr, _)| (Transport::Udp, *addr)),
             )
-            .collect();
+            .collect::<BTreeSet<_>>();
+        if sockets.is_empty() {
+            tracing::info!(secret = %secret.name_any(), "snapshot has no active listeners; proxy readiness withdrawn");
+        }
         Ok(Self {
             version: wire::version(bytes),
             revision: tx.publish(snapshot),

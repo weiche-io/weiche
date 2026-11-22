@@ -16,6 +16,17 @@ use weiche_gtwapi::v1::gateways::Gateway;
 /// label identifying the gateway that owns a workload.
 pub const OWNER: &str = "weiche.io/gateway-uid";
 
+/// standard Gateway API label for resources provisioned for a Gateway.
+pub const GATEWAY_NAME: &str = "gateway.networking.k8s.io/gateway-name";
+
+/// check the controller owner reference before using a provisioned resource.
+pub fn controlled_by(resource: &impl ResourceExt, uid: &str) -> bool {
+    resource
+        .owner_references()
+        .iter()
+        .any(|r| r.controller == Some(true) && r.uid == uid)
+}
+
 /// controller decisions and the observed serving state for this Gateway.
 pub struct Plan {
     /// gateway observed during this reconciliation.
@@ -112,23 +123,28 @@ impl Plan {
         (Self { listeners, ..Self::new(gateway) }, snapshot)
     }
 
-    /// expose each requested port once across virtual hosts sharing a transport.
+    /// check that the gateway is eligible and has at least one accepted listener.
+    pub fn accepted(&self) -> bool {
+        !self.denied
+            && !self.invalid_parameters
+            && self.listeners.iter().any(|l| l.accepted)
+    }
+
+    /// expose each accepted port once across virtual hosts sharing a transport.
     pub fn ports(&self, http3: bool) -> Vec<serde_json::Value> {
-        let declared = &self.gateway.spec.listeners;
-        let mut ports: BTreeSet<_> = declared
+        let mut ports = BTreeSet::new();
+        for (listener, result) in self
+            .gateway
+            .spec
+            .listeners
             .iter()
-            .map(|l| (Transport::for_protocol(&l.protocol), l.port))
-            .collect();
-        if http3 {
-            ports.extend(
-                declared
-                    .iter()
-                    .zip(&self.listeners)
-                    .filter(|(listener, result)| {
-                        listener.protocol == "HTTPS" && result.accepted
-                    })
-                    .map(|(listener, _)| (Transport::Udp, listener.port)),
-            );
+            .zip(&self.listeners)
+            .filter(|(_, result)| result.accepted)
+        {
+            ports.insert((result.transport, listener.port));
+            if http3 && listener.protocol == "HTTPS" {
+                ports.insert((Transport::Udp, listener.port));
+            }
         }
         ports.into_iter().map(|(transport, port)| {
             let protocol = transport.protocol();

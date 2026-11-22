@@ -278,7 +278,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
         .as_ref()
         .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let generation = gateway.metadata.generation;
-    let accepted = plan.listeners.iter().any(|l| l.accepted);
+    let accepted = plan.accepted();
     let all_valid = plan.listeners.iter().all(|l| l.accepted);
     let programmed = plan.programmed && accepted;
     let mut desired = old.clone();

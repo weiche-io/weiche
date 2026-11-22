@@ -143,7 +143,7 @@ async fn lead(
             retry = true;
         }
         if let Err(error) =
-            super::cleanup::retired(client, stores, settings, &plans).await
+            super::cleanup::retired(client, stores, settings, &plans, &mut applied).await
         {
             tracing::warn!(%error, "could not retire gateway resources");
             retry = true;
