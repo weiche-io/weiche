@@ -1,5 +1,5 @@
 //! report gateway and route conditions for the applied worker revision.
-use super::{CONTROLLER_NAME, GatewayStores, compile::RouteReport, service::Plan};
+use super::{GatewayStores, compile::RouteReport, service::Plan};
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
@@ -80,13 +80,14 @@ where
 pub async fn update_status(
     client: &Client,
     stores: &GatewayStores,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()> {
     for class in stores
         .gateway_classes
         .state()
         .into_iter()
-        .filter(|c| c.spec.controller_name == CONTROLLER_NAME)
+        .filter(|c| c.spec.controller_name == controller_name)
     {
         let class_old = class
             .status
@@ -147,7 +148,7 @@ pub async fn update_status(
     for plan in plans {
         update_gateway(client, plan).await?;
     }
-    update_policies(client, stores, plans).await?;
+    update_policies(client, stores, controller_name, plans).await?;
 
     /// publish parent conditions for each supported route kind.
     macro_rules! routes {
@@ -161,7 +162,7 @@ pub async fn update_status(
                     client.clone(),
                     &route.namespace().unwrap_or_default(),
                 );
-                update_route(api, route.as_ref(), old, plans).await?;
+                update_route(api, route.as_ref(), old, controller_name, plans).await?;
             }
         };
     }
@@ -178,6 +179,7 @@ async fn update_route<K>(
     api: Api<K>,
     route: &K,
     old: Value,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()>
 where
@@ -191,7 +193,7 @@ where
         .get("parents")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let owned_parent = |p: &Value| p["controllerName"] == CONTROLLER_NAME;
+    let owned_parent = |p: &Value| p["controllerName"] == controller_name;
     let mut parents: Vec<_> =
         old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
     let mut reports = std::collections::BTreeMap::new();
@@ -257,7 +259,7 @@ where
         }
         let conditions = stamp(conditions, previous.and_then(|p| p.get("conditions")));
         parents.push(json!({
-            "controllerName": CONTROLLER_NAME,
+            "controllerName": controller_name,
             "parentRef": parent,
             "conditions": conditions,
         }));
@@ -401,6 +403,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
 async fn update_policies(
     client: &Client,
     stores: &GatewayStores,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()> {
     let mut reports = HashMap::<_, BTreeMap<_, _>>::new();
@@ -425,7 +428,7 @@ async fn update_policies(
         let entries = old["ancestors"].as_array().map_or(&[][..], Vec::as_slice);
         let owned = |p: &Value| {
             let ancestor = &p["ancestorRef"];
-            p["controllerName"] == CONTROLLER_NAME
+            p["controllerName"] == controller_name
                 && ancestor["kind"] == "Gateway"
                 && ancestor["group"] == "gateway.networking.k8s.io"
         };
@@ -476,7 +479,7 @@ async fn update_policies(
                     "group": "gateway.networking.k8s.io", "kind": "Gateway",
                     "name": name, "namespace": namespace
                 },
-                "controllerName": CONTROLLER_NAME,
+                "controllerName": controller_name,
                 "conditions": conditions
             }));
         }

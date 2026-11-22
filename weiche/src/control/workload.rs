@@ -4,7 +4,7 @@ use super::{
         GatewaySnapshot,
         wire::{self, SNAPSHOT_KEY},
     },
-    GatewayStores,
+    CONTROLLER_NAME, GatewayStores,
     service::{OWNER, Plan},
 };
 use anyhow::{Context, ensure};
@@ -31,27 +31,74 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// default Helm release instance label for generated workloads.
+fn default_release() -> String {
+    "weiche".into()
+}
+
+/// default GatewayClass controllerName owned by this installation.
+fn default_controller_name() -> String {
+    CONTROLLER_NAME.into()
+}
+
+/// default leader-election Lease name in the release namespace.
+fn default_lease_name() -> String {
+    "weiche-controller".into()
+}
+
+/// default provisioner RoleBinding and ClusterRole name in authorized namespaces.
+fn default_provisioner_binding() -> String {
+    "weiche-gateway-provisioner".into()
+}
+
 /// installation policy supplied by the platform, outside of tenant-writable Gateway specs.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// release instance name used to isolate multi-release workloads.
+    #[serde(default = "default_release")]
+    pub release: String,
+    /// gateway class controller name matched by this controller.
+    #[serde(default = "default_controller_name")]
+    pub controller_name: String,
+    /// coordination Lease name used for leader election.
+    #[serde(default = "default_lease_name")]
+    pub lease_name: String,
+    /// provisioner RoleBinding and ClusterRole name checked by proxies.
+    #[serde(default = "default_provisioner_binding")]
+    pub provisioner_binding: String,
+    /// local IP address bound by proxy listeners.
     pub bind_address: std::net::IpAddr,
+    /// namespaces authorized to host Gateway proxy workloads.
     pub namespaces: BTreeSet<String>,
+    /// container image rendered into per-Gateway proxy Deployments.
     image: String,
+    /// Kubernetes image pull policy for proxy containers.
     pull_policy: String,
+    /// image pull secrets copied onto proxy pods.
     pull_secrets: Vec<LocalObjectReference>,
+    /// container resource requests and limits for proxy pods.
     resources: ResourceRequirements,
+    /// seccomp profile required for proxy io_uring workers.
     seccomp_profile: SeccompProfile,
+    /// desired proxy Deployment replica count.
     replicas: i32,
+    /// compio worker thread count inside each proxy pod.
     workers: std::num::NonZeroUsize,
+    /// Kubernetes Service type provisioned for each Gateway.
     service_type: String,
 }
 impl Settings {
+    /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
         let settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
         ensure!(
-            !settings.namespaces.is_empty()
+            !settings.release.is_empty()
+                && !settings.controller_name.is_empty()
+                && !settings.lease_name.is_empty()
+                && !settings.provisioner_binding.is_empty()
+                && !settings.namespaces.is_empty()
                 && settings.replicas > 0
                 && !settings.image.is_empty(),
             "invalid proxy installation settings"
@@ -78,6 +125,7 @@ impl Applied {
         client: &Client,
         namespace: &str,
         name: &str,
+        instance: &str,
         owner: &Value,
         mut fields: Value,
     ) -> anyhow::Result<()> {
@@ -85,6 +133,7 @@ impl Applied {
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
         fields["metadata"]["labels"]["app.kubernetes.io/managed-by"] = json!("weiche");
+        fields["metadata"]["labels"]["app.kubernetes.io/instance"] = json!(instance);
         fields["metadata"]["name"] = json!(name);
         fields["metadata"]["namespace"] = json!(namespace);
         fields["metadata"]["ownerReferences"] = json!([owner]);
@@ -144,13 +193,14 @@ pub async fn reconcile(
     })?;
     let revision = wire::version(&payload);
     applied
-        .ensure::<ConfigMap>(client, &ns, &name, &owner, json!({}))
+        .ensure::<ConfigMap>(client, &ns, &name, &settings.release, &owner, json!({}))
         .await?;
     applied
         .ensure::<Secret>(
             client,
             &ns,
             &name,
+            &settings.release,
             &owner,
             json!({
                 "type":"weiche.io/snapshot", "data":{(SNAPSHOT_KEY):ByteString(payload)}
@@ -158,19 +208,41 @@ pub async fn reconcile(
         )
         .await?;
     applied
-        .ensure::<ServiceAccount>(client, &ns, &name, &owner, json!({}))
+        .ensure::<ServiceAccount>(
+            client,
+            &ns,
+            &name,
+            &settings.release,
+            &owner,
+            json!({}),
+        )
         .await?;
     applied
-        .ensure::<Role>(client, &ns, &name, &owner, proxy_role(&name))
+        .ensure::<Role>(
+            client,
+            &ns,
+            &name,
+            &settings.release,
+            &owner,
+            proxy_role(&name, &settings.provisioner_binding),
+        )
         .await?;
     applied
-        .ensure::<RoleBinding>(client, &ns, &name, &owner, proxy_role_binding(&name, &ns))
+        .ensure::<RoleBinding>(
+            client,
+            &ns,
+            &name,
+            &settings.release,
+            &owner,
+            proxy_role_binding(&name, &ns),
+        )
         .await?;
     applied
         .ensure::<Deployment>(
             client,
             &ns,
             &name,
+            &settings.release,
             &owner,
             proxy_deployment(&name, &labels, settings),
         )
@@ -180,6 +252,7 @@ pub async fn reconcile(
             client,
             &ns,
             &name,
+            &settings.release,
             &owner,
             proxy_service(&labels, plan.ports(), settings),
         )
@@ -268,7 +341,8 @@ pub async fn reconcile(
     Ok(())
 }
 
-fn proxy_role(name: &str) -> Value {
+/// render least-privilege RBAC for one proxy pod.
+fn proxy_role(name: &str, provisioner_binding: &str) -> Value {
     json!({
         "rules": [
             {
@@ -286,7 +360,7 @@ fn proxy_role(name: &str) -> Value {
             {
                 "apiGroups": ["rbac.authorization.k8s.io"],
                 "resources": ["rolebindings"],
-                "resourceNames": ["weiche-gateway-provisioner"],
+                "resourceNames": [provisioner_binding],
                 "verbs": ["get"],
             },
         ]
@@ -335,6 +409,7 @@ fn proxy_deployment(name: &str, labels: &Value, settings: &Settings) -> Value {
                         "resources": settings.resources,
                         "env": [
                             {"name": "WEICHE_WORKERS", "value": settings.workers.to_string()},
+                            {"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding},
                             {"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
                         ],
                         "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],

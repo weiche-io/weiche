@@ -55,6 +55,12 @@ pub async fn retired(
         {
             continue;
         }
+        let instance = cm.labels().get("app.kubernetes.io/instance").map(String::as_str);
+        if instance != Some(settings.release.as_str())
+            && !(instance.is_none() && settings.release == "weiche")
+        {
+            continue;
+        }
         let Some(owner) = cm.owner_references().iter().find(|r| {
             r.controller == Some(true)
                 && r.kind == "Gateway"

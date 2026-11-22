@@ -96,12 +96,17 @@ impl Desired {
     }
 }
 
+/// default RoleBinding and ClusterRole name granting namespace authorization.
+const DEFAULT_PROVISIONER_BINDING: &str = "weiche-gateway-provisioner";
+
 /// a withdrawn Helm namespace binding also withdraws permission to serve cached routes.
-async fn authorized(bindings: &Api<RoleBinding>) -> anyhow::Result<bool> {
-    match bindings.get_opt("weiche-gateway-provisioner").await {
+async fn authorized(
+    bindings: &Api<RoleBinding>,
+    binding_name: &str,
+) -> anyhow::Result<bool> {
+    match bindings.get_opt(binding_name).await {
         Ok(binding) => Ok(binding.is_some_and(|b| {
-            b.role_ref.kind == "ClusterRole"
-                && b.role_ref.name == "weiche-gateway-provisioner"
+            b.role_ref.kind == "ClusterRole" && b.role_ref.name == binding_name
         })),
         Err(kube::Error::Api(e)) if e.code == 403 => Ok(false),
         Err(e) => Err(e.into()),
@@ -119,8 +124,15 @@ pub async fn run(
     let client = Client::try_default().await?;
     let ns = client.default_namespace();
     let pod = std::env::var("POD_UID").context("missing pod UID")?;
+    let binding_name = std::env::var("WEICHE_PROVISIONER_BINDING")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVISIONER_BINDING.to_owned());
     let bindings = Api::<RoleBinding>::namespaced(client.clone(), ns);
-    ensure!(authorized(&bindings).await?, "gateway namespace authorization withdrawn");
+    ensure!(
+        authorized(&bindings, &binding_name).await?,
+        "gateway namespace authorization withdrawn"
+    );
     let reports = Api::<ConfigMap>::namespaced(client.clone(), ns);
     let secrets = Api::<Secret>::namespaced(client.clone(), ns);
     let (store, writer) = reflector::store();
@@ -172,7 +184,7 @@ pub async fn run(
             _ = &mut stop => break,
             change = workers.changed() => { change.context("worker reports stopped")?; }
             _ = refresh.tick() => {
-                match authorized(&bindings).await {
+                match authorized(&bindings, &binding_name).await {
                     Ok(false) => { tracing::info!("gateway namespace authorization withdrawn"); break; }
                     Ok(true) => refresh_due = true,
                     Err(error) => tracing::warn!(%error, "could not refresh namespace authorization"),
