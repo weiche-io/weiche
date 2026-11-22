@@ -4,6 +4,7 @@ use super::super::{
     admission::Admission,
     config::RuntimeConfig,
 };
+pub use super::listen_tcp as listen;
 use compio::{
     BufResult,
     buf::{IntoInner, IoBufExt},

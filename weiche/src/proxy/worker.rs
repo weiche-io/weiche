@@ -7,7 +7,7 @@ use super::{
     admission::Admission,
     config::{Reader, RuntimeConfig},
     http::{ProxyService, server::Server},
-    net::{ListenerGroup, WorkerStatus, listen_tcp, quic, tcp, udp},
+    net::{ListenerGroup, WorkerStatus, quic, tcp, udp},
     stopped,
 };
 use compio::runtime::time::sleep;
@@ -138,7 +138,7 @@ impl Listeners {
             if self.http.contains_key(&address) {
                 continue;
             }
-            let socket = match listen_tcp(address) {
+            let socket = match tcp::listen(address) {
                 Ok(socket) => socket,
                 Err(error) => {
                     tracing::warn!(%address, %error, "listener bind failed");
@@ -246,7 +246,7 @@ impl Listeners {
                 update(tx, socket);
                 continue;
             }
-            match listen_tcp(address) {
+            match tcp::listen(address) {
                 Ok(listener) => {
                     let (tx, rx) = watch::channel(socket.clone());
                     self.serving.push(
@@ -277,27 +277,7 @@ impl Listeners {
             }
             let (tx, rx) = watch::channel(listener.route.clone());
             let (transport, address) = key;
-            let task = match transport {
-                Transport::Tcp => listen_tcp(address).map(|socket| {
-                    tcp::serve(
-                        socket,
-                        rx,
-                        self.admission.clone(),
-                        self.runtime.clone(),
-                        tcp::forward,
-                    )
-                    .boxed_local()
-                }),
-                Transport::Udp => udp::bind(
-                    address,
-                    self.id,
-                    &self.group.datagrams,
-                    &self.runtime,
-                    rx,
-                    self.admission.clone(),
-                ),
-            };
-            match task {
+            match self.bind_stream(transport, address, rx) {
                 Ok(task) => {
                     self.serving.push(task);
                     self.streams.insert(
@@ -313,6 +293,37 @@ impl Listeners {
                     tracing::warn!(%address, ?transport, %error, "transport listener bind failed")
                 }
             }
+        }
+    }
+
+    /// bind a raw listener and return the task that owns its socket.
+    fn bind_stream(
+        &self,
+        transport: Transport,
+        address: SocketAddr,
+        routes: watch::Receiver<Arc<StreamRoute>>,
+    ) -> io::Result<Task> {
+        let admission = self.admission.clone();
+        match transport {
+            Transport::Tcp => {
+                let listener = tcp::listen(address)?;
+                let task = tcp::serve(
+                    listener,
+                    routes,
+                    admission,
+                    self.runtime.clone(),
+                    tcp::forward,
+                );
+                Ok(task.boxed_local())
+            }
+            Transport::Udp => udp::bind(
+                address,
+                self.id,
+                &self.group.datagrams,
+                &self.runtime,
+                routes,
+                admission,
+            ),
         }
     }
 
