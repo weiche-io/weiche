@@ -7,7 +7,7 @@ mod pool;
 mod upgrade;
 mod upstream;
 
-pub use deadline::{Deadlines, ResponseDeadline, TimedBody};
+pub use deadline::{Deadlines, TimedBody};
 pub use pool::{ConnectionPool, PooledBody};
 pub use upgrade::{Tunnel, Upgrade};
-pub use upstream::UpstreamClient;
+pub use upstream::{Exchange, UpstreamClient};

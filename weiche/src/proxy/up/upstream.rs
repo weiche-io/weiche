@@ -1,8 +1,8 @@
 //! request dispatch and conservative retry over the worker's connection pool.
-use super::super::http::RequestBody;
+use super::super::http::{RequestBody, ResponseBody};
 use super::{
     super::super::ir::Protocol,
-    deadline::{Deadlines, ResponseDeadline, TimedBody},
+    deadline::{Deadlines, TimedBody},
     pool::{ConnectionPool, Endpoint, PooledBody},
     upgrade::{Tunnel, Upgrade},
 };
@@ -11,10 +11,33 @@ use std::{rc::Rc, time::Instant};
 
 /// a response with its streaming budget and optional upgraded transport.
 pub struct Exchange {
-    /// backend response with a lease for the lifetime of its body.
-    pub response: Response<TimedBody<PooledBody>>,
+    /// downstream response with its local payload or leased backend body.
+    pub response: Response<ResponseBody>,
     /// dedicated connection after a validated switching response.
     pub tunnel: Option<Tunnel>,
+    /// absolute cutoff for streaming and flushing the response.
+    pub deadline: Option<Instant>,
+}
+
+impl Exchange {
+    /// complete a local response without an upstream transport or attempt deadline.
+    pub fn local(response: Response<ResponseBody>) -> Self {
+        Self { response, tunnel: None, deadline: None }
+    }
+
+    /// use the same attempt cutoff for backend frames and the downstream flush.
+    fn upstream(
+        response: Response<PooledBody>,
+        tunnel: Option<Tunnel>,
+        deadline: Option<Instant>,
+    ) -> Self {
+        Self {
+            response: response
+                .map(|body| ResponseBody::Upstream(TimedBody::new(body, deadline))),
+            tunnel,
+            deadline,
+        }
+    }
 }
 
 /// only requests returned untouched by hyper are eligible for another attempt.
@@ -56,12 +79,7 @@ impl UpstreamClient {
                 }
             };
             match budget.dispatch(end, attempt).await? {
-                Attempt::Complete(mut exchange) => {
-                    if let Some(end) = end {
-                        exchange.response.extensions_mut().insert(ResponseDeadline(end));
-                    }
-                    return Ok(exchange);
-                }
+                Attempt::Complete(exchange) => return Ok(exchange),
                 Attempt::Retry(untouched) => request = untouched,
             }
         }
@@ -102,10 +120,7 @@ impl UpstreamClient {
         } else {
             (response.map(|b| lease.into_body(b)), None)
         };
-        Ok(Attempt::Complete(Exchange {
-            response: response.map(|b| TimedBody::new(b, end)),
-            tunnel,
-        }))
+        Ok(Attempt::Complete(Exchange::upstream(response, tunnel, end)))
     }
 
     /// retire a stale HTTP/2 sender before retrying an undispatched stream.
@@ -121,10 +136,11 @@ impl UpstreamClient {
             .try_send_request(request.map(|body| TimedBody::new(lease.upload(body), end)))
             .await
         {
-            Ok(response) => Ok(Attempt::Complete(Exchange {
-                response: response.map(|body| TimedBody::new(lease.into_body(body), end)),
-                tunnel: None,
-            })),
+            Ok(response) => Ok(Attempt::Complete(Exchange::upstream(
+                response.map(|body| lease.into_body(body)),
+                None,
+                end,
+            ))),
             Err(mut error) => {
                 let Some(request) = error.take_message() else {
                     return Err(error.into_error().into());

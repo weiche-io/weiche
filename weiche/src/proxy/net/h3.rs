@@ -5,7 +5,6 @@ use super::super::{
     config::RuntimeConfig,
     http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
     stopped,
-    up::ResponseDeadline,
 };
 use bytes::{Buf, Bytes};
 use compio::{
@@ -190,11 +189,10 @@ where
     let req = req
         .map(|()| RequestBody::Stream(Box::pin(upload(recv, length, malformed.clone()))));
     let exchange = async {
-        let (response, _) = service.call(binding, peer, req).await;
-        let deadline = response.extensions().get::<ResponseDeadline>().copied();
-        let write = respond(&mut send, response, head);
-        match deadline {
-            Some(ResponseDeadline(end)) => timeout_at(end, write).await?,
+        let reply = service.call(binding, peer, req).await;
+        let write = respond(&mut send, reply.response, head);
+        match reply.deadline {
+            Some(end) => timeout_at(end, write).await?,
             None => write.await,
         }
     };

@@ -152,14 +152,14 @@ impl Server {
             let listener = listener.clone();
             let owner = owner.clone();
             async move {
-                let (response, tunnel) = server
+                let exchange = server
                     .service
                     .call(&listener, peer, request.map(RequestBody::Incoming))
                     .await;
-                if let Some(tunnel) = tunnel {
+                if let Some(tunnel) = exchange.tunnel {
                     compio::runtime::spawn(owner.relay(tunnel)).detach();
                 }
-                Ok::<_, std::convert::Infallible>(response)
+                Ok::<_, std::convert::Infallible>(exchange.response)
             }
         });
         /// drive each hyper connection type through the same graceful shutdown path.

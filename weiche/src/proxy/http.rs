@@ -12,7 +12,7 @@ use super::{
     },
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
-    up::{ConnectionPool, Deadlines, Tunnel, UpstreamClient},
+    up::{ConnectionPool, Deadlines, Exchange, UpstreamClient},
 };
 pub use body::{RequestBody, ResponseBody};
 use bytes::Bytes;
@@ -235,48 +235,50 @@ impl ProxyService {
         listener: &Binding,
         peer: SocketAddr,
         mut request: Request<RequestBody>,
-    ) -> (Response<ResponseBody>, Option<Tunnel>) {
+    ) -> Exchange {
         let start = Instant::now();
         let version = request.version();
-        let advertise = |mut response: Response<ResponseBody>| {
+        let advertise = |mut exchange: Exchange| {
             if listener.tls
                 && version != Version::HTTP_3
                 && let Some((active, value)) =
                     self.advertised.borrow().get(&listener.address)
                 && **active == *listener
             {
-                response
+                exchange
+                    .response
                     .headers_mut()
                     .entry(header::ALT_SVC)
                     .or_insert_with(|| value.clone());
             }
-            response
+            exchange
         };
         if request.method() == http::Method::CONNECT
             || (version == Version::HTTP_3
                 && request.headers().contains_key(header::UPGRADE))
         {
-            return (advertise(ProxyError::UnsupportedUpgrade.response()), None);
+            return advertise(ProxyError::UnsupportedUpgrade.response());
         }
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
-            Err(error) => return (advertise(error.response()), None),
+            Err(error) => return advertise(error.response()),
         };
         let grpc = is_grpc(&request);
         let selection = match self.select(listener, &authority, &request, start, grpc) {
             Ok(s) => s,
-            Err(error) => return (advertise(error.for_request(grpc)), None),
+            Err(error) => return advertise(error.for_request(grpc)),
         };
-        let (response, tunnel) = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
+        let exchange = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
             let mut response = Response::new(ResponseBody::full(Bytes::new()));
             *response.status_mut() = StatusCode::NO_CONTENT;
-            (response, None)
+            Exchange::local(response)
         } else {
             self.forward(listener, peer, request, &authority, &selection)
                 .await
-                .unwrap_or_else(|error| (error.for_request(selection.grpc), None))
+                .unwrap_or_else(|error| error.for_request(selection.grpc))
         };
-        let mut response = advertise(response);
+        let mut exchange = advertise(exchange);
+        let response = &mut exchange.response;
         *response.version_mut() = version;
         let headers = response.headers_mut();
         let backend_changes = selection
@@ -293,13 +295,13 @@ impl ProxyService {
         {
             response.headers_mut().remove(header::CONTENT_LENGTH);
         }
-        if let Some(tunnel) = &tunnel {
+        if let Some(tunnel) = &exchange.tunnel {
             tunnel.restore(response.headers_mut());
         }
         if let Some(cors) = selection.cors {
             cors.apply(response.headers_mut());
         }
-        (response, tunnel)
+        exchange
     }
 
     /// apply the selected filters and forward on the chosen endpoint generation.
@@ -310,7 +312,7 @@ impl ProxyService {
         mut request: Request<RequestBody>,
         original: &Authority,
         selection: &Selection,
-    ) -> Result<(Response<ResponseBody>, Option<Tunnel>), ProxyError> {
+    ) -> Result<Exchange, ProxyError> {
         let rule = &selection.rule;
         let backend = selection.backend.as_ref();
         if let Some(r) = rule.redirect.as_ref().or_else(|| backend?.1.redirect.as_ref()) {
@@ -373,7 +375,7 @@ impl ProxyService {
                 }
             })?;
         strip_hop_headers(exchange.response.headers_mut());
-        Ok((exchange.response.map(ResponseBody::Upstream), exchange.tunnel))
+        Ok(exchange)
     }
 }
 

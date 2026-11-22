@@ -1,5 +1,9 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
-use super::super::{super::ir::Protocol, admission::EndpointKey, up::Upgrade};
+use super::super::{
+    super::ir::Protocol,
+    admission::EndpointKey,
+    up::{Exchange, Upgrade},
+};
 use super::ResponseBody;
 use bytes::Bytes;
 use http::{
@@ -51,7 +55,7 @@ pub fn is_grpc<B>(request: &Request<B>) -> bool {
 
 impl ProxyError {
     /// emit a trailers-only gRPC response when a call cannot be dispatched.
-    pub fn for_request(self, grpc: bool) -> Response<ResponseBody> {
+    pub fn for_request(self, grpc: bool) -> Exchange {
         if grpc {
             let code = match self {
                 Self::NoRoute => "12",
@@ -68,19 +72,19 @@ impl ProxyError {
             response
                 .headers_mut()
                 .insert("grpc-status", HeaderValue::from_static(code));
-            return response;
+            return Exchange::local(response);
         }
         self.response()
     }
 
     /// format a local response with the corresponding HTTP status.
-    pub fn response(self) -> Response<ResponseBody> {
+    pub fn response(self) -> Exchange {
         let (status, text) = match self {
             Self::Redirect(status, location) => {
                 let mut response = Response::new(ResponseBody::full(Bytes::new()));
                 *response.status_mut() = status;
                 response.headers_mut().insert(header::LOCATION, location);
-                return response;
+                return Exchange::local(response);
             }
             Self::InvalidTarget => (StatusCode::BAD_REQUEST, "invalid request target\n"),
             Self::UnsupportedUpgrade => {
@@ -108,7 +112,7 @@ impl ProxyError {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         );
-        response
+        Exchange::local(response)
     }
 }
 
