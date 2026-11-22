@@ -16,20 +16,20 @@ use std::{
     time::Duration,
 };
 use weiche_gtwapi::v1::httproutes::{
-    HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
+    HttpRouteRules, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeadersType as HeaderType,
     HttpRouteRulesMatchesMethod as Method, HttpRouteRulesMatchesPathType as PathType,
     HttpRouteRulesMatchesQueryParamsType as QueryType,
 };
 use weiche_gtwapi::v1::{
     grpcroutes::{
-        GrpcRouteRules, GrpcRouteRulesBackendRefs, GrpcRouteRulesMatches,
+        GrpcRouteRules, GrpcRouteRulesMatches,
         GrpcRouteRulesMatchesHeadersType as GrpcHeader,
         GrpcRouteRulesMatchesMethodType as MethodType,
     },
-    tcproutes::{TcpRoute, TcpRouteRulesBackendRefs},
-    tlsroutes::{TlsRoute, TlsRouteRulesBackendRefs},
-    udproutes::{UdpRoute, UdpRouteRulesBackendRefs},
+    tcproutes::TcpRoute,
+    tlsroutes::TlsRoute,
+    udproutes::UdpRoute,
 };
 
 /// errors which prevent the route itself from being accepted.
@@ -57,6 +57,34 @@ pub struct HttpRule {
     pub matches: Vec<Http>,
     /// shared forwarding and filter configuration.
     pub action: RouteAction,
+}
+
+/// the common weighted Service reference carried by all generated route kinds.
+struct ServiceRef<'a> {
+    /// whether the group and kind designate a core Service.
+    service: bool,
+    /// effective target namespace, including the route namespace default.
+    namespace: &'a str,
+    /// referenced Service name.
+    name: &'a str,
+    /// requested Service port.
+    port: Option<u16>,
+    /// backend weight, including the Gateway API default.
+    weight: u32,
+}
+
+/// borrow a Service reference without naming each generated backend type.
+macro_rules! service_ref {
+    ($r:ident, $namespace:expr) => {
+        ServiceRef {
+            service: $r.group.as_deref().unwrap_or("").is_empty()
+                && $r.kind.as_deref().unwrap_or("Service") == "Service",
+            namespace: $r.namespace.as_deref().unwrap_or($namespace),
+            name: &$r.name,
+            port: $r.port,
+            weight: $r.weight.unwrap_or(1),
+        }
+    };
 }
 
 impl GatewayStores {
@@ -93,11 +121,7 @@ impl GatewayStores {
             {
                 return Err(ResolveError::IncompatibleFilters);
             }
-            validated.push((
-                reference.weight.unwrap_or(1),
-                ServiceRef::from(reference),
-                backend,
-            ));
+            validated.push((service_ref!(reference, namespace), backend));
         }
         let backends = self.resolve_backends(namespace, "HTTPRoute", policies, validated);
         Ok(HttpRule {
@@ -126,7 +150,7 @@ impl GatewayStores {
         for r in rule.backend_refs.iter().flatten() {
             let backend =
                 filters::grpc_backend_filters(r.filters.as_deref().unwrap_or_default())?;
-            validated.push((r.weight.unwrap_or(1), ServiceRef::from(r), backend));
+            validated.push((service_ref!(r, namespace), backend));
         }
         let backends = self.resolve_backends(namespace, "GRPCRoute", policies, validated);
         Ok(HttpRule {
@@ -145,12 +169,12 @@ impl GatewayStores {
         namespace: &str,
         source: &str,
         policies: &mut Policies,
-        validated: Vec<(u32, ServiceRef<'_>, Filters)>,
+        validated: Vec<(ServiceRef<'_>, Filters)>,
     ) -> Vec<Backend<Arc<ClusterSpec>>> {
         validated
             .into_iter()
-            .map(|(weight, reference, filters)| Backend {
-                weight,
+            .map(|(reference, filters)| Backend {
+                weight: reference.weight,
                 cluster: resolve_backend(self, policies, namespace, source, reference)
                     .map(Arc::new),
                 filters: Arc::new(filters),
@@ -216,18 +240,20 @@ impl ValueMatch<String> {
     }
 }
 
-/// retain the first predicate per name, ignoring later entries even for validation.
-fn named_matches<'a>(
-    predicates: impl Iterator<Item = (String, &'a str, bool)>,
-) -> Result<Vec<(String, ValueMatch<String>)>, ResolveError> {
-    let mut seen = HashSet::new();
-    let mut matches = Vec::new();
-    for (name, value, regular) in predicates {
-        if seen.insert(name.clone()) {
-            matches.push((name, ValueMatch::resolve(value, regular)?));
+/// retain the first header or query predicate per normalized name, even for validation.
+macro_rules! named_matches {
+    ($entries:expr, $kind:ident, $name:expr) => {{
+        let mut seen = HashSet::new();
+        let mut matches = Vec::new();
+        for entry in $entries {
+            let name = $name(&entry.name);
+            if seen.insert(name.clone()) {
+                let regular = matches!(entry.r#type, Some($kind::RegularExpression));
+                matches.push((name, ValueMatch::resolve(&entry.value, regular)?));
+            }
         }
-    }
-    Ok(matches)
+        matches
+    }};
 }
 
 /// resolve optional method components independently of the HTTP path matcher.
@@ -247,22 +273,10 @@ fn grpc_match(predicate: Option<&GrpcRouteRulesMatches>) -> Result<Http, Resolve
             return Err(ResolveError::UnsupportedValue);
         }
     }
-    let headers = named_matches(
-        predicate
-            .and_then(|p| p.headers.as_deref())
-            .unwrap_or_default()
-            .iter()
-            .map(|h| {
-                (
-                    h.name.to_ascii_lowercase(),
-                    h.value.as_str(),
-                    matches!(h.r#type, Some(GrpcHeader::RegularExpression)),
-                )
-            }),
-    )?;
+    let headers = predicate.and_then(|p| p.headers.as_deref()).unwrap_or_default();
     Ok(Http {
         path: PathMatch::Grpc { grpc },
-        headers,
+        headers: named_matches!(headers, GrpcHeader, |n: &String| n.to_ascii_lowercase()),
         ..Http::default()
     })
 }
@@ -300,20 +314,16 @@ fn http_match(predicate: &HttpRouteRulesMatches) -> Result<Http, ResolveError> {
             }
             .into()
         }),
-        headers: named_matches(predicate.headers.iter().flatten().map(|h| {
-            (
-                h.name.to_ascii_lowercase(),
-                h.value.as_str(),
-                matches!(h.r#type, Some(HeaderType::RegularExpression)),
-            )
-        }))?,
-        query_params: named_matches(predicate.query_params.iter().flatten().map(|p| {
-            (
-                p.name.clone(),
-                p.value.as_str(),
-                matches!(p.r#type, Some(QueryType::RegularExpression)),
-            )
-        }))?,
+        headers: named_matches!(
+            predicate.headers.iter().flatten(),
+            HeaderType,
+            |n: &String| n.to_ascii_lowercase()
+        ),
+        query_params: named_matches!(
+            predicate.query_params.iter().flatten(),
+            QueryType,
+            String::clone
+        ),
     })
 }
 
@@ -330,44 +340,6 @@ impl RefError {
     }
 }
 
-/// application protocol declared on a backend Service port.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AppProtocol {
-    /// the route selects the wire protocol.
-    None,
-    /// serve HTTP with optional transport security.
-    Http,
-    /// secure HTTP.
-    Https,
-    /// negotiate HTTP/2 over TLS.
-    H2,
-    /// cleartext HTTP/2.
-    H2c,
-    /// cleartext WebSocket.
-    Ws,
-    /// secure WebSocket.
-    Wss,
-    /// unrecognized service name or domain-prefixed protocol.
-    Unsupported,
-}
-
-impl AppProtocol {
-    /// recognize case-insensitive IANA names and exact Kubernetes protocol names.
-    fn parse(raw: Option<&str>) -> Self {
-        match raw {
-            None => Self::None,
-            Some("kubernetes.io/http") => Self::Http,
-            Some("kubernetes.io/h2c") => Self::H2c,
-            Some("kubernetes.io/ws") => Self::Ws,
-            Some("kubernetes.io/wss") => Self::Wss,
-            Some(name) if name.eq_ignore_ascii_case("http") => Self::Http,
-            Some(name) if name.eq_ignore_ascii_case("https") => Self::Https,
-            Some(name) if name.eq_ignore_ascii_case("h2") => Self::H2,
-            Some(_) => Self::Unsupported,
-        }
-    }
-}
-
 /// resolve a Service backend into a validated cluster or a Gateway API status reason.
 fn resolve_backend(
     stores: &GatewayStores,
@@ -377,31 +349,31 @@ fn resolve_backend(
     reference: ServiceRef<'_>,
 ) -> Result<ClusterSpec, RefError> {
     let (service, port) = reference.resolve(stores, namespace, source, Transport::Tcp)?;
-    let namespace = reference.namespace.unwrap_or(namespace);
-    let app = AppProtocol::parse(port.app_protocol.as_deref());
-    let protocol =
-        if source == "GRPCRoute" || matches!(app, AppProtocol::H2 | AppProtocol::H2c) {
-            Protocol::Http2
-        } else {
-            Protocol::Http1
-        };
-    // record the policy's Gateway ancestor even if this route cannot use the port.
-    let tls =
-        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol);
-    if app == AppProtocol::Unsupported
-        || (source == "GRPCRoute" && matches!(app, AppProtocol::Ws | AppProtocol::Wss))
-    {
-        return Err(RefError::UnsupportedProtocol);
-    }
+    let target = reference.namespace;
+    let grpc = source == "GRPCRoute";
+    let app = port.app_protocol.as_deref();
+    let h2 = app.is_some_and(|name| name.eq_ignore_ascii_case("h2"));
+    let protocol = if grpc || h2 || app == Some("kubernetes.io/h2c") {
+        Protocol::Http2
+    } else {
+        Protocol::Http1
+    };
+    // record the policy's ancestor even when the port protocol is unsupported.
+    let tls = policies.backend(stores, target, &service, port.name.as_deref(), protocol);
+    let requires_tls = match app {
+        None | Some("kubernetes.io/http") => None,
+        Some(name) if name.eq_ignore_ascii_case("http") => None,
+        Some(name) if h2 || name.eq_ignore_ascii_case("https") => Some(true),
+        Some("kubernetes.io/h2c") => Some(false),
+        Some("kubernetes.io/ws") if !grpc => Some(false),
+        Some("kubernetes.io/wss") if !grpc => Some(true),
+        _ => return Err(RefError::UnsupportedProtocol),
+    };
     let tls = tls?;
-    if matches!(
-        (app, &tls),
-        (AppProtocol::Https | AppProtocol::H2 | AppProtocol::Wss, None)
-            | (AppProtocol::H2c | AppProtocol::Ws, Some(_))
-    ) {
+    if requires_tls.is_some_and(|required| required != tls.is_some()) {
         return Err(RefError::UnsupportedProtocol);
     }
-    let endpoints = endpoints(stores, namespace, reference.name, &port, Transport::Tcp);
+    let endpoints = endpoints(stores, target, reference.name, &port, Transport::Tcp);
     Ok(ClusterSpec { endpoints, protocol, tls })
 }
 
@@ -456,42 +428,6 @@ fn endpoints(
     endpoints
 }
 
-/// the identical core Service reference fields generated for each Route kind.
-struct ServiceRef<'a> {
-    /// referenced API group.
-    group: Option<&'a str>,
-    /// referenced resource kind.
-    kind: Option<&'a str>,
-    /// target namespace when different from the route.
-    namespace: Option<&'a str>,
-    /// referenced Service name.
-    name: &'a str,
-    /// requested Service port.
-    port: Option<u16>,
-}
-/// borrow common Service reference fields from each generated type.
-macro_rules! service_ref {
-    ($ty:ty) => {
-        impl<'a> From<&'a $ty> for ServiceRef<'a> {
-            /// borrow the backend identity and port from the route reference.
-            fn from(r: &'a $ty) -> Self {
-                Self {
-                    group: r.group.as_deref(),
-                    kind: r.kind.as_deref(),
-                    namespace: r.namespace.as_deref(),
-                    name: &r.name,
-                    port: r.port,
-                }
-            }
-        }
-    };
-}
-service_ref!(HttpRouteRulesBackendRefs);
-service_ref!(GrpcRouteRulesBackendRefs);
-service_ref!(TcpRouteRulesBackendRefs);
-service_ref!(TlsRouteRulesBackendRefs);
-service_ref!(UdpRouteRulesBackendRefs);
-
 impl ServiceRef<'_> {
     /// check the grant and locate the requested Service port.
     fn resolve(
@@ -501,19 +437,16 @@ impl ServiceRef<'_> {
         source: &str,
         transport: Transport,
     ) -> Result<(Arc<Service>, ServicePort), RefError> {
-        if !self.group.unwrap_or("").is_empty()
-            || self.kind.unwrap_or("Service") != "Service"
-        {
+        if !self.service {
             return Err(RefError::InvalidKind);
         }
-        let target = self.namespace.unwrap_or(namespace);
-        if !stores.permits(namespace, source, target, "Service", self.name) {
+        if !stores.permits(namespace, source, self.namespace, "Service", self.name) {
             return Err(RefError::RefNotPermitted);
         }
         let num = self.port.ok_or(RefError::BackendNotFound)?;
         let service = stores
             .services
-            .get(&ObjectRef::new(self.name).within(target))
+            .get(&ObjectRef::new(self.name).within(self.namespace))
             .filter(|s| s.metadata.deletion_timestamp.is_none())
             .ok_or(RefError::BackendNotFound)?;
         let port = service
@@ -539,13 +472,7 @@ impl ServiceRef<'_> {
         transport: Transport,
     ) -> Result<Vec<SocketAddr>, RefError> {
         let (_, port) = self.resolve(stores, namespace, source, transport)?;
-        Ok(endpoints(
-            stores,
-            self.namespace.unwrap_or(namespace),
-            self.name,
-            &port,
-            transport,
-        ))
+        Ok(endpoints(stores, self.namespace, self.name, &port, transport))
     }
 }
 
@@ -563,9 +490,11 @@ macro_rules! stream_resolver {
                 .backend_refs
                 .iter()
                 .map(|r| {
-                    let target =
-                        ServiceRef::from(r).stream(self, namespace, &kind, $transport);
-                    (r.weight.unwrap_or(1), target)
+                    let reference = service_ref!(r, namespace);
+                    (
+                        reference.weight,
+                        reference.stream(self, namespace, &kind, $transport),
+                    )
                 })
                 .collect();
             Ok(StreamRoute { backends })
@@ -582,7 +511,7 @@ impl GatewayStores {
         let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
         route.spec.rules.iter().flat_map(|rule| &rule.backend_refs).find_map(
             |reference| {
-                ServiceRef::from(reference)
+                service_ref!(reference, namespace)
                     .resolve(self, namespace, "TLSRoute", Transport::Tcp)
                     .err()
             },
