@@ -2,7 +2,7 @@
 use super::{
     super::ir::{
         Binding, GatewaySnapshot, Listener, PublishedSnapshot, Revision, ServerTls,
-        StreamRoute, TlsSocket, Transport,
+        StreamListener, StreamRoute, TlsSocket, Transport,
     },
     admission::Admission,
     config::{Reader, RuntimeConfig},
@@ -46,14 +46,6 @@ impl HttpListener {
     }
 }
 
-/// owner and live forwarding table of a raw TCP or UDP socket.
-struct StreamListener {
-    /// binding owner retained across route changes.
-    gateway_uid: String,
-    /// current targets for admitted connections or datagrams.
-    routes: watch::Sender<Arc<StreamRoute>>,
-}
-
 /// resources shared by listener tasks on one compio runtime.
 pub struct Worker {
     /// index in the reuseport group and worker status table.
@@ -78,7 +70,10 @@ struct Listeners {
     /// bound HTTP sockets retained across route and certificate updates.
     http: BTreeMap<SocketAddr, HttpListener>,
     /// gateway identity and current forwarding table of each raw socket.
-    streams: BTreeMap<(Transport, SocketAddr), StreamListener>,
+    streams: BTreeMap<
+        (Transport, SocketAddr),
+        StreamListener<watch::Sender<Arc<StreamRoute>>>,
+    >,
     /// live SNI routing tables of TLS passthrough sockets.
     tls: BTreeMap<SocketAddr, watch::Sender<Arc<TlsSocket>>>,
     /// accept loops and draining connections for current and retired bindings.
@@ -132,9 +127,9 @@ impl Listeners {
             &self.serving,
             &mut self.streams,
             &gateway.streams,
-            |active, next| update(&active.routes, &next.route),
+            |active, next| update(&active.route, &next.route),
             |(transport, address), next| {
-                let (routes, rx) = watch::channel(next.route.clone());
+                let (route, rx) = watch::channel(next.route.clone());
                 let task = match transport {
                     Transport::Tcp => {
                         tcp::serve(worker, tcp::listen(address)?, rx, tcp::forward)
@@ -142,7 +137,7 @@ impl Listeners {
                     Transport::Udp => udp::bind(worker, address, rx)?,
                 };
                 Ok((
-                    StreamListener { gateway_uid: next.gateway_uid.clone(), routes },
+                    StreamListener { gateway_uid: next.gateway_uid.clone(), route },
                     task,
                 ))
             },

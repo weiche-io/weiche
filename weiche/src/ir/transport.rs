@@ -57,18 +57,18 @@ impl StreamRoute {
 
     /// sample a weighted backend and one of its ready addresses.
     pub fn select(&self) -> Option<SocketAddr> {
-        let endpoints = weighted(&self.backends)?.as_ref().ok()?;
-        fastrand::choice(endpoints).copied()
+        let (_, target) = weighted_by(&self.backends, |(weight, _)| *weight)?;
+        fastrand::choice(target.as_ref().ok()?).copied()
     }
 }
 
 /// keep the listener identity separate from the target set when endpoints change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamListener {
+pub struct StreamListener<R = Arc<StreamRoute>> {
     /// owning gateway identity.
     pub gateway_uid: String,
-    /// resolved route currently serving new flows.
-    pub route: Arc<StreamRoute>,
+    /// resolved route in the snapshot or its live watch on the worker.
+    pub route: R,
 }
 
 /// highest-precedence attached route for each original route hostname.
@@ -100,11 +100,6 @@ fn lookup<'a, T>(hosts: &'a BTreeMap<String, T>, hostname: &str) -> Option<&'a T
             .find_map(|(dot, _)| hosts.get(&format!("*{}", &hostname[dot..])))
             .or_else(|| hosts.get(""))
     })
-}
-
-/// sample a target with its configured weight, including targets that failed resolution.
-pub fn weighted<T>(targets: &[(u32, T)]) -> Option<&T> {
-    weighted_by(targets, |(weight, _)| *weight).map(|(_, target)| target)
 }
 
 /// sample a weighted reference while retaining its protocol-specific metadata.

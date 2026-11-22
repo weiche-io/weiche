@@ -21,5 +21,5 @@ pub use snapshot::{
 };
 pub use tls::{BackendTls, ServerTls};
 pub use transport::{
-    SniRoutes, StreamListener, StreamRoute, TlsSocket, Transport, weighted, weighted_by,
+    SniRoutes, StreamListener, StreamRoute, TlsSocket, Transport, weighted_by,
 };
