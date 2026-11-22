@@ -27,14 +27,14 @@ fn entries<'a>(status: &'a Value, key: &str) -> &'a [Value] {
 }
 
 /// retain transition times for unchanged truth values and preserve foreign conditions.
-fn stamp_conditions<'a>(
+fn stamp_conditions(
     previous: Option<&Value>,
     generation: Option<i64>,
-    desired: impl IntoIterator<Item = Cond<'a>>,
+    desired: &[Cond<'_>],
 ) -> Value {
     let old = entries(previous.unwrap_or(&Value::Null), "conditions");
     let mut conditions = Vec::new();
-    for (kind, truth, reason, message) in desired {
+    for &(kind, truth, reason, message) in desired {
         let status = if truth { "True" } else { "False" };
         let time = old
             .iter()
@@ -77,13 +77,14 @@ async fn patch_status<K>(
     api: Api<K>,
     resource: &K,
     status: Option<&impl Serialize>,
-    build: impl FnOnce(&Value) -> Option<Value>,
+    update: impl FnOnce(&mut Value),
 ) -> anyhow::Result<()>
 where
     K: Resource<DynamicType = ()> + Clone + std::fmt::Debug + DeserializeOwned,
 {
     let old = status.map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-    let Some(desired) = build(&old) else { return Ok(()) };
+    let mut desired = old.clone();
+    update(&mut desired);
     if old == desired {
         return Ok(());
     }
@@ -139,31 +140,32 @@ pub async fn update_status(
     controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()> {
-    for class in stores
-        .gateway_classes
-        .state()
-        .into_iter()
-        .filter(|c| c.spec.controller_name == controller_name)
-    {
-        patch_status(Api::all(client.clone()), &*class, class.status.as_ref(), |old| {
-            let accepted = class.spec.parameters_ref.is_none();
-            let reason = if accepted { "Accepted" } else { "InvalidParameters" };
-            let mut status = old.clone();
-            status["conditions"] = stamp_conditions(
-                Some(old),
-                class.metadata.generation,
-                [("Accepted", accepted, reason, "Weiche gateway controller")],
-            );
-            status["supportedFeatures"] =
-                FEATURES.iter().map(|name| json!({"name":name})).collect();
-            Some(status)
-        })
+    for class in stores.gateway_classes.state() {
+        if class.spec.controller_name != controller_name {
+            continue;
+        }
+        patch_status(
+            Api::all(client.clone()),
+            &*class,
+            class.status.as_ref(),
+            |status| {
+                let accepted = class.spec.parameters_ref.is_none();
+                let reason = if accepted { "Accepted" } else { "InvalidParameters" };
+                status["conditions"] = stamp_conditions(
+                    Some(status),
+                    class.metadata.generation,
+                    &[("Accepted", accepted, reason, "Weiche gateway controller")],
+                );
+                status["supportedFeatures"] =
+                    FEATURES.iter().map(|name| json!({"name":name})).collect();
+            },
+        )
         .await?;
     }
     for plan in plans {
         let g = plan.gateway.as_ref();
         patch_status(namespaced(client, g), g, g.status.as_ref(), |old| {
-            Some(gateway_status(plan, old))
+            gateway_status(plan, old)
         })
         .await?;
     }
@@ -193,11 +195,11 @@ pub async fn update_status(
 
 /// merge parent conditions for any route kind while preserving foreign controller entries.
 fn route_status(
-    old: &Value,
+    old: &mut Value,
     generation: Option<i64>,
     controller_name: &str,
     route_reports: &[&RouteReport],
-) -> Option<Value> {
+) {
     let old_parents = entries(old, "parents");
     let owned_parent = |p: &Value| p["controllerName"] == controller_name;
     let mut parents: Vec<_> =
@@ -239,21 +241,23 @@ fn route_status(
         if let Some(message) = &report.partially_invalid {
             conditions.push(("PartiallyInvalid", true, "UnsupportedValue", message));
         }
-        let conditions = stamp_conditions(previous, generation, conditions);
+        let conditions = stamp_conditions(previous, generation, &conditions);
         parents.push(json!({
             "controllerName": controller_name,
             "parentRef": parent,
             "conditions": conditions,
         }));
     }
-    (!parents.is_empty() || !old_parents.is_empty()).then(|| json!({"parents":parents}))
+    if !parents.is_empty() || !old_parents.is_empty() {
+        *old = json!({"parents":parents});
+    }
 }
 
 /// default programming condition message for gateways and their listeners.
 const READINESS: &str = "proxy snapshot and listener readiness";
 
 /// publish independent listener status and the address actually assigned by Kubernetes.
-fn gateway_status(plan: &Plan, old: &Value) -> Value {
+fn gateway_status(plan: &Plan, status: &mut Value) {
     let gateway = &plan.gateway;
     let generation = gateway.metadata.generation;
     let accepted = plan.accepted();
@@ -279,24 +283,23 @@ fn gateway_status(plan: &Plan, old: &Value) -> Value {
     } else {
         "Pending"
     };
-    let mut desired = old.clone();
     let ready_message = plan.issue.as_deref().unwrap_or(READINESS);
-    desired["conditions"] = stamp_conditions(
-        Some(old),
+    status["conditions"] = stamp_conditions(
+        Some(status),
         generation,
-        [
+        &[
             ("Accepted", accepted, reason, message),
             ("Programmed", programmed, ready_reason, ready_message),
         ],
     );
-    desired["addresses"] = plan
+    status["addresses"] = plan
         .addresses
         .iter()
         .map(|(kind, value)| json!({"type":kind,"value":value}))
         .collect();
     let mut statuses = Vec::new();
     for (l, report) in gateway.spec.listeners.iter().zip(&plan.listeners) {
-        let previous = entries(old, "listeners").iter().find(|v| v["name"] == l.name);
+        let previous = entries(status, "listeners").iter().find(|v| v["name"] == l.name);
         let bound = plan.programmed && report.accepted;
         let error = report.refs_error.as_ref();
         let attached = report
@@ -313,30 +316,17 @@ fn gateway_status(plan: &Plan, old: &Value) -> Value {
             .collect();
         let conflict = report.conflict.unwrap_or("NoConflicts");
         let ready = if bound { "Programmed" } else { "Pending" };
-        let conditions = stamp_conditions(
-            previous,
-            generation,
-            [
-                ("Accepted", report.accepted, report.reason, report.message.as_str()),
+        statuses.push(json!({
+            "name": l.name, "attachedRoutes": attached, "supportedKinds": kinds,
+            "conditions": stamp_conditions(previous, generation, &[
+                ("Accepted", report.accepted, report.reason, &report.message),
                 ("Programmed", bound, ready, READINESS),
                 resolved(error, "listener references resolved"),
-                (
-                    "Conflicted",
-                    report.conflict.is_some(),
-                    conflict,
-                    "listener distinctness",
-                ),
-            ],
-        );
-        statuses.push(json!({
-            "name": l.name,
-            "attachedRoutes": attached,
-            "supportedKinds": kinds,
-            "conditions": conditions,
+                ("Conflicted", report.conflict.is_some(), conflict, "listener distinctness"),
+            ]),
         }));
     }
-    desired["listeners"] = Value::Array(statuses);
-    desired
+    status["listeners"] = Value::Array(statuses);
 }
 
 /// publish all gateway ancestors for a policy against a single observed resource version.
@@ -375,7 +365,7 @@ async fn update_policies(
             let mut ancestors: Vec<_> =
                 entries.iter().filter(|entry| !owned(entry)).cloned().collect();
             if reports.is_empty() && ancestors.len() == entries.len() {
-                return None;
+                return;
             }
             for ((namespace, name), report) in reports {
                 let previous = entries.iter().find(|entry| {
@@ -384,37 +374,28 @@ async fn update_policies(
                         && entry["ancestorRef"]["namespace"] == namespace
                 });
                 let error = report.as_ref().err();
-                let refs_error = error.filter(|e| {
-                    matches!(
-                        e.reason,
-                        "InvalidCACertificateRef" | "InvalidKind" | "TargetNotFound"
-                    )
-                });
-                let reason = if refs_error.is_some_and(|e| e.reason != "TargetNotFound") {
-                    "NoValidCACertificate"
-                } else {
-                    error.map_or("Accepted", |e| e.reason)
+                let (reason, refs_error) = match error.map(|e| e.reason) {
+                    Some("InvalidCACertificateRef" | "InvalidKind") => {
+                        ("NoValidCACertificate", error)
+                    }
+                    Some("TargetNotFound") => ("TargetNotFound", error),
+                    other => (other.unwrap_or("Accepted"), None),
                 };
                 let message =
                     error.map_or("backend TLS policy applied", |e| e.message.as_str());
-                let conditions = stamp_conditions(
-                    previous,
-                    p.metadata.generation,
-                    [
-                        ("Accepted", error.is_none(), reason, message),
-                        resolved(refs_error, "policy references resolved"),
-                    ],
-                );
                 ancestors.push(json!({
                     "ancestorRef": {
                         "group": "gateway.networking.k8s.io", "kind": "Gateway",
                         "name": name, "namespace": namespace
                     },
                     "controllerName": controller_name,
-                    "conditions": conditions
+                    "conditions": stamp_conditions(previous, p.metadata.generation, &[
+                        ("Accepted", error.is_none(), reason, message),
+                        resolved(refs_error, "policy references resolved"),
+                    ])
                 }));
             }
-            Some(json!({"ancestors":ancestors}))
+            *old = json!({"ancestors":ancestors});
         })
         .await?;
     }
