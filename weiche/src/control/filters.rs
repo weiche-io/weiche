@@ -140,21 +140,12 @@ fn cors(
     cors_list(methods, 9, true)?;
     cors_list(headers, 64, true)?;
     cors_list(expose, 64, false)?;
+    let verbs = [
+        "*", "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE",
+        "PATCH",
+    ];
     if !(1..=i32::MAX as u32).contains(&max_age)
-        || !methods.iter().all(|m| {
-            matches!(
-                m.as_str(),
-                "*" | "GET"
-                    | "HEAD"
-                    | "POST"
-                    | "PUT"
-                    | "DELETE"
-                    | "CONNECT"
-                    | "OPTIONS"
-                    | "TRACE"
-                    | "PATCH"
-            )
-        })
+        || !methods.iter().all(|m| verbs.contains(&m.as_str()))
         || !headers
             .iter()
             .chain(expose)
@@ -183,10 +174,10 @@ fn cors(
 
 /// compile identical filter semantics for both generated Gateway API shapes.
 macro_rules! filters {
-    ($name:ident, $filter:ty, $kind:ident, $scheme:ident, $redirect:ident, $rewrite:ident) => {
-        /// resolve one ordered list of HTTP filters.
+    ($name:ident, $filter:ty, $kind:ident $(, $rule:ident: $scheme:ident, $redirect:ident, $rewrite_kind:ident, $rewrite:ident)?) => {
+        /// resolve one ordered list of rule or backend filters.
         pub fn $name(
-            rule: &HttpRouteRules,
+            $($rule: &HttpRouteRules,)?
             filters: &[$filter],
         ) -> Result<Filters, ResolveError> {
             use $kind as Kind;
@@ -198,6 +189,14 @@ macro_rules! filters {
                     return Err(ResolveError::IncompatibleFilters);
                 }
                 match f.r#type {
+                    Kind::RequestHeaderModifier => result.headers.extend(changes!(
+                        f.request_header_modifier.as_ref().ok_or(invalid)?
+                    )),
+                    Kind::ResponseHeaderModifier => {
+                        result.response_headers =
+                            changes!(f.response_header_modifier.as_ref().ok_or(invalid)?)
+                    }
+                    $(
                     Kind::Cors => {
                         let c = f.cors.as_ref().ok_or(invalid)?;
                         result.cors = Some(cors(
@@ -209,32 +208,15 @@ macro_rules! filters {
                             c.max_age.unwrap_or(5),
                         )?);
                     }
-                    Kind::RequestHeaderModifier => result.headers.extend(changes!(
-                        f.request_header_modifier.as_ref().ok_or(invalid)?
-                    )),
-                    Kind::ResponseHeaderModifier => {
-                        result.response_headers =
-                            changes!(f.response_header_modifier.as_ref().ok_or(invalid)?)
-                    }
                     Kind::RequestRedirect => {
                         let r = f.request_redirect.as_ref().ok_or(invalid)?;
-                        let status = match r.status_code.unwrap_or(302) {
-                            code @ (301 | 302 | 303 | 307 | 308) => {
-                                StatusCode::from_u16(code as u16).map_err(|_| invalid)?
-                            }
-                            _ => return Err(invalid),
-                        };
-                        if r.port == Some(0) {
+                        let code = r.status_code.unwrap_or(302);
+                        if !matches!(code, 301 | 302 | 303 | 307 | 308) || r.port == Some(0) {
                             return Err(invalid);
                         }
                         result.redirect = Some(Redirect {
-                            status,
-                            hostname: r
-                                .hostname
-                                .as_deref()
-                                .map(hostname)
-                                .transpose()?
-                                .map(str::to_owned),
+                            status: StatusCode::from_u16(code as u16).map_err(|_| invalid)?,
+                            hostname: r.hostname.as_deref().map(hostname).transpose()?.map(str::to_owned),
                             scheme: r.scheme.as_ref().map(|s| {
                                 match s {
                                     $scheme::Http => "http",
@@ -243,10 +225,10 @@ macro_rules! filters {
                                 .into()
                             }),
                             port: r.port,
-                            path: modifier!(rule, r.path, $redirect),
+                            path: modifier!($rule, r.path, $redirect),
                         });
                     }
-                    Kind::UrlRewrite => {
+                    Kind::$rewrite_kind => {
                         let r = f.url_rewrite.as_ref().ok_or(invalid)?;
                         if let Some(host) = &r.hostname {
                             result.headers.push(HeaderChange::Set(
@@ -255,16 +237,17 @@ macro_rules! filters {
                                     .map_err(|_| invalid)?,
                             ));
                         }
-                        result.path = modifier!(rule, r.path, $rewrite);
+                        result.path = modifier!($rule, r.path, $rewrite);
                     }
+                    )?
                     _ => return Err(invalid),
                 }
             }
-            if result.redirect.is_some()
-                && seen.contains(&std::mem::discriminant(&Kind::UrlRewrite))
+            $(if result.redirect.is_some()
+                && seen.contains(&std::mem::discriminant(&Kind::$rewrite_kind))
             {
                 return Err(ResolveError::IncompatibleFilters);
-            }
+            })?
             Ok(result)
         }
     };
@@ -274,49 +257,21 @@ filters!(
     rule_filters,
     HttpRouteRulesFilters,
     HttpRouteRulesFiltersType,
-    HttpRouteRulesFiltersRequestRedirectScheme,
+    rule: HttpRouteRulesFiltersRequestRedirectScheme,
     HttpRouteRulesFiltersRequestRedirectPathType,
-    HttpRouteRulesFiltersUrlRewritePathType
+    UrlRewrite, HttpRouteRulesFiltersUrlRewritePathType
 );
 filters!(
     backend_filters,
     HttpRouteRulesBackendRefsFilters,
     HttpRouteRulesBackendRefsFiltersType,
-    HttpRouteRulesBackendRefsFiltersRequestRedirectScheme,
+    rule: HttpRouteRulesBackendRefsFiltersRequestRedirectScheme,
     HttpRouteRulesBackendRefsFiltersRequestRedirectPathType,
-    HttpRouteRulesBackendRefsFiltersUrlRewritePathType
+    UrlRewrite, HttpRouteRulesBackendRefsFiltersUrlRewritePathType
 );
 
-/// compile gRPC metadata operations from either generated filter schema.
-macro_rules! grpc_filters {
-    ($name:ident, $filter:ty, $kind:ident) => {
-        /// validate the ordered header filters for a gRPC rule or backend.
-        pub fn $name(filters: &[$filter]) -> Result<Filters, ResolveError> {
-            let mut result = Filters::default();
-            let mut seen = HashSet::new();
-            for f in filters {
-                if !seen.insert(std::mem::discriminant(&f.r#type)) {
-                    return Err(ResolveError::IncompatibleFilters);
-                }
-                let invalid = ResolveError::UnsupportedValue;
-                match f.r#type {
-                    $kind::RequestHeaderModifier => {
-                        result.headers =
-                            changes!(f.request_header_modifier.as_ref().ok_or(invalid)?)
-                    }
-                    $kind::ResponseHeaderModifier => {
-                        result.response_headers =
-                            changes!(f.response_header_modifier.as_ref().ok_or(invalid)?)
-                    }
-                    _ => return Err(invalid),
-                }
-            }
-            Ok(result)
-        }
-    };
-}
-grpc_filters!(grpc_rule_filters, GrpcRouteRulesFilters, GrpcRouteRulesFiltersType);
-grpc_filters!(
+filters!(grpc_rule_filters, GrpcRouteRulesFilters, GrpcRouteRulesFiltersType);
+filters!(
     grpc_backend_filters,
     GrpcRouteRulesBackendRefsFilters,
     GrpcRouteRulesBackendRefsFiltersType
