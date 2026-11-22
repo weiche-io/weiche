@@ -2,9 +2,12 @@
 use super::super::super::ir::{Binding, Filters, HeaderChange, PathModifier, Redirect};
 use super::super::up::Exchange;
 use super::router::Selection;
-use super::wire::{ProxyError, host_authority, strip_hop_headers};
+use super::wire::{
+    ProxyError, header_tokens, host_authority, strip_hop_headers, supply_host,
+};
 use http::{
-    HeaderMap, HeaderValue, Request, Uri, Version, header,
+    HeaderMap, HeaderValue, Uri, Version, header,
+    request::Parts,
     uri::{Authority, PathAndQuery},
 };
 use std::net::SocketAddr;
@@ -28,17 +31,12 @@ pub fn modify(headers: &mut HeaderMap, changes: &[HeaderChange]) {
 
 /// detect the only transfer coding that can pass through HTTP/2.
 fn supports_trailers(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::TE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|v| v.trim().eq_ignore_ascii_case("trailers"))
+    header_tokens(headers, header::TE).any(|v| v.eq_ignore_ascii_case("trailers"))
 }
 
 /// preserve the original authority and TE semantics while applying request filters.
-pub fn request_headers<B>(
-    request: &mut Request<B>,
+pub fn request_headers(
+    request: &mut Parts,
     peer: SocketAddr,
     original: &Authority,
     tls: bool,
@@ -46,9 +44,9 @@ pub fn request_headers<B>(
     backend: &Filters,
 ) -> Result<(Authority, bool), ProxyError> {
     // an HTTP/3 client can receive trailers without an explicit TE field.
-    let implicit_trailers = request.version() == Version::HTTP_3
-        && !request.headers().contains_key(header::TE);
-    let headers = request.headers_mut();
+    let implicit_trailers =
+        request.version == Version::HTTP_3 && !request.headers.contains_key(header::TE);
+    let headers = &mut request.headers;
     let trailers = implicit_trailers || supports_trailers(headers);
     strip_hop_headers(headers);
     forwarded(headers, peer, original, tls);
@@ -56,13 +54,7 @@ pub fn request_headers<B>(
         return Ok((original.clone(), trailers));
     }
     // a nominated Host still supplies the authority seen by the filters.
-    if !headers.contains_key(header::HOST) {
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_str(original.as_str())
-                .map_err(|_| ProxyError::InvalidHost)?,
-        );
-    }
+    supply_host(headers, original)?;
     if trailers {
         headers.insert(header::TE, HeaderValue::from_static("trailers"));
     }

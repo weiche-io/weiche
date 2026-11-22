@@ -1,13 +1,7 @@
 //! evaluate cross-origin requests against the selected rule or backend policy.
 use super::super::super::ir::{Cors, Origin};
+use super::wire::{header_tokens, single};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, header::*};
-
-/// retrieve an unambiguous singleton field.
-fn single(headers: &HeaderMap, name: HeaderName) -> Option<&HeaderValue> {
-    let mut values = headers.get_all(name).iter();
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
-}
 
 /// identify a preflight by the presence of both Fetch request fields.
 fn preflight(method: &Method, headers: &HeaderMap) -> bool {
@@ -170,13 +164,8 @@ impl Decision {
 
 /// append a missing cache key, preserving existing lines, token casing and Vary: *.
 fn vary(headers: &mut HeaderMap, key: &'static str) {
-    let present = headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .any(|v| v == "*" || v.eq_ignore_ascii_case(key));
+    let present =
+        header_tokens(headers, VARY).any(|v| v == "*" || v.eq_ignore_ascii_case(key));
     if !present {
         headers.append(VARY, HeaderValue::from_static(key));
     }

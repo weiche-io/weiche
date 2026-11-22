@@ -1,5 +1,5 @@
 //! validate HTTP/1 upgrade negotiation and relay the switched protocol locally.
-use super::http1::Lease;
+use super::{super::http::wire::header_tokens, http1::Lease};
 use http::{HeaderMap, HeaderValue, Request, Response, Version, header};
 use hyper::{
     body::Incoming,
@@ -17,12 +17,8 @@ pub struct Upgrade {
 
 /// check the connection tokens and the protocol-name[/version] grammar.
 fn protocols(headers: &HeaderMap) -> Option<Vec<HeaderValue>> {
-    let connection = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|s| s.trim().eq_ignore_ascii_case("upgrade"));
+    let connection = header_tokens(headers, header::CONNECTION)
+        .any(|s| s.eq_ignore_ascii_case("upgrade"));
     let values: Vec<_> = headers.get_all(header::UPGRADE).iter().cloned().collect();
     if !connection || values.is_empty() {
         return None;

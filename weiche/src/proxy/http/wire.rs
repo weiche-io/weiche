@@ -7,8 +7,10 @@ use super::super::{
 use super::ResponseBody;
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
-    uri::Authority,
+    HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version,
+    header,
+    request::Parts,
+    uri::{Authority, PathAndQuery, Scheme},
 };
 use std::{io, net::SocketAddr};
 
@@ -70,25 +72,19 @@ impl ProxyError {
 
     /// emit a trailers-only gRPC response when a call cannot be dispatched.
     pub fn for_request(self, grpc: bool) -> Exchange {
-        if grpc {
-            let code = match self {
-                Self::NoRoute => "12",
-                Self::InvalidBackend | Self::NoEndpoints | Self::Upstream => "14",
-                Self::Timeout => "4",
-                _ => return self.response(),
-            };
-            let mut response = empty_response(StatusCode::OK);
-            *response.version_mut() = Version::HTTP_2;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            );
-            response
-                .headers_mut()
-                .insert("grpc-status", HeaderValue::from_static(code));
-            return Exchange::local(response);
-        }
-        self.response()
+        let code = match (grpc, &self) {
+            (true, Self::NoRoute) => "12",
+            (true, Self::InvalidBackend | Self::NoEndpoints | Self::Upstream) => "14",
+            (true, Self::Timeout) => "4",
+            _ => return self.response(),
+        };
+        let mut response = empty_response(StatusCode::OK);
+        *response.version_mut() = Version::HTTP_2;
+        let headers = response.headers_mut();
+        headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+        headers.insert("grpc-status", HeaderValue::from_static(code));
+        Exchange::local(response)
     }
 
     /// format a local response with the corresponding HTTP status.
@@ -136,22 +132,41 @@ pub fn empty_response(status: StatusCode) -> Response<ResponseBody> {
     response
 }
 
+/// retrieve an unambiguous singleton field.
+pub fn single(headers: &HeaderMap, name: HeaderName) -> Option<&HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
 /// parse the single Host field used by HTTP/1 or supplied by a route filter.
 pub fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
-    let mut hosts = headers.get_all(header::HOST).iter();
-    let value = hosts.next().ok_or(ProxyError::InvalidHost)?;
+    let value = single(headers, header::HOST).ok_or(ProxyError::InvalidHost)?;
     let authority =
         Authority::try_from(value.as_bytes()).map_err(|_| ProxyError::InvalidHost)?;
     let host = authority.host();
     let port = authority.as_str().strip_prefix(host).ok_or(ProxyError::InvalidHost)?;
-    if hosts.next().is_some()
-        || host.is_empty()
+    if host.is_empty()
         || authority.as_str().contains(['@', ','])
         || (!port.is_empty() && (!port.starts_with(':') || authority.port().is_none()))
     {
         return Err(ProxyError::InvalidHost);
     }
     Ok(authority)
+}
+
+/// restore the original authority when hop-by-hop fields or filters removed Host.
+pub fn supply_host(
+    headers: &mut HeaderMap,
+    authority: &Authority,
+) -> Result<(), ProxyError> {
+    if let http::header::Entry::Vacant(host) = headers.entry(header::HOST) {
+        host.insert(
+            HeaderValue::from_str(authority.as_str())
+                .map_err(|_| ProxyError::InvalidHost)?,
+        );
+    }
+    Ok(())
 }
 
 /// expose :authority to header matches and reject conflicting downstream identities.
@@ -187,81 +202,75 @@ pub fn take_upgrade<B>(
 }
 
 /// encode the filtered authority and path for the selected upstream protocol.
-pub fn prepare_request<B>(
-    request: &mut Request<B>,
+pub fn prepare_request(
+    request: &mut Parts,
     authority: Authority,
     endpoint: &EndpointKey,
     downstream_tls: bool,
     grpc: bool,
     trailers: bool,
-    path: Option<http::uri::PathAndQuery>,
+    path: Option<PathAndQuery>,
 ) -> Result<(), ProxyError> {
+    let headers = &mut request.headers;
     if trailers || grpc {
-        request
-            .headers_mut()
-            .insert(header::TE, HeaderValue::from_static("trailers"));
+        headers.insert(header::TE, HeaderValue::from_static("trailers"));
     }
-    let mut uri = request.uri().clone().into_parts();
-    if path.is_some() {
-        uri.path_and_query = path;
-    }
+    let mut uri = std::mem::take(&mut request.uri).into_parts();
+    uri.path_and_query = path.or(uri.path_and_query);
     uri.path_and_query
-        .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
+        .get_or_insert_with(|| PathAndQuery::from_static("/"));
     match endpoint.protocol {
         Protocol::Http1 => {
             // an HTTP/3 upload can carry data or trailers without declaring its length.
             // keep polling through FIN even after the advertised length has arrived.
-            let streaming = request.version() == Version::HTTP_3;
-            *request.version_mut() = Version::HTTP_11;
-            if !request.headers().contains_key(header::HOST) {
-                request.headers_mut().insert(
-                    header::HOST,
-                    HeaderValue::from_str(authority.as_str())
-                        .map_err(|_| ProxyError::InvalidHost)?,
-                );
-            }
+            let streaming = request.version == Version::HTTP_3;
+            request.version = Version::HTTP_11;
+            supply_host(headers, &authority)?;
             uri.scheme = None;
             uri.authority = None;
             if trailers {
-                request
-                    .headers_mut()
-                    .insert(header::CONNECTION, HeaderValue::from_static("TE"));
+                headers.insert(header::CONNECTION, HeaderValue::from_static("TE"));
             }
-            if streaming || request.headers().contains_key(header::TRAILER) {
-                request.headers_mut().remove(header::CONTENT_LENGTH);
-                request.headers_mut().insert(
+            if streaming || headers.contains_key(header::TRAILER) {
+                headers.remove(header::CONTENT_LENGTH);
+                headers.insert(
                     header::TRANSFER_ENCODING,
                     HeaderValue::from_static("chunked"),
                 );
             }
         }
         Protocol::Http2 => {
-            *request.version_mut() = Version::HTTP_2;
+            request.version = Version::HTTP_2;
             // encode authority once; some HTTP/2 servers reject a duplicate Host field.
-            request.headers_mut().remove(header::HOST);
+            headers.remove(header::HOST);
             if grpc || uri.scheme.is_none() {
                 let tls = if grpc { endpoint.tls.is_some() } else { downstream_tls };
-                uri.scheme = Some(if tls {
-                    http::uri::Scheme::HTTPS
-                } else {
-                    http::uri::Scheme::HTTP
-                });
+                uri.scheme = Some(if tls { Scheme::HTTPS } else { Scheme::HTTP });
             }
             uri.authority = Some(authority);
         }
     }
-    *request.uri_mut() = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
+    request.uri = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
     Ok(())
+}
+
+/// visit comma-separated header tokens in wire order, skipping non-text field lines.
+pub fn header_tokens(
+    headers: &HeaderMap,
+    name: HeaderName,
+) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
 }
 
 /// remove connection-specific fields and fields nominated by this hop.
 pub fn strip_hop_headers(headers: &mut HeaderMap) {
-    let nominated: Vec<_> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|s| s.trim().parse::<header::HeaderName>().ok())
+    let nominated: Vec<_> = header_tokens(headers, header::CONNECTION)
+        .filter_map(|name| name.parse::<HeaderName>().ok())
         .collect();
     for name in nominated {
         headers.remove(name);

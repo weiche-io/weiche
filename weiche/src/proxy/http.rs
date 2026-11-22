@@ -249,6 +249,7 @@ impl ProxyService {
         let key = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(key).ok_or(ProxyError::NoEndpoints)?;
         let upgrade = wire::take_upgrade(&mut request, endpoint.key.protocol)?;
+        let (mut request, body) = request.into_parts();
         let (authority, trailers) = filter::request_headers(
             &mut request,
             peer,
@@ -261,7 +262,7 @@ impl ProxyService {
             .path
             .as_ref()
             .or(rule.path.as_ref())
-            .map(|p| filter::apply(p, request.uri()))
+            .map(|p| filter::apply(p, &request.uri))
             .transpose()?;
         prepare_request(
             &mut request,
@@ -273,8 +274,9 @@ impl ProxyService {
             path,
         )?;
         if let Some(upgrade) = &upgrade {
-            upgrade.restore(request.headers_mut());
+            upgrade.restore(&mut request.headers);
         }
+        let request = Request::from_parts(request, body);
         let address = endpoint.key.address;
         let mut exchange = self
             .pool
