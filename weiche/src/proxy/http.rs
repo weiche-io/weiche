@@ -10,7 +10,7 @@ use super::{
     super::ir::{Binding, ClusterSpec, PublishedSnapshot, Revision},
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
-    up::{ConnectionPool, Exchange},
+    up::{ConnectionPool, Exchange, Upgrade},
 };
 pub use body::{RequestBody, ResponseBody};
 use http::{HeaderValue, Request, StatusCode, Version, header, uri::Authority};
@@ -205,23 +205,23 @@ impl ProxyService {
             || (version == Version::HTTP_3
                 && request.headers().contains_key(header::UPGRADE))
         {
-            return advertise(ProxyError::UnsupportedUpgrade.response());
+            return advertise(ProxyError::UnsupportedUpgrade.response(false));
         }
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
-            Err(error) => return advertise(error.response()),
+            Err(error) => return advertise(error.response(false)),
         };
         let grpc = is_grpc(&request);
         let selection = match self.select(listener, &authority, &request, start, grpc) {
             Ok(s) => s,
-            Err(error) => return advertise(error.for_request(grpc)),
+            Err(error) => return advertise(error.response(grpc)),
         };
         let exchange = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
-            Exchange::local(wire::empty_response(StatusCode::NO_CONTENT))
+            Exchange::local(StatusCode::NO_CONTENT, "")
         } else {
             self.forward(listener, peer, request, &authority, &selection)
                 .await
-                .unwrap_or_else(|error| error.for_request(selection.grpc))
+                .unwrap_or_else(|error| error.response(selection.grpc))
         };
         let mut exchange = advertise(exchange);
         filter::response(&mut exchange, version, selection);
@@ -240,15 +240,15 @@ impl ProxyService {
         let rule = &selection.rule;
         let backend = selection.backend.as_ref();
         if let Some(r) = rule.redirect.as_ref().or_else(|| backend?.1.redirect.as_ref()) {
-            return Err(ProxyError::Redirect(
-                r.status,
-                filter::location(r, listener, original, request.uri())?,
-            ));
+            let location = filter::location(r, listener, original, request.uri())?;
+            let mut exchange = Exchange::local(r.status, "");
+            exchange.response.headers_mut().insert(header::LOCATION, location);
+            return Ok(exchange);
         }
         let (cluster, filters) = backend.ok_or(ProxyError::InvalidBackend)?;
         let key = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(key).ok_or(ProxyError::NoEndpoints)?;
-        let upgrade = wire::take_upgrade(&mut request, endpoint.key.protocol)?;
+        let upgrade = Upgrade::request(&mut request, endpoint.key.protocol)?;
         let (mut request, body) = request.into_parts();
         let (authority, trailers) = filter::request_headers(
             &mut request,

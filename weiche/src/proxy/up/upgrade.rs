@@ -1,5 +1,11 @@
 //! validate HTTP/1 upgrade negotiation and relay the switched protocol locally.
-use super::{super::http::wire::header_tokens, http1::Lease};
+use super::{
+    super::{
+        super::ir::Protocol,
+        http::wire::{ProxyError, header_tokens},
+    },
+    http1::Lease,
+};
 use http::{HeaderMap, HeaderValue, Request, Response, Version, header};
 use hyper::{
     body::Incoming,
@@ -40,12 +46,19 @@ fn protocols(headers: &HeaderMap) -> Option<Vec<HeaderValue>> {
 
 impl Upgrade {
     /// capture a valid client offer before the request extensions reach the upstream.
-    pub fn request<B>(request: &mut Request<B>) -> Option<Self> {
-        if request.version() != Version::HTTP_11 {
-            return None;
+    pub fn request<B>(
+        request: &mut Request<B>,
+        protocol: Protocol,
+    ) -> Result<Option<Self>, ProxyError> {
+        if !request.headers().contains_key(header::UPGRADE) {
+            return Ok(None);
         }
-        let protocols = protocols(request.headers())?;
-        Some(Self { downstream: on(request), protocols })
+        if protocol != Protocol::Http1 || request.version() != Version::HTTP_11 {
+            return Err(ProxyError::UnsupportedUpgrade);
+        }
+        let protocols =
+            protocols(request.headers()).ok_or(ProxyError::UnsupportedUpgrade)?;
+        Ok(Some(Self { downstream: on(request), protocols }))
     }
 
     /// restore only the handshake fields after stripping hop-by-hop headers.

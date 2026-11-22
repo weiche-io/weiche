@@ -6,7 +6,9 @@ use super::{
     pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease},
     upgrade::{Tunnel, Upgrade},
 };
+use bytes::Bytes;
 use http::{Request, Response, StatusCode};
+use http_body_util::Full;
 use std::{rc::Rc, time::Instant};
 
 /// a response with its streaming budget and optional upgraded transport.
@@ -21,7 +23,10 @@ pub struct Exchange {
 
 impl Exchange {
     /// complete a local response without an upstream transport or attempt deadline.
-    pub fn local(response: Response<ResponseBody>) -> Self {
+    pub fn local(status: StatusCode, text: &'static str) -> Self {
+        let body = Full::new(Bytes::from_static(text.as_bytes()));
+        let mut response = Response::new(ResponseBody::Full(body));
+        *response.status_mut() = status;
         Self { response, tunnel: None, deadline: None }
     }
 

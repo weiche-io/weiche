@@ -1,14 +1,7 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
-use super::super::{
-    super::ir::Protocol,
-    admission::EndpointKey,
-    up::{Exchange, Upgrade},
-};
-use super::ResponseBody;
-use bytes::Bytes;
+use super::super::{super::ir::Protocol, admission::EndpointKey, up::Exchange};
 use http::{
-    HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version,
-    header,
+    HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version, header,
     request::Parts,
     uri::{Authority, PathAndQuery, Scheme},
 };
@@ -16,13 +9,6 @@ use std::{io, net::SocketAddr};
 
 /// errors mapped to local HTTP responses.
 pub enum ProxyError {
-    /// local redirect with its validated Location.
-    Redirect(
-        /// status selected by the redirect filter.
-        StatusCode,
-        /// absolute URI for the Location header.
-        HeaderValue,
-    ),
     /// request URI cannot be represented for the selected hop.
     InvalidTarget,
     /// unsupported tunnel method or handshake.
@@ -70,66 +56,49 @@ impl ProxyError {
         }
     }
 
-    /// emit a trailers-only gRPC response when a call cannot be dispatched.
-    pub fn for_request(self, grpc: bool) -> Exchange {
-        let code = match (grpc, &self) {
-            (true, Self::NoRoute) => "12",
-            (true, Self::InvalidBackend | Self::NoEndpoints | Self::Upstream) => "14",
-            (true, Self::Timeout) => "4",
-            _ => return self.response(),
-        };
-        let mut response = empty_response(StatusCode::OK);
-        *response.version_mut() = Version::HTTP_2;
-        let headers = response.headers_mut();
-        headers
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
-        headers.insert("grpc-status", HeaderValue::from_static(code));
-        Exchange::local(response)
-    }
-
-    /// format a local response with the corresponding HTTP status.
-    pub fn response(self) -> Exchange {
-        let (status, text) = match self {
-            Self::Redirect(status, location) => {
-                let mut response = empty_response(status);
-                response.headers_mut().insert(header::LOCATION, location);
-                return Exchange::local(response);
-            }
-            Self::InvalidTarget => (StatusCode::BAD_REQUEST, "invalid request target\n"),
+    /// send local HTTP errors or trailers-only status for a native gRPC call.
+    pub fn response(self, grpc: bool) -> Exchange {
+        use StatusCode as S;
+        let (status, text, grpc_code) = match self {
+            Self::InvalidTarget => (S::BAD_REQUEST, "invalid request target\n", None),
             Self::UnsupportedUpgrade => {
-                (StatusCode::NOT_IMPLEMENTED, "unsupported upgrade or CONNECT request\n")
+                (S::NOT_IMPLEMENTED, "unsupported upgrade or CONNECT request\n", None)
             }
             Self::InvalidHost => (
-                StatusCode::BAD_REQUEST,
+                S::BAD_REQUEST,
                 "a valid, consistent Host or :authority is required\n",
+                None,
             ),
-            Self::NoRoute => (StatusCode::NOT_FOUND, "no matching HTTPRoute\n"),
+            Self::NoRoute => (S::NOT_FOUND, "no matching HTTPRoute\n", Some("12")),
             Self::InvalidBackend => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                S::INTERNAL_SERVER_ERROR,
                 "HTTPRoute has an invalid backend reference\n",
+                Some("14"),
             ),
             Self::NoEndpoints => {
-                (StatusCode::SERVICE_UNAVAILABLE, "Service has no ready endpoints\n")
+                (S::SERVICE_UNAVAILABLE, "Service has no ready endpoints\n", Some("14"))
             }
-            Self::Upstream => (StatusCode::BAD_GATEWAY, "backend request failed\n"),
-            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "request timed out\n"),
+            Self::Upstream => (S::BAD_GATEWAY, "backend request failed\n", Some("14")),
+            Self::Timeout => (S::GATEWAY_TIMEOUT, "request timed out\n", Some("4")),
         };
-        let mut response =
-            Response::new(ResponseBody::full(Bytes::from_static(text.as_bytes())));
-        *response.status_mut() = status;
-        response.headers_mut().insert(
+        if grpc && let Some(code) = grpc_code {
+            let mut exchange = Exchange::local(S::OK, "");
+            *exchange.response.version_mut() = Version::HTTP_2;
+            let headers = exchange.response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            );
+            headers.insert("grpc-status", HeaderValue::from_static(code));
+            return exchange;
+        }
+        let mut exchange = Exchange::local(status, text);
+        exchange.response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         );
-        Exchange::local(response)
+        exchange
     }
-}
-
-/// build a header-only response for redirects, preflights and local gRPC status.
-pub fn empty_response(status: StatusCode) -> Response<ResponseBody> {
-    let mut response = Response::new(ResponseBody::full(Bytes::new()));
-    *response.status_mut() = status;
-    response
 }
 
 /// retrieve an unambiguous singleton field.
@@ -183,22 +152,6 @@ pub fn normalize_authority<B>(request: &mut Request<B>) -> Result<Authority, Pro
         return Err(ProxyError::InvalidHost);
     }
     Ok(host)
-}
-
-/// take the downstream upgrade before its handshake fields are stripped.
-pub fn take_upgrade<B>(
-    request: &mut Request<B>,
-    protocol: Protocol,
-) -> Result<Option<Upgrade>, ProxyError> {
-    if !request.headers().contains_key(header::UPGRADE) {
-        return Ok(None);
-    }
-    if protocol != Protocol::Http1 {
-        return Err(ProxyError::UnsupportedUpgrade);
-    }
-    Upgrade::request(request)
-        .map(Some)
-        .ok_or(ProxyError::UnsupportedUpgrade)
 }
 
 /// encode the filtered authority and path for the selected upstream protocol.

@@ -37,13 +37,6 @@ pub enum ResponseBody {
     ),
 }
 
-impl ResponseBody {
-    /// wrap a complete local payload for downstream framing.
-    pub fn full(bytes: Bytes) -> Self {
-        Self::Full(Full::new(bytes))
-    }
-}
-
 /// forward both inline body variants and normalize the first variant's transport error.
 macro_rules! forward_body {
     ($name:ident, $first:ident, $second:ident) => {
