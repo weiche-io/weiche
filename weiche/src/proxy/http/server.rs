@@ -4,6 +4,7 @@ use super::super::{
     admission::{Admission, Permit},
     config::RuntimeConfig,
     io::{AcceptedTls, Io, TlsIo},
+    net::tcp,
     stopped,
     up::Tunnel,
 };
@@ -13,6 +14,7 @@ use compio::{
     runtime::{self, time::timeout},
 };
 use cyper_core::{CompioExecutor, CompioTimer};
+use futures::stream;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::server::conn::auto::Builder;
 use std::{io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
@@ -69,18 +71,12 @@ impl Server {
         drain: Duration,
     ) -> io::Result<()> {
         let (connections, _) = watch::channel(false);
-        {
-            let mut accepting = std::pin::pin!(socket.accept());
-            loop {
-                let (stream, peer) = tokio::select! {
-                    biased;
-                    changed = certs.changed() => {
-                        if changed.is_err() { break }
-                        continue;
-                    }
-                    accepted = &mut accepting => accepted?,
-                };
-                accepting.set(socket.accept());
+        // HTTP connections run independently so upgrades can outlive the hyper connection.
+        tcp::accept(
+            socket,
+            &mut certs,
+            &mut stream::pending::<()>(),
+            |(stream, peer), certs, _| {
                 if let Some(permit) = admission.acquire() {
                     runtime::spawn(self.clone().serve(
                         binding.clone(),
@@ -92,9 +88,9 @@ impl Server {
                     ))
                     .detach();
                 }
-            }
-        }
-        drop(socket);
+            },
+        )
+        .await?;
         connections.send_replace(true);
         let _ = timeout(drain, connections.closed()).await;
         Ok(())
@@ -114,30 +110,27 @@ impl Server {
             return;
         }
         let (stream, h2) = if listener.tls {
-            let handshake = tokio::select! {
+            let stream = tokio::select! {
                 _ = shutdown.changed() => return,
-                result = timeout(self.handshake_timeout, accept_tls(stream, &certs)) => result,
-            };
-            let stream = match handshake {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    tracing::debug!(%peer, %error, "tls handshake failed");
-                    return;
-                }
-                Err(_) => {
-                    tracing::debug!(%peer, "tls handshake timed out");
-                    return;
-                }
+                result = timeout(self.handshake_timeout, accept_tls(stream, &certs)) => match result {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%peer, %error, "tls handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(%peer, "tls handshake timed out");
+                        return;
+                    }
+                },
             };
             let h2 = stream.negotiated_alpn() == Some(b"h2");
             (Io::tls(stream), Some(h2))
         } else {
-            let stream = match Io::plain(stream) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
-                    return;
-                }
+            let Ok(stream) = Io::plain(stream).inspect_err(|error| {
+                tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
+            }) else {
+                return;
             };
             (stream, None)
         };
@@ -157,7 +150,7 @@ impl Server {
                     .call(&listener, peer, request.map(RequestBody::Incoming))
                     .await;
                 if let Some(tunnel) = exchange.tunnel {
-                    compio::runtime::spawn(owner.relay(tunnel)).detach();
+                    runtime::spawn(owner.relay(tunnel)).detach();
                 }
                 Ok::<_, std::convert::Infallible>(exchange.response)
             }
@@ -165,8 +158,7 @@ impl Server {
         /// drive each hyper connection type through the same graceful shutdown path.
         macro_rules! serve {
             ($connection:expr) => {{
-                let connection = $connection;
-                tokio::pin!(connection);
+                let mut connection = std::pin::pin!($connection);
                 tokio::select! {
                     result = &mut connection => {
                         if let Err(error) = result {
@@ -206,8 +198,7 @@ struct Owner {
 impl Owner {
     /// relay locally and preserve the listener's normal drain interval on shutdown.
     async fn relay(self: Rc<Self>, tunnel: Tunnel) {
-        let relay = tunnel.relay();
-        tokio::pin!(relay);
+        let mut relay = std::pin::pin!(tunnel.relay());
         let result = tokio::select! {
             result = &mut relay => result,
             _ = stopped(self.shutdown.clone()) => match timeout(self.drain, relay).await {
@@ -224,11 +215,8 @@ impl Owner {
 /// a listener without a hostname also accepts clients that omit SNI.
 async fn accept_tls(stream: TcpStream, certs: &[Arc<ServerTls>]) -> io::Result<TlsIo> {
     let handshake = AcceptedTls::accept(stream).await?;
-    let host = handshake
-        .client_hello()
-        .server_name()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let hello = handshake.client_hello();
+    let host = hello.server_name().unwrap_or_default().to_ascii_lowercase();
     let tls = certs
         .iter()
         .find(|tls| hostname_matches(&tls.hostname, &host))
