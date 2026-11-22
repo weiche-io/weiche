@@ -1,12 +1,11 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
 use super::super::{super::ir::Protocol, admission::EndpointKey, up::Upgrade};
-use super::Body;
+use super::ResponseBody;
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
     uri::Authority,
 };
-use http_body_util::{BodyExt, Full};
 
 /// errors mapped to local HTTP responses.
 pub enum ProxyError {
@@ -52,7 +51,7 @@ pub fn is_grpc<B>(request: &Request<B>) -> bool {
 
 impl ProxyError {
     /// emit a trailers-only gRPC response when a call cannot be dispatched.
-    pub fn for_request(self, grpc: bool) -> Response<Body> {
+    pub fn for_request(self, grpc: bool) -> Response<ResponseBody> {
         if grpc {
             let code = match self {
                 Self::NoRoute => "12",
@@ -60,7 +59,7 @@ impl ProxyError {
                 Self::Timeout => "4",
                 _ => return self.response(),
             };
-            let mut response = Response::new(full_body(Bytes::new()));
+            let mut response = Response::new(ResponseBody::full(Bytes::new()));
             *response.version_mut() = Version::HTTP_2;
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -75,10 +74,10 @@ impl ProxyError {
     }
 
     /// format a local response with the corresponding HTTP status.
-    pub fn response(self) -> Response<Body> {
+    pub fn response(self) -> Response<ResponseBody> {
         let (status, text) = match self {
             Self::Redirect(status, location) => {
-                let mut response = Response::new(full_body(Bytes::new()));
+                let mut response = Response::new(ResponseBody::full(Bytes::new()));
                 *response.status_mut() = status;
                 response.headers_mut().insert(header::LOCATION, location);
                 return response;
@@ -102,7 +101,8 @@ impl ProxyError {
             Self::Upstream => (StatusCode::BAD_GATEWAY, "backend request failed\n"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "request timed out\n"),
         };
-        let mut response = Response::new(full_body(Bytes::from_static(text.as_bytes())));
+        let mut response =
+            Response::new(ResponseBody::full(Bytes::from_static(text.as_bytes())));
         *response.status_mut() = status;
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -110,11 +110,6 @@ impl ProxyError {
         );
         response
     }
-}
-
-/// build a complete local response without involving an upstream stream.
-pub fn full_body(bytes: Bytes) -> Body {
-    Box::pin(Full::new(bytes).map_err(|never| -> std::io::Error { never }))
 }
 
 /// parse the single Host field used by HTTP/1 or supplied by a route filter.

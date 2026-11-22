@@ -14,7 +14,7 @@ use super::{
     config::RuntimeConfig,
     up::{ConnectionPool, Deadlines, Tunnel, UpstreamClient},
 };
-pub use body::RequestBody;
+pub use body::{RequestBody, ResponseBody};
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, Version, header, uri::Authority};
 use router::{Hosts, Router};
@@ -22,18 +22,13 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
-    pin::Pin,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 use wire::{
-    ProxyError, full_body, is_grpc, normalize_authority, prepare_request,
-    strip_hop_headers,
+    ProxyError, is_grpc, normalize_authority, prepare_request, strip_hop_headers,
 };
-
-/// streaming response bodies stay on the owning compio worker.
-pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = std::io::Error>>>;
 
 /// routing state installed atomically on one worker.
 struct WorkerView {
@@ -240,10 +235,10 @@ impl ProxyService {
         listener: &Binding,
         peer: SocketAddr,
         mut request: Request<RequestBody>,
-    ) -> (Response<Body>, Option<Tunnel>) {
+    ) -> (Response<ResponseBody>, Option<Tunnel>) {
         let start = Instant::now();
         let version = request.version();
-        let advertise = |mut response: Response<Body>| {
+        let advertise = |mut response: Response<ResponseBody>| {
             if listener.tls
                 && version != Version::HTTP_3
                 && let Some((active, value)) =
@@ -273,7 +268,7 @@ impl ProxyService {
             Err(error) => return (advertise(error.for_request(grpc)), None),
         };
         let (response, tunnel) = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
-            let mut response = Response::new(full_body(Bytes::new()));
+            let mut response = Response::new(ResponseBody::full(Bytes::new()));
             *response.status_mut() = StatusCode::NO_CONTENT;
             (response, None)
         } else {
@@ -315,7 +310,7 @@ impl ProxyService {
         mut request: Request<RequestBody>,
         original: &Authority,
         selection: &Selection,
-    ) -> Result<(Response<Body>, Option<Tunnel>), ProxyError> {
+    ) -> Result<(Response<ResponseBody>, Option<Tunnel>), ProxyError> {
         let rule = &selection.rule;
         let backend = selection.backend.as_ref();
         if let Some(r) = rule.redirect.as_ref().or_else(|| backend?.1.redirect.as_ref()) {
@@ -362,7 +357,7 @@ impl ProxyService {
             upgrade.restore(request.headers_mut());
         }
         let address = endpoint.key.address;
-        let exchange = self
+        let mut exchange = self
             .upstream
             .send(endpoint, request, upgrade, selection.budget)
             .await
@@ -377,9 +372,8 @@ impl ProxyService {
                     ProxyError::Upstream
                 }
             })?;
-        let (mut parts, body) = exchange.response.into_parts();
-        strip_hop_headers(&mut parts.headers);
-        Ok((Response::from_parts(parts, Box::pin(body)), exchange.tunnel))
+        strip_hop_headers(exchange.response.headers_mut());
+        Ok((exchange.response.map(ResponseBody::Upstream), exchange.tunnel))
     }
 }
 

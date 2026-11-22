@@ -3,7 +3,7 @@ use super::super::{
     super::ir::Binding,
     admission::Permit,
     config::RuntimeConfig,
-    http::{Body, ProxyService, RequestBody, wire::strip_hop_headers},
+    http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
     stopped,
     up::ResponseDeadline,
 };
@@ -215,7 +215,7 @@ where
 /// flush the headers, data and optional trailers while respecting peer flow control.
 async fn respond<S: h3::quic::SendStream<Bytes>>(
     send: &mut RequestStream<S, Bytes>,
-    response: Response<Body>,
+    response: Response<ResponseBody>,
     head: bool,
 ) -> anyhow::Result<()> {
     let (mut parts, mut body) = response.into_parts();
