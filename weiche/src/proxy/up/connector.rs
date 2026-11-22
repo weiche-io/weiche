@@ -3,7 +3,7 @@ use super::{
     super::{
         super::ir::Protocol,
         admission::EndpointKey,
-        http::Body,
+        http::RequestBody,
         io::{Io, TlsIo},
     },
     deadline::TimedBody,
@@ -18,7 +18,7 @@ use hyper::{
 };
 
 /// request sender paired with its worker-local connection driver.
-pub struct Connected<S = http1::SendRequest<TimedBody<Body>>> {
+pub struct Connected<S = http1::SendRequest<TimedBody<RequestBody>>> {
     /// hyper handle for dispatching requests.
     pub sender: S,
     /// cancelling a lease also cancels its driver on the owning runtime.

@@ -3,7 +3,7 @@ use super::super::{
     super::ir::Binding,
     admission::Permit,
     config::RuntimeConfig,
-    http::{Body, ProxyService, wire::strip_hop_headers},
+    http::{Body, ProxyService, RequestBody, wire::strip_hop_headers},
     stopped,
     up::ResponseDeadline,
 };
@@ -187,7 +187,8 @@ where
     let head = req.method() == Method::HEAD;
     let (mut send, recv) = stream.split();
     let malformed = Rc::new(Notify::new());
-    let req = req.map(|()| upload(recv, length, malformed.clone()));
+    let req = req
+        .map(|()| RequestBody::Stream(Box::pin(upload(recv, length, malformed.clone()))));
     let exchange = async {
         let (response, _) = service.call(binding, peer, req).await;
         let deadline = response.extensions().get::<ResponseDeadline>().copied();

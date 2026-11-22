@@ -1,4 +1,5 @@
 //! worker-local service composition; keep-alive requests borrow the current view.
+mod body;
 mod cors;
 mod filter;
 mod router;
@@ -13,9 +14,9 @@ use super::{
     config::RuntimeConfig,
     up::{ConnectionPool, Deadlines, Tunnel, UpstreamClient},
 };
+pub use body::RequestBody;
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, Version, header, uri::Authority};
-use http_body_util::BodyExt;
 use router::{Hosts, Router};
 use std::{
     cell::RefCell,
@@ -31,7 +32,7 @@ use wire::{
     strip_hop_headers,
 };
 
-/// streaming request and response bodies stay on the owning compio worker.
+/// streaming response bodies stay on the owning compio worker.
 pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = std::io::Error>>>;
 
 /// routing state installed atomically on one worker.
@@ -200,7 +201,7 @@ impl ProxyService {
         &self,
         listener: &Binding,
         authority: &Authority,
-        request: &Request<Body>,
+        request: &Request<RequestBody>,
         start: Instant,
         grpc: bool,
     ) -> Result<Selection, ProxyError> {
@@ -234,18 +235,12 @@ impl ProxyService {
     }
 
     /// route the original request and apply response filters to the selected response.
-    pub async fn call<B>(
+    pub async fn call(
         &self,
         listener: &Binding,
         peer: SocketAddr,
-        request: Request<B>,
-    ) -> (Response<Body>, Option<Tunnel>)
-    where
-        B: hyper::body::Body<Data = Bytes> + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let mut request =
-            request.map(|b| Box::pin(b.map_err(std::io::Error::other)) as Body);
+        mut request: Request<RequestBody>,
+    ) -> (Response<Body>, Option<Tunnel>) {
         let start = Instant::now();
         let version = request.version();
         let advertise = |mut response: Response<Body>| {
@@ -317,7 +312,7 @@ impl ProxyService {
         &self,
         listener: &Binding,
         peer: SocketAddr,
-        mut request: Request<Body>,
+        mut request: Request<RequestBody>,
         original: &Authority,
         selection: &Selection,
     ) -> Result<(Response<Body>, Option<Tunnel>), ProxyError> {

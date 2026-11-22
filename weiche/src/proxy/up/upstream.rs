@@ -1,5 +1,5 @@
 //! request dispatch and conservative retry over the worker's connection pool.
-use super::super::http::Body;
+use super::super::http::RequestBody;
 use super::{
     super::super::ir::Protocol,
     deadline::{Deadlines, ResponseDeadline, TimedBody},
@@ -22,7 +22,7 @@ enum Attempt {
     /// response headers received from the selected backend.
     Complete(Exchange),
     /// original request was never dispatched.
-    Retry(Request<Body>),
+    Retry(Request<RequestBody>),
 }
 
 /// dispatch requests using the worker's bounded pool.
@@ -41,7 +41,7 @@ impl UpstreamClient {
     pub async fn send(
         &self,
         endpoint: Rc<Endpoint>,
-        mut request: Request<Body>,
+        mut request: Request<RequestBody>,
         mut upgrade: Option<Upgrade>,
         budget: Deadlines,
     ) -> anyhow::Result<Exchange> {
@@ -72,7 +72,7 @@ impl UpstreamClient {
     async fn http1(
         &self,
         endpoint: Rc<Endpoint>,
-        request: Request<Body>,
+        request: Request<RequestBody>,
         upgrade: Option<Upgrade>,
         first: bool,
         end: Option<Instant>,
@@ -112,7 +112,7 @@ impl UpstreamClient {
     async fn http2(
         &self,
         endpoint: &Rc<Endpoint>,
-        request: Request<Body>,
+        request: Request<RequestBody>,
         end: Option<Instant>,
     ) -> anyhow::Result<Attempt> {
         let lease = self.pool.acquire_http2(endpoint).await?;

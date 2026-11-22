@@ -1,6 +1,6 @@
 //! a shared HTTP/2 connection and its active request and response streams.
 use super::{
-    super::http::Body,
+    super::http::RequestBody,
     connector::Connected,
     deadline::TimedBody,
     pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot},
@@ -138,7 +138,7 @@ impl Http2Lease {
     }
 
     /// attach stream accounting before arming the upload deadline.
-    pub fn upload(&self, body: Body) -> Upload {
+    pub fn upload(&self, body: RequestBody) -> Upload {
         Upload { body, _stream: self.stream.clone() }
     }
 
@@ -151,14 +151,14 @@ impl Http2Lease {
 /// request body retaining stream capacity until upload completion.
 pub struct Upload {
     /// original streaming upload from the downstream request.
-    body: Body,
+    body: RequestBody,
     /// shared stream accounting guard.
     _stream: Rc<Stream>,
 }
 
 impl Upload {
     /// recover a body returned before dispatch for a fresh attempt.
-    pub fn into_inner(self) -> Body {
+    pub fn into_inner(self) -> RequestBody {
         self.body
     }
 }

@@ -7,7 +7,7 @@ use super::super::{
     stopped,
     up::Tunnel,
 };
-use super::ProxyService;
+use super::{ProxyService, RequestBody};
 use compio::{
     net::{TcpListener, TcpStream},
     runtime::{self, time::timeout},
@@ -152,8 +152,10 @@ impl Server {
             let listener = listener.clone();
             let owner = owner.clone();
             async move {
-                let (response, tunnel) =
-                    server.service.call(&listener, peer, request).await;
+                let (response, tunnel) = server
+                    .service
+                    .call(&listener, peer, request.map(RequestBody::Incoming))
+                    .await;
                 if let Some(tunnel) = tunnel {
                     compio::runtime::spawn(owner.relay(tunnel)).detach();
                 }
