@@ -11,19 +11,27 @@ use std::{
 };
 use weiche_gtwapi::v1::gateways::Gateway;
 
+/// label identifying the gateway that owns a workload.
 pub const OWNER: &str = "weiche.io/gateway-uid";
 
 /// controller decisions and the observed serving state for this Gateway.
 pub struct Plan {
+    /// gateway observed during this reconciliation.
     pub gateway: Arc<Gateway>,
+    /// address types and values published on the gateway.
     pub addresses: Vec<(String, String)>,
+    /// whether the workers have applied the desired revision.
     pub programmed: bool,
+    /// whether the gateway is outside the deployment scope.
     pub denied: bool,
+    /// provisioning failure to report on the gateway.
     pub issue: Option<String>,
+    /// attachment and reference results for each listener.
     pub listeners: Vec<Compiled>,
 }
 
 impl Plan {
+    /// start a plan for the observed gateway.
     pub fn new(gateway: Arc<Gateway>) -> Self {
         Self {
             gateway,
@@ -35,6 +43,7 @@ impl Plan {
         }
     }
 
+    /// group eligible routes by socket and listener hostname.
     pub fn compile(
         stores: &GatewayStores,
         gateway: Arc<Gateway>,
@@ -65,8 +74,12 @@ impl Plan {
                                 tls: vec![],
                             },
                             routes: vec![],
+                            hostnames: Vec::new(),
                         });
                     socket.listener.tls.extend(result.tls.iter().cloned());
+                    if let Some(hostname) = &listener.hostname {
+                        socket.hostnames.push(hostname.to_ascii_lowercase());
+                    }
                     socket.routes.append(&mut result.routes);
                 }
             }

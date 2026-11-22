@@ -7,6 +7,11 @@ use std::{net::SocketAddr, sync::Arc};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PathMatch<R> {
+    /// match the two path components of a native gRPC call.
+    Grpc {
+        /// optional service and method predicates.
+        grpc: GrpcMethod<R>,
+    },
     /// match the request path with the configured regex dialect.
     RegularExpression {
         /// original pattern in the snapshot, or its compiled worker representation.
@@ -32,6 +37,15 @@ pub enum ValueMatch<R> {
         /// original pattern in the snapshot, or its compiled worker representation.
         regex: R,
     },
+}
+
+/// component predicates on a gRPC method path, shared by snapshots and workers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrpcMethod<R> {
+    /// fully qualified service name before the final slash.
+    pub service: Option<ValueMatch<R>>,
+    /// method name after the final slash.
+    pub method: Option<ValueMatch<R>>,
 }
 
 /// one HTTP match whose path, method, header and query predicates must all hold.

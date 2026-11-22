@@ -11,6 +11,7 @@ use kube_lease_manager::LeaseManagerBuilder;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// start resource watches and reconcile while holding the writer lease.
 pub async fn run() -> anyhow::Result<()> {
     let settings = Settings::load()?;
     let mut lease_config = kube::Config::infer().await?;
@@ -55,6 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
     result
 }
 
+/// wait for all initial lists and publish changes while elected.
 async fn lead(
     client: &Client,
     stores: &GatewayStores,
@@ -65,6 +67,7 @@ async fn lead(
         stores.gateway_classes.wait_until_ready(),
         stores.gateways.wait_until_ready(),
         stores.http_routes.wait_until_ready(),
+        stores.grpc_routes.wait_until_ready(),
         stores.tcp_routes.wait_until_ready(),
         stores.udp_routes.wait_until_ready(),
         stores.secrets.wait_until_ready(),

@@ -5,7 +5,7 @@ KIND_SHA256_amd64 := eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb9
 KIND_SHA256_arm64 := 8e1014e87c34901cc422a1445866835d1e666f2a61301c27e722bdeab5a1f7e4
 KIND              := $(SPEC)/kind-$(KIND_VERSION)/kind
 NODE_IMAGE        := docker.io/kindest/node:v1.35.0
-PROFILES          := GATEWAY-HTTP,GATEWAY-TCP,GATEWAY-UDP
+PROFILES          := GATEWAY-HTTP,GATEWAY-GRPC,GATEWAY-TCP,GATEWAY-UDP
 
 .PHONY: conformance-source conformance-tools conformance
 conformance-source: $(SUITE)/go.work

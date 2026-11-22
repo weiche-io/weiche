@@ -105,7 +105,12 @@ pub async fn update_status(
             class_old.get("conditions"),
         );
         class_status["supportedFeatures"] = [
+            "BackendTLSPolicy",
+            "GRPCRoute",
+            "GRPCRouteNamedRouteRule",
+            "GRPCRouteRequestHeaderModifier",
             "Gateway",
+            "GatewayRouteHostnameIntersectionPrecedence",
             "HTTPRoute",
             "HTTPRoute303RedirectStatusCode",
             "HTTPRoute307RedirectStatusCode",
@@ -160,6 +165,7 @@ pub async fn update_status(
         };
     }
     routes!(stores.http_routes);
+    routes!(stores.grpc_routes);
     routes!(stores.tcp_routes);
     routes!(stores.udp_routes);
     Ok(())
@@ -323,11 +329,11 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             .map(|r| &r.uid)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let kinds = if let Some(kind) = report.supported_kind {
-            json!([{"group": "gateway.networking.k8s.io", "kind": kind}])
-        } else {
-            json!([])
-        };
+        let kinds: Vec<_> = report
+            .supported_kinds
+            .iter()
+            .map(|kind| json!({"group":"gateway.networking.k8s.io", "kind":kind}))
+            .collect();
         let conditions = stamp(
             vec![
                 condition(

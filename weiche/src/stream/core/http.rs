@@ -7,8 +7,8 @@ use super::{
     super::{
         super::{
             ir::{
-                Backend, Binding, Filters, HeaderChange, Protocol, PublishedSnapshot,
-                Revision, Route, RouteAction,
+                Backend, Binding, Filters, HeaderChange, PathMatch, Protocol,
+                PublishedSnapshot, Revision, RouteAction,
             },
             rtconf::RuntimeConfig,
         },
@@ -23,7 +23,7 @@ use http::{
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use router::Router;
+use router::{Hosts, Router};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
@@ -44,7 +44,7 @@ struct WorkerView {
     /// gateway default for receiving backend headers.
     deadline: Duration,
     /// routers indexed by downstream listening address.
-    routes: BTreeMap<SocketAddr, tcp::Route<Router>>,
+    routes: BTreeMap<SocketAddr, tcp::Route<Hosts<Router>>>,
 }
 
 impl WorkerView {
@@ -65,7 +65,8 @@ impl WorkerView {
         let mut clusters: HashMap<_, _> = previous
             .into_iter()
             .flat_map(|view| view.routes.values())
-            .flat_map(|socket| socket.target.routes())
+            .flat_map(|socket| socket.target.values())
+            .flat_map(Router::routes)
             .flat_map(|route| &route.action.backends)
             .filter_map(|backend| backend.cluster.as_ref().ok())
             .map(|c| (c.spec.clone(), c.clone()))
@@ -73,9 +74,8 @@ impl WorkerView {
         let mut endpoints = HashSet::new();
         let mut routes = BTreeMap::new();
         for (address, socket) in &gateway.sockets {
-            let router = Router::compile(socket.routes.iter().map(|route| {
-                let backends = route
-                    .action
+            let mut prepare = |action: &RouteAction| {
+                let backends = action
                     .backends
                     .iter()
                     .map(|backend| Backend {
@@ -102,20 +102,29 @@ impl WorkerView {
                             .map_err(|e| *e),
                     })
                     .collect();
-                let action = RouteAction {
+                RouteAction {
                     backends,
-                    filters: route.action.filters.clone(),
-                    timeouts: route.action.timeouts,
-                };
-                Route {
-                    hostname: route.hostname.clone(),
-                    http: route.http.clone(),
-                    action,
+                    filters: action.filters.clone(),
+                    timeouts: action.timeouts,
                 }
-            }))?;
+            };
+            let mut by_listener: BTreeMap<_, Vec<_>> =
+                socket.hostnames.iter().map(|h| (h.as_str(), Vec::new())).collect();
+            for route in &socket.routes {
+                let listener = route.host.as_ref().map_or("", |h| h.listener.as_str());
+                by_listener.entry(listener).or_default().push(route);
+            }
+            let mut listeners = Vec::new();
+            for (hostname, rules) in by_listener {
+                let router = Router::compile(rules, &mut prepare)?;
+                listeners.push((hostname.to_owned(), router));
+            }
             routes.insert(
                 *address,
-                tcp::Route { binding: socket.listener.binding(), target: router },
+                tcp::Route {
+                    binding: socket.listener.binding(),
+                    target: listeners.into_iter().collect(),
+                },
             );
         }
         Ok((
@@ -181,21 +190,20 @@ impl ProxyService {
         authority: &Authority,
         request: &Request<Incoming>,
         start: Instant,
+        grpc: bool,
     ) -> Result<Selection, ProxyError> {
         let view = self.view.borrow();
+        let hostname = authority.host().to_ascii_lowercase();
         let router = view
             .routes
             .get(&listener.address)
             .and_then(|r| r.find(listener))
+            .and_then(|hosts| hosts.matching(&hostname).next())
             .ok_or(ProxyError::NoRoute)?;
-        let (action, backend) = router
-            .find(
-                &authority.host().to_ascii_lowercase(),
-                request.uri(),
-                request.method(),
-                request.headers(),
-            )
+        let (route, backend) = router
+            .find(&hostname, request.uri(), request.method(), request.headers(), grpc)
             .ok_or(ProxyError::NoRoute)?;
+        let action = &route.action;
         let cors = backend
             .and_then(|b| b.filters.cors.as_ref())
             .or(action.filters.cors.as_ref())
@@ -205,6 +213,7 @@ impl ProxyService {
         let backend = backend
             .and_then(|b| Some((b.cluster.as_ref().ok()?.clone(), b.filters.clone())));
         Ok(Selection {
+            grpc: matches!(route.http.path, PathMatch::Grpc { .. }),
             rule: action.filters.clone(),
             backend,
             cors,
@@ -228,9 +237,10 @@ impl ProxyService {
             Ok(authority) => authority,
             Err(error) => return (error.response(), None),
         };
-        let selection = match self.select(listener, &authority, &request, start) {
+        let grpc = is_grpc(&request);
+        let selection = match self.select(listener, &authority, &request, start, grpc) {
             Ok(s) => s,
-            Err(error) => return (error.response(), None),
+            Err(error) => return (error.for_request(grpc), None),
         };
         let (mut response, tunnel) =
             if selection.cors.as_ref().is_some_and(|c| c.preflight) {
@@ -240,7 +250,7 @@ impl ProxyService {
             } else {
                 self.forward(listener, peer, request, &authority, &selection)
                     .await
-                    .unwrap_or_else(|error| (error.response(), None))
+                    .unwrap_or_else(|error| (error.for_request(selection.grpc), None))
             };
         *response.version_mut() = version;
         let headers = response.headers_mut();
@@ -312,8 +322,9 @@ impl ProxyService {
         prepare_request(
             &mut request,
             authority,
-            endpoint.key.protocol,
+            &endpoint.key,
             listener.tls,
+            selection.grpc,
             trailers,
             path,
         )?;
@@ -344,6 +355,8 @@ impl ProxyService {
 
 /// routing decisions retained across asynchronous admission and forwarding.
 struct Selection {
+    /// whether the selected route uses native gRPC forwarding and errors.
+    grpc: bool,
     /// listener rule and its response filters.
     rule: Arc<Filters>,
     /// selected target and backend-specific filters.
@@ -376,7 +389,45 @@ enum ProxyError {
     Timeout,
 }
 
+/// recognize native gRPC media types with an optional codec suffix and parameters.
+fn is_grpc<B>(request: &Request<B>) -> bool {
+    request.version() == Version::HTTP_2
+        && request.method() == http::Method::POST
+        && request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                let media = v.split(';').next().unwrap_or("").trim();
+                let base = media.split_once('+').map_or(media, |(base, _)| base);
+                base.eq_ignore_ascii_case("application/grpc")
+            })
+}
+
 impl ProxyError {
+    /// emit a trailers-only gRPC response when a call cannot be dispatched.
+    fn for_request(self, grpc: bool) -> Response<Body> {
+        if grpc {
+            let code = match self {
+                Self::NoRoute => "12",
+                Self::InvalidBackend | Self::NoEndpoints | Self::Upstream => "14",
+                Self::Timeout => "4",
+                _ => return self.response(),
+            };
+            let mut response = Response::new(full_body(Bytes::new()));
+            *response.version_mut() = Version::HTTP_2;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            );
+            response
+                .headers_mut()
+                .insert("grpc-status", HeaderValue::from_static(code));
+            return response;
+        }
+        self.response()
+    }
+
     /// format a local response with the corresponding HTTP status.
     fn response(self) -> Response<Body> {
         let (status, text) = match self {
@@ -458,12 +509,13 @@ fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, Pro
 fn prepare_request(
     request: &mut Request<Incoming>,
     authority: Authority,
-    protocol: Protocol,
+    endpoint: &EndpointKey,
     downstream_tls: bool,
+    grpc: bool,
     trailers: bool,
     path: Option<http::uri::PathAndQuery>,
 ) -> Result<(), ProxyError> {
-    if trailers {
+    if trailers || grpc {
         request
             .headers_mut()
             .insert(header::TE, http::HeaderValue::from_static("trailers"));
@@ -474,7 +526,7 @@ fn prepare_request(
     }
     uri.path_and_query
         .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
-    match protocol {
+    match endpoint.protocol {
         Protocol::Http1 => {
             *request.version_mut() = Version::HTTP_11;
             if !request.headers().contains_key(header::HOST) {
@@ -503,11 +555,14 @@ fn prepare_request(
             *request.version_mut() = Version::HTTP_2;
             // encode authority once; some HTTP/2 servers reject a duplicate Host field.
             request.headers_mut().remove(header::HOST);
-            uri.scheme.get_or_insert(if downstream_tls {
-                http::uri::Scheme::HTTPS
-            } else {
-                http::uri::Scheme::HTTP
-            });
+            if grpc || uri.scheme.is_none() {
+                let tls = if grpc { endpoint.tls.is_some() } else { downstream_tls };
+                uri.scheme = Some(if tls {
+                    http::uri::Scheme::HTTPS
+                } else {
+                    http::uri::Scheme::HTTP
+                });
+            }
             uri.authority = Some(authority);
         }
     }

@@ -5,7 +5,7 @@ use super::super::super::ir::{
 use super::{HttpRouteRules, PathType, ResolveError};
 use http::{HeaderName, HeaderValue, StatusCode, header};
 use std::{collections::HashSet, net::IpAddr};
-use weiche_gtwapi::v1::httproutes::*;
+use weiche_gtwapi::v1::{grpcroutes::*, httproutes::*};
 
 /// validate an explicit Gateway API precise hostname.
 fn hostname(host: &str) -> Result<&str, ResolveError> {
@@ -286,4 +286,39 @@ filters!(
     HttpRouteRulesBackendRefsFiltersRequestRedirectScheme,
     HttpRouteRulesBackendRefsFiltersRequestRedirectPathType,
     HttpRouteRulesBackendRefsFiltersUrlRewritePathType
+);
+
+/// compile gRPC metadata operations from either generated filter schema.
+macro_rules! grpc_filters {
+    ($name:ident, $filter:ty, $kind:ident) => {
+        /// validate the ordered header filters for a gRPC rule or backend.
+        pub fn $name(filters: &[$filter]) -> Result<Filters, ResolveError> {
+            let mut result = Filters::default();
+            let mut seen = HashSet::new();
+            for f in filters {
+                if !seen.insert(std::mem::discriminant(&f.r#type)) {
+                    return Err(ResolveError::IncompatibleFilters);
+                }
+                let invalid = ResolveError::UnsupportedValue;
+                match f.r#type {
+                    $kind::RequestHeaderModifier => {
+                        result.headers =
+                            changes!(f.request_header_modifier.as_ref().ok_or(invalid)?)
+                    }
+                    $kind::ResponseHeaderModifier => {
+                        result.response_headers =
+                            changes!(f.response_header_modifier.as_ref().ok_or(invalid)?)
+                    }
+                    _ => return Err(invalid),
+                }
+            }
+            Ok(result)
+        }
+    };
+}
+grpc_filters!(grpc_rule_filters, GrpcRouteRulesFilters, GrpcRouteRulesFiltersType);
+grpc_filters!(
+    grpc_backend_filters,
+    GrpcRouteRulesBackendRefsFilters,
+    GrpcRouteRulesBackendRefsFiltersType
 );

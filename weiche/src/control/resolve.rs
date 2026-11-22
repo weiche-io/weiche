@@ -1,9 +1,10 @@
 //! translate watched route resources against the controller's local stores.
 mod filters;
+mod grpc;
 
 use super::{
     super::ir::{
-        Backend, ClusterSpec, Http, PathMatch, Protocol, RefError, RouteAction,
+        Backend, ClusterSpec, Filters, Http, PathMatch, Protocol, RefError, RouteAction,
         StreamRoute, Timeouts, Transport, ValueMatch,
     },
     GatewayStores,
@@ -24,6 +25,7 @@ use weiche_gtwapi::v1::httproutes::{
     HttpRouteRulesMatchesQueryParamsType as QueryType,
 };
 use weiche_gtwapi::v1::{
+    grpcroutes::GrpcRouteRulesBackendRefs,
     tcproutes::{TcpRoute, TcpRouteRulesBackendRefs},
     udproutes::{UdpRoute, UdpRouteRulesBackendRefs},
 };
@@ -47,7 +49,7 @@ impl ResolveError {
     }
 }
 
-/// resolved matches and action for one HTTPRoute rule.
+/// resolved predicates and forwarding action for one HTTP or gRPC rule.
 pub struct HttpRule {
     /// alternative predicates that select this action.
     pub matches: Vec<Http>,
@@ -89,21 +91,36 @@ impl GatewayStores {
             {
                 return Err(ResolveError::IncompatibleFilters);
             }
-            validated.push((reference, backend));
+            validated.push((
+                reference.weight.unwrap_or(1),
+                ServiceRef::from(reference),
+                backend,
+            ));
         }
-        let backends = validated
-            .into_iter()
-            .map(|(reference, backend)| Backend {
-                weight: reference.weight.unwrap_or(1),
-                cluster: resolve_backend(self, policies, namespace, reference)
-                    .map(Arc::new),
-                filters: Arc::new(backend),
-            })
-            .collect();
+        let backends = self.resolve_backends(namespace, "HTTPRoute", policies, validated);
         Ok(HttpRule {
             matches,
             action: RouteAction { backends, filters: Arc::new(filters), timeouts },
         })
+    }
+
+    /// keep an unresolved reference in its weighted slot and bind filters to that slot.
+    fn resolve_backends(
+        &self,
+        namespace: &str,
+        source: &str,
+        policies: &mut Policies,
+        validated: Vec<(u32, ServiceRef<'_>, Filters)>,
+    ) -> Vec<Backend<Arc<ClusterSpec>>> {
+        validated
+            .into_iter()
+            .map(|(weight, reference, filters)| Backend {
+                weight,
+                cluster: resolve_backend(self, policies, namespace, source, reference)
+                    .map(Arc::new),
+                filters: Arc::new(filters),
+            })
+            .collect()
     }
 }
 
@@ -153,6 +170,17 @@ fn regex(pattern: &str) -> Result<String, ResolveError> {
     Ok(pattern.to_owned())
 }
 
+impl ValueMatch<String> {
+    /// validate a literal or Rust regex for one method component or metadata value.
+    fn resolve(value: &str, regular: bool) -> Result<Self, ResolveError> {
+        if regular {
+            Ok(Self::RegularExpression { regex: regex(value)? })
+        } else {
+            Ok(Self::Exact(value.into()))
+        }
+    }
+}
+
 /// retain the first predicate per name, ignoring later entries even for validation.
 fn named_matches<'a>(
     predicates: impl Iterator<Item = (String, &'a str, bool)>,
@@ -161,12 +189,7 @@ fn named_matches<'a>(
     let mut matches = Vec::new();
     for (name, value, regular) in predicates {
         if seen.insert(name.clone()) {
-            let predicate = if regular {
-                ValueMatch::RegularExpression { regex: regex(value)? }
-            } else {
-                ValueMatch::Exact(value.into())
-            };
-            matches.push((name, predicate));
+            matches.push((name, ValueMatch::resolve(value, regular)?));
         }
     }
     Ok(matches)
@@ -240,32 +263,40 @@ fn resolve_backend(
     stores: &GatewayStores,
     policies: &mut Policies,
     namespace: &str,
-    backend: &HttpRouteRulesBackendRefs,
+    source: &str,
+    reference: ServiceRef<'_>,
 ) -> Result<ClusterSpec, RefError> {
-    let reference = ServiceRef::from(backend);
-    let (service, port) =
-        reference.resolve(stores, namespace, "HTTPRoute", Transport::Tcp)?;
+    let (service, port) = reference.resolve(stores, namespace, source, Transport::Tcp)?;
     let namespace = reference.namespace.unwrap_or(namespace);
-    // https and h2 require an authenticated transport; h2c explicitly uses cleartext.
-    let protocol = match port.app_protocol.as_deref() {
-        None
-        | Some(
-            "http" | "kubernetes.io/http" | "https" | "kubernetes.io/ws"
-            | "kubernetes.io/wss",
+    // a gRPC route selects HTTP/2 even when the Service omits appProtocol.
+    let app = port.app_protocol.as_deref();
+    let protocol = match (source, app) {
+        (
+            "GRPCRoute",
+            None
+            | Some("http" | "https" | "kubernetes.io/http" | "kubernetes.io/h2c" | "h2"),
+        ) => Protocol::Http2,
+        (
+            "HTTPRoute",
+            None
+            | Some(
+                "http" | "kubernetes.io/http" | "https" | "kubernetes.io/ws"
+                | "kubernetes.io/wss",
+            ),
         ) => Protocol::Http1,
-        Some("kubernetes.io/h2c" | "h2") => Protocol::Http2,
+        ("HTTPRoute", Some("kubernetes.io/h2c" | "h2")) => Protocol::Http2,
         _ => return Err(RefError::UnsupportedProtocol),
     };
     let tls =
         policies.backend(stores, namespace, &service, port.name.as_deref(), protocol)?;
-    match (port.app_protocol.as_deref(), &tls) {
-        (Some("https" | "h2" | "kubernetes.io/wss"), None)
-        | (Some("kubernetes.io/h2c" | "kubernetes.io/ws"), Some(_)) => {
+    match (source, app, &tls) {
+        (_, Some("https" | "h2" | "kubernetes.io/wss"), None)
+        | ("HTTPRoute", Some("kubernetes.io/h2c" | "kubernetes.io/ws"), Some(_)) => {
             return Err(RefError::UnsupportedProtocol);
         }
         _ => {}
     }
-    let endpoints = endpoints(stores, namespace, &backend.name, &port, Transport::Tcp);
+    let endpoints = endpoints(stores, namespace, reference.name, &port, Transport::Tcp);
     Ok(ClusterSpec { endpoints, protocol, tls })
 }
 
@@ -350,6 +381,7 @@ macro_rules! service_ref {
     };
 }
 service_ref!(HttpRouteRulesBackendRefs);
+service_ref!(GrpcRouteRulesBackendRefs);
 service_ref!(TcpRouteRulesBackendRefs);
 service_ref!(UdpRouteRulesBackendRefs);
 

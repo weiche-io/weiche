@@ -1,8 +1,8 @@
 //! select HTTP routes by hostname, path, method, headers and query parameters.
 use super::super::{
     super::super::ir::{
-        Backend, Http, PathMatch, Route, RouteAction, ValueMatch, hostname_matches,
-        weighted_by,
+        Backend, GrpcMethod, Http, PathMatch, Route, RouteAction, ValueMatch,
+        hostname_matches, weighted_by,
     },
     Cluster,
 };
@@ -17,10 +17,15 @@ use std::{
 };
 
 /// compiled route owned by one worker.
-type WorkerRoute = Route<Rc<Cluster>, Regex>;
+pub struct WorkerRoute {
+    /// predicates with precompiled regular expressions.
+    pub http: Http<Regex>,
+    /// resolved targets and filters for this match.
+    pub action: RouteAction<Rc<Cluster>>,
+}
 
 /// route action and the single weighted backend selected for this request.
-type Selected<'a> = (&'a RouteAction<Rc<Cluster>>, Option<&'a Backend<Rc<Cluster>>>);
+type Selected<'a> = (&'a WorkerRoute, Option<&'a Backend<Rc<Cluster>>>);
 
 /// decoded first values, borrowing from the URI when no unescaping is necessary.
 type Query<'a> = HashMap<Cow<'a, str>, Cow<'a, str>>;
@@ -31,16 +36,20 @@ fn compile_values(
 ) -> Result<Vec<(String, ValueMatch<Regex>)>, regex::Error> {
     values
         .into_iter()
-        .map(|(name, value)| {
-            let value = match value {
-                ValueMatch::Exact(value) => ValueMatch::Exact(value),
-                ValueMatch::RegularExpression { regex } => {
-                    ValueMatch::RegularExpression { regex: Regex::new(&regex)? }
-                }
-            };
-            Ok((name, value))
-        })
+        .map(|(name, value)| Ok((name, value.compile()?)))
         .collect()
+}
+
+impl ValueMatch<String> {
+    /// compile regular expressions once when installing a snapshot.
+    fn compile(self) -> Result<ValueMatch<Regex>, regex::Error> {
+        Ok(match self {
+            Self::Exact(value) => ValueMatch::Exact(value),
+            Self::RegularExpression { regex } => {
+                ValueMatch::RegularExpression { regex: Regex::new(&regex)? }
+            }
+        })
+    }
 }
 
 impl ValueMatch<Regex> {
@@ -59,6 +68,12 @@ impl Http<Regex> {
     /// prepare the worker representation without changing the serialized snapshot.
     fn compile(http: Http) -> Result<Self, regex::Error> {
         let path = match http.path {
+            PathMatch::Grpc { grpc } => PathMatch::Grpc {
+                grpc: GrpcMethod {
+                    service: grpc.service.map(ValueMatch::compile).transpose()?,
+                    method: grpc.method.map(ValueMatch::compile).transpose()?,
+                },
+            },
             PathMatch::Literal { path, exact } => PathMatch::Literal { path, exact },
             PathMatch::RegularExpression { regex } => {
                 PathMatch::RegularExpression { regex: Regex::new(&regex)? }
@@ -81,6 +96,22 @@ impl Http<Regex> {
     ) -> bool {
         let path = uri.path();
         let path_matches = match &self.path {
+            PathMatch::Grpc { grpc } => path
+                .strip_prefix('/')
+                .and_then(|p| p.split_once('/'))
+                .is_some_and(|(service, method)| {
+                    !service.is_empty()
+                        && !method.is_empty()
+                        && !method.contains('/')
+                        && grpc
+                            .service
+                            .as_ref()
+                            .is_none_or(|v| v.matches(service.as_bytes()))
+                        && grpc
+                            .method
+                            .as_ref()
+                            .is_none_or(|v| v.matches(method.as_bytes()))
+                }),
             PathMatch::RegularExpression { regex } => regex.is_match(path),
             PathMatch::Literal { path: pattern, exact } => {
                 path == pattern
@@ -117,9 +148,19 @@ impl Http<Regex> {
         })
     }
 
-    /// rank regex paths below all literal paths, breaking regex ties by the other predicates.
+    /// rank native gRPC components or HTTP paths before counting metadata predicates.
     fn rank(&self) -> (u8, usize, bool, usize, usize) {
         let (kind, length) = match &self.path {
+            PathMatch::Grpc { grpc } => {
+                let kind = match (&grpc.service, &grpc.method) {
+                    (Some(ValueMatch::Exact(_)), Some(ValueMatch::Exact(_))) => 4,
+                    (Some(ValueMatch::Exact(_)), None) => 3,
+                    (None, Some(ValueMatch::Exact(_))) => 2,
+                    (None, None) => 0,
+                    _ => 1,
+                };
+                (kind, 0)
+            }
             PathMatch::Literal { exact: true, .. } => (2, 0),
             PathMatch::Literal { path, exact: false } => (1, path.len()),
             PathMatch::RegularExpression { .. } => (0, 0),
@@ -128,46 +169,103 @@ impl Http<Regex> {
     }
 }
 
-/// worker-local route index sorted by hostname specificity and match precedence.
-#[derive(Default)]
+/// hostname index shared by listener selection and route matching.
+pub struct Hosts<T> {
+    /// exact hostnames match first.
+    exact: BTreeMap<String, T>,
+    /// wildcard hostnames ordered by descending suffix length.
+    wildcard: Vec<(String, T)>,
+    /// unrestricted hostname matches last.
+    fallback: Option<T>,
+}
+
+impl<T> FromIterator<(String, T)> for Hosts<T> {
+    fn from_iter<I: IntoIterator<Item = (String, T)>>(entries: I) -> Self {
+        let mut hosts = Self {
+            exact: BTreeMap::new(),
+            wildcard: Vec::new(),
+            fallback: None,
+        };
+        for (hostname, value) in entries {
+            if hostname.is_empty() {
+                hosts.fallback = Some(value);
+            } else if hostname.starts_with("*.") {
+                hosts.wildcard.push((hostname, value));
+            } else {
+                hosts.exact.insert(hostname, value);
+            }
+        }
+        hosts.wildcard.sort_by_key(|(h, _)| Reverse(h.len()));
+        hosts
+    }
+}
+
+impl<T> Hosts<T> {
+    /// enumerate matching hostnames from most to least specific.
+    pub fn matching<'a>(&'a self, hostname: &str) -> impl Iterator<Item = &'a T> {
+        self.exact
+            .get(hostname)
+            .into_iter()
+            .chain(
+                self.wildcard
+                    .iter()
+                    .filter(move |(pattern, _)| hostname_matches(pattern, hostname))
+                    .map(|(_, v)| v),
+            )
+            .chain(self.fallback.iter())
+    }
+
+    /// visit every value when reusing worker-local clusters.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.exact
+            .values()
+            .chain(self.wildcard.iter().map(|(_, v)| v))
+            .chain(self.fallback.iter())
+    }
+}
+
+/// independent routing tables for HTTP and native gRPC on one listener.
 pub struct Router {
-    /// routes with an exact hostname.
-    exact: BTreeMap<String, Vec<WorkerRoute>>,
-    /// wildcard hosts sorted by descending suffix length.
-    wildcard: Vec<(String, Vec<WorkerRoute>)>,
-    /// routes accepting any hostname.
-    fallback: Vec<WorkerRoute>,
+    /// ordinary HTTP routes, including gRPC traffic on HTTP-only hosts.
+    http: Hosts<Vec<WorkerRoute>>,
+    /// gRPC routes ranked independently of HTTP path matches.
+    grpc: Hosts<Vec<WorkerRoute>>,
 }
 
 impl Router {
     /// preserve creation time, namespace/name, rule and match order on ties.
-    pub fn compile(
-        routes: impl IntoIterator<Item = Route<Rc<Cluster>>>,
+    pub fn compile<'a>(
+        routes: impl IntoIterator<Item = &'a Route>,
+        mut prepare: impl FnMut(&RouteAction) -> RouteAction<Rc<Cluster>>,
     ) -> Result<Self, regex::Error> {
-        let mut buckets: BTreeMap<String, Vec<_>> = BTreeMap::new();
+        let mut http = BTreeMap::<_, Vec<_>>::new();
+        let mut grpc = BTreeMap::<_, Vec<_>>::new();
         for route in routes {
-            let hostname = route.hostname.to_ascii_lowercase();
-            let route = Route {
-                hostname: hostname.clone(),
-                http: Http::compile(route.http)?,
-                action: route.action,
-            };
-            buckets.entry(hostname).or_default().push(route);
-        }
-        let mut router = Self::default();
-        for (hostname, mut routes) in buckets {
-            // stable sorting preserves compiler-established tie order.
-            routes.sort_by_key(|route| Reverse(route.http.rank()));
-            if hostname.is_empty() {
-                router.fallback = routes;
-            } else if hostname.starts_with("*.") {
-                router.wildcard.push((hostname, routes));
+            let hosts = if matches!(route.http.path, PathMatch::Grpc { .. }) {
+                &mut grpc
             } else {
-                router.exact.insert(hostname, routes);
-            }
+                &mut http
+            };
+            let hostname = route.host.as_ref().map_or(&route.hostname, |h| &h.route);
+            hosts
+                .entry(hostname.to_ascii_lowercase())
+                .or_default()
+                .push(WorkerRoute {
+                    http: Http::compile(route.http.clone())?,
+                    action: prepare(&route.action),
+                });
         }
-        router.wildcard.sort_by_key(|(hostname, _)| Reverse(hostname.len()));
-        Ok(router)
+        let ranked = |buckets: BTreeMap<_, Vec<WorkerRoute>>| {
+            buckets
+                .into_iter()
+                .map(|(hostname, mut routes)| {
+                    // stable sorting preserves compiler-established tie order.
+                    routes.sort_by_key(|route| Reverse(route.http.rank()));
+                    (hostname, routes)
+                })
+                .collect()
+        };
+        Ok(Self { http: ranked(http), grpc: ranked(grpc) })
     }
 
     /// select a route and backend, allowing its CORS policy to handle a preflight
@@ -178,43 +276,35 @@ impl Router {
         uri: &Uri,
         method: &Method,
         headers: &HeaderMap,
+        grpc: bool,
     ) -> Option<Selected<'_>> {
         let requested = super::cors::requested_method(method, headers);
         let query = OnceCell::new();
-        self.exact
-            .get(hostname)
-            .into_iter()
-            .chain(
-                self.wildcard
-                    .iter()
-                    .filter(|(pattern, _)| hostname_matches(pattern, hostname))
-                    .map(|(_, routes)| routes),
-            )
-            .chain(std::iter::once(&self.fallback))
-            .flatten()
-            .find_map(|route| {
-                let action = &route.action;
-                let expected = route.http.method.as_deref();
-                let direct = expected.is_none_or(|m| m == method.as_str());
-                if (!direct && requested != expected)
-                    || !route.http.matches(uri, headers, &query)
-                {
-                    return None;
-                }
-                let backend = weighted_by(&action.backends, |b| b.weight);
-                (direct
-                    || action.filters.cors.is_some()
-                    || backend.is_some_and(|b| b.filters.cors.is_some()))
-                .then_some((action, backend))
-            })
+        // once a hostname has a gRPC route, unmatched RPCs receive UNIMPLEMENTED.
+        let table = if grpc && self.grpc.matching(hostname).next().is_some() {
+            &self.grpc
+        } else {
+            &self.http
+        };
+        table.matching(hostname).flatten().find_map(|route| {
+            let action = &route.action;
+            let expected = route.http.method.as_deref();
+            let direct = expected.is_none_or(|m| m == method.as_str());
+            if (!direct && requested != expected)
+                || !route.http.matches(uri, headers, &query)
+            {
+                return None;
+            }
+            let backend = weighted_by(&action.backends, |b| b.weight);
+            (direct
+                || action.filters.cors.is_some()
+                || backend.is_some_and(|b| b.filters.cors.is_some()))
+            .then_some((route, backend))
+        })
     }
 
     /// enumerate installed routes for cluster reuse during a snapshot change.
     pub fn routes(&self) -> impl Iterator<Item = &WorkerRoute> {
-        self.exact
-            .values()
-            .chain(self.wildcard.iter().map(|(_, routes)| routes))
-            .chain(std::iter::once(&self.fallback))
-            .flatten()
+        self.http.values().chain(self.grpc.values()).flatten()
     }
 }

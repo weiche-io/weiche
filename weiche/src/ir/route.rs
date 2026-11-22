@@ -102,15 +102,27 @@ pub enum HeaderChange {
     Remove(#[serde(with = "http_serde_ext::header_name")] HeaderName),
 }
 
+/// original hostnames when a route attaches to a hostname-specific listener.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteHost {
+    /// listener selected before comparing its route predicates.
+    pub listener: String,
+    /// configured route hostname used to rank matching rules.
+    pub route: String,
+}
+
 /// resolved HTTP match and its forwarding action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route<T = Arc<ClusterSpec>, R = String> {
-    /// listener and route hostname intersection.
+    /// effective intersection used by workers that read flattened route tables.
     pub hostname: String,
     /// predicates which select this rule.
     pub http: Http<R>,
     /// transformations and forwarding targets.
     pub action: RouteAction<T>,
+    /// original listener and route names retained across an intersection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<RouteHost>,
 }
 
 /// match an exact, wildcard or unrestricted hostname.

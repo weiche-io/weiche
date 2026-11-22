@@ -1,4 +1,4 @@
-//! Kubernetes watches and their live resource caches.
+//! maintain Kubernetes watches and their live resource caches.
 mod cleanup;
 mod compile;
 mod reconcile;
@@ -33,8 +33,8 @@ use std::{fmt::Debug, future::ready};
 use tokio::sync::watch;
 use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
-    gateways::Gateway, httproutes::HttpRoute, referencegrants::ReferenceGrant,
-    tcproutes::TcpRoute, udproutes::UdpRoute,
+    gateways::Gateway, grpcroutes::GrpcRoute, httproutes::HttpRoute,
+    referencegrants::ReferenceGrant, tcproutes::TcpRoute, udproutes::UdpRoute,
 };
 
 /// live snapshots maintained by kube-runtime, including updates and deletions.
@@ -42,27 +42,44 @@ use weiche_gtwapi::v1::{
 /// consistent and do not form an atomic snapshot.
 #[derive(Clone)]
 pub struct GatewayStores {
+    /// gateway classes used to identify owned gateways.
     pub gateway_classes: Store<GatewayClass>,
+    /// gateways that may own proxy workloads.
     pub gateways: Store<Gateway>,
+    /// watched routes for TCP listeners.
     pub tcp_routes: Store<TcpRoute>,
+    /// watched routes for UDP listeners.
     pub udp_routes: Store<UdpRoute>,
+    /// watched routes for HTTP and HTTPS listeners.
     pub http_routes: Store<HttpRoute>,
+    /// watched gRPC routes available for listener attachment.
+    pub grpc_routes: Store<GrpcRoute>,
+    /// certificate chains and keys for terminating TLS.
     pub secrets: Store<Secret>,
+    /// namespace labels used by listener selectors.
     pub namespaces: Store<Namespace>,
+    /// permissions for references into another namespace.
     pub grants: Store<ReferenceGrant>,
+    /// certificate authorities referenced by backend policies.
     pub config_maps: Store<ConfigMap>,
+    /// authentication policies attached to backend Services.
     pub tls_policies: Store<BackendTlsPolicy>,
+    /// backend Services and their declared ports.
     pub services: Store<Service>,
+    /// addresses and ports of ready backends.
     pub endpoint_slices: Store<EndpointSlice>,
 }
 
 /// maintains resource caches for the reconciliation loop.
 /// uses reflectors directly because these watches have no per-object reconcile.
 pub struct GatewayController {
+    /// resource stores shared with the compiler.
     stores: GatewayStores,
+    /// watch streams that update the stores.
     watches: Vec<BoxStream<'static, ()>>,
 }
 impl GatewayController {
+    /// create cluster-wide reflectors for the controller.
     pub fn new(client: Client) -> Self {
         let defaults = watcher::Config::default;
         let (gateway_classes, classes_watch) =
@@ -71,6 +88,7 @@ impl GatewayController {
         let (tcp_routes, tcp_watch) = cache(Api::all(client.clone()), defaults());
         let (udp_routes, udp_watch) = cache(Api::all(client.clone()), defaults());
         let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
+        let (grpc_routes, grpc_watch) = cache(Api::all(client.clone()), defaults());
         let (secrets, secrets_watch) =
             cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
         let (namespaces, namespaces_watch) = cache(Api::all(client.clone()), defaults());
@@ -84,6 +102,7 @@ impl GatewayController {
                 gateway_classes,
                 gateways,
                 http_routes,
+                grpc_routes,
                 tcp_routes,
                 udp_routes,
                 secrets,
@@ -98,6 +117,7 @@ impl GatewayController {
                 classes_watch,
                 gateways_watch,
                 routes_watch,
+                grpc_watch,
                 tcp_watch,
                 udp_watch,
                 secrets_watch,
@@ -110,6 +130,7 @@ impl GatewayController {
             ],
         }
     }
+    /// clone the read handles for reconciliation.
     pub fn stores(&self) -> GatewayStores {
         self.stores.clone()
     }
@@ -127,6 +148,7 @@ impl GatewayController {
     }
 }
 
+/// watch one resource type and signal after applying changes.
 fn cache<K>(api: Api<K>, config: watcher::Config) -> (Store<K>, BoxStream<'static, ()>)
 where
     K: Resource<DynamicType = ()>
