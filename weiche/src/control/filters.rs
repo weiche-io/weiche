@@ -178,13 +178,13 @@ macro_rules! filters {
         /// resolve one ordered list of rule or backend filters.
         pub fn $name(
             $($rule: &HttpRouteRules,)?
-            filters: &[$filter],
+            filters: Option<&[$filter]>,
         ) -> Result<Filters, ResolveError> {
             use $kind as Kind;
             let invalid = ResolveError::UnsupportedValue;
             let mut seen = HashSet::new();
             let mut result = Filters::default();
-            for f in filters {
+            for f in filters.unwrap_or_default() {
                 if !seen.insert(std::mem::discriminant(&f.r#type)) {
                     return Err(ResolveError::IncompatibleFilters);
                 }

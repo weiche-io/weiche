@@ -103,8 +103,7 @@ impl GatewayStores {
             Some(matches) => matches.iter().map(http_match).collect::<Result<_, _>>()?,
         };
         let timeouts = timeouts(rule)?;
-        let filters =
-            filters::rule_filters(rule, rule.filters.as_deref().unwrap_or_default())?;
+        let filters = filters::rule_filters(rule, rule.filters.as_deref())?;
         let references = rule.backend_refs.as_deref().unwrap_or_default();
         if filters.redirect.is_some() && !references.is_empty() {
             return Err(ResolveError::IncompatibleFilters);
@@ -112,10 +111,7 @@ impl GatewayStores {
         // validate the entire rule before recording any backend TLS policy status.
         let mut validated = Vec::with_capacity(references.len());
         for reference in references {
-            let backend = filters::backend_filters(
-                rule,
-                reference.filters.as_deref().unwrap_or_default(),
-            )?;
+            let backend = filters::backend_filters(rule, reference.filters.as_deref())?;
             if backend.redirect.is_some()
                 && rule.filters.iter().flatten().any(|f| f.url_rewrite.is_some())
             {
@@ -144,12 +140,10 @@ impl GatewayStores {
                 .map(|m| grpc_match(Some(m)))
                 .collect::<Result<_, _>>()?,
         };
-        let filters =
-            filters::grpc_rule_filters(rule.filters.as_deref().unwrap_or_default())?;
+        let filters = filters::grpc_rule_filters(rule.filters.as_deref())?;
         let mut validated = Vec::new();
         for r in rule.backend_refs.iter().flatten() {
-            let backend =
-                filters::grpc_backend_filters(r.filters.as_deref().unwrap_or_default())?;
+            let backend = filters::grpc_backend_filters(r.filters.as_deref())?;
             validated.push((service_ref!(r, namespace), backend));
         }
         let backends = self.resolve_backends(namespace, "GRPCRoute", policies, validated);
@@ -373,59 +367,8 @@ fn resolve_backend(
     if requires_tls.is_some_and(|required| required != tls.is_some()) {
         return Err(RefError::UnsupportedProtocol);
     }
-    let endpoints = endpoints(stores, target, reference.name, &port, Transport::Tcp);
+    let endpoints = reference.endpoints(stores, &port, Transport::Tcp);
     Ok(ClusterSpec { endpoints, protocol, tls })
-}
-
-/// collect only ready endpoints for the selected Service port and transport.
-fn endpoints(
-    stores: &GatewayStores,
-    namespace: &str,
-    name: &str,
-    port: &ServicePort,
-    transport: Transport,
-) -> Vec<SocketAddr> {
-    let mut endpoints = vec![];
-    for slice in stores.endpoint_slices.state() {
-        if slice.namespace().as_deref() != Some(namespace)
-            || slice.metadata.deletion_timestamp.is_some()
-            || slice.labels().get("kubernetes.io/service-name").map(String::as_str)
-                != Some(name)
-            || !matches!(slice.address_type.as_str(), "IPv4" | "IPv6")
-        {
-            continue;
-        }
-        for slice_port in slice.ports.iter().flatten().filter(|candidate| {
-            candidate.name.as_deref().unwrap_or("") == port.name.as_deref().unwrap_or("")
-                && candidate.protocol.as_deref().unwrap_or("TCP") == transport.protocol()
-        }) {
-            let Some(endpoint_port) = slice_port
-                .port
-                .and_then(|port| u16::try_from(port).ok())
-                .filter(|&port| port != 0)
-            else {
-                continue;
-            };
-            for endpoint in slice.endpoints.iter().flatten() {
-                let conditions = endpoint.conditions.as_ref();
-                if conditions.is_some_and(|conditions| {
-                    conditions.ready == Some(false)
-                        || conditions.terminating == Some(true)
-                        || conditions.serving == Some(false)
-                }) {
-                    continue;
-                }
-                for address in &endpoint.addresses {
-                    if let Ok(ip) = address.parse::<IpAddr>() {
-                        endpoints.push(SocketAddr::new(ip, endpoint_port));
-                    }
-                }
-            }
-        }
-    }
-    endpoints.sort_unstable();
-    endpoints.dedup();
-    endpoints
 }
 
 impl ServiceRef<'_> {
@@ -463,16 +406,49 @@ impl ServiceRef<'_> {
             .ok_or(RefError::BackendNotFound)?;
         Ok((service, port))
     }
-    /// resolve a transport reference to its ready endpoint addresses.
-    fn stream(
+    /// collect only ready endpoints for the selected Service port and transport.
+    fn endpoints(
         &self,
         stores: &GatewayStores,
-        namespace: &str,
-        source: &str,
+        port: &ServicePort,
         transport: Transport,
-    ) -> Result<Vec<SocketAddr>, RefError> {
-        let (_, port) = self.resolve(stores, namespace, source, transport)?;
-        Ok(endpoints(stores, self.namespace, self.name, &port, transport))
+    ) -> Vec<SocketAddr> {
+        let mut endpoints = vec![];
+        for slice in stores.endpoint_slices.state() {
+            if slice.namespace().as_deref() != Some(self.namespace)
+                || slice.metadata.deletion_timestamp.is_some()
+                || slice.labels().get("kubernetes.io/service-name").map(String::as_str)
+                    != Some(self.name)
+                || !matches!(slice.address_type.as_str(), "IPv4" | "IPv6")
+            {
+                continue;
+            }
+            for slice_port in slice.ports.iter().flatten().filter(|candidate| {
+                candidate.name.as_deref().unwrap_or("")
+                    == port.name.as_deref().unwrap_or("")
+                    && candidate.protocol.as_deref().unwrap_or("TCP")
+                        == transport.protocol()
+            }) {
+                let Some(endpoint_port @ 1..=65535) = slice_port.port else { continue };
+                for endpoint in slice.endpoints.iter().flatten() {
+                    if endpoint.conditions.as_ref().is_some_and(|c| {
+                        c.ready == Some(false)
+                            || c.terminating == Some(true)
+                            || c.serving == Some(false)
+                    }) {
+                        continue;
+                    }
+                    for address in &endpoint.addresses {
+                        if let Ok(ip) = address.parse::<IpAddr>() {
+                            endpoints.push(SocketAddr::new(ip, endpoint_port as u16));
+                        }
+                    }
+                }
+            }
+        }
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        endpoints
     }
 }
 
@@ -491,10 +467,10 @@ macro_rules! stream_resolver {
                 .iter()
                 .map(|r| {
                     let reference = service_ref!(r, namespace);
-                    (
-                        reference.weight,
-                        reference.stream(self, namespace, &kind, $transport),
-                    )
+                    let target = reference
+                        .resolve(self, namespace, &kind, $transport)
+                        .map(|(_, port)| reference.endpoints(self, &port, $transport));
+                    (reference.weight, target)
                 })
                 .collect();
             Ok(StreamRoute { backends })
