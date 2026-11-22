@@ -2773,6 +2773,7 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rustls-native-certs",
+ "send_wrapper",
  "serde",
  "serde_json",
  "socket2",
