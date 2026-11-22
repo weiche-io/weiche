@@ -1,10 +1,10 @@
 //! select HTTP routes by hostname, path, method, headers and query parameters.
 use super::super::{
-    super::super::ir::{
+    super::ir::{
         Backend, GrpcMethod, Http, PathMatch, Route, RouteAction, ValueMatch,
         hostname_matches, weighted_by,
     },
-    Cluster,
+    admission::Cluster,
 };
 use ::http::{HeaderMap, Method, Uri};
 use regex::Regex;

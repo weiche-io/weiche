@@ -2,17 +2,16 @@
 mod cors;
 mod filter;
 mod router;
+pub mod server;
 
 use super::{
-    super::{
-        super::ir::{
-            Backend, Binding, Filters, HeaderChange, PathMatch, Protocol,
-            PublishedSnapshot, Revision, RouteAction,
-        },
-        config::RuntimeConfig,
-        up::{ConnectionPool, Deadlines, Tunnel, Upgrade, UpstreamClient},
+    super::ir::{
+        Backend, Binding, Filters, HeaderChange, PathMatch, Protocol, PublishedSnapshot,
+        Revision, RouteAction,
     },
-    Cluster, EndpointKey, tcp,
+    admission::{Cluster, EndpointKey, Route},
+    config::RuntimeConfig,
+    up::{ConnectionPool, Deadlines, Tunnel, Upgrade, UpstreamClient},
 };
 use bytes::Bytes;
 use http::{
@@ -41,7 +40,7 @@ struct WorkerView {
     /// gateway default for receiving backend headers.
     deadline: Duration,
     /// routers indexed by downstream listening address.
-    routes: BTreeMap<SocketAddr, tcp::Route<Hosts<Router>>>,
+    routes: BTreeMap<SocketAddr, Route<Hosts<Router>>>,
 }
 
 impl WorkerView {
@@ -118,7 +117,7 @@ impl WorkerView {
             }
             routes.insert(
                 *address,
-                tcp::Route {
+                Route {
                     binding: socket.listener.binding(),
                     target: listeners.into_iter().collect(),
                 },

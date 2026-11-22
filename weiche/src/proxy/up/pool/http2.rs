@@ -1,6 +1,6 @@
 //! a shared HTTP/2 connection and its active request and response streams.
 use super::{
-    super::{super::core::http::Body, connector::Connected, deadline::TimedBody},
+    super::{super::http::Body, connector::Connected, deadline::TimedBody},
     ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use bytes::Bytes;

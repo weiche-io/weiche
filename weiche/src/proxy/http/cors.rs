@@ -1,5 +1,5 @@
 //! evaluate cross-origin requests against the selected rule or backend policy.
-use super::super::super::super::ir::{Cors, Origin};
+use super::super::super::ir::{Cors, Origin};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, header::*};
 
 /// retrieve an unambiguous singleton field.

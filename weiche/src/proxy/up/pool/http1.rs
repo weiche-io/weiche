@@ -1,6 +1,6 @@
 //! exclusive HTTP/1 leases and idle connection reuse.
 use super::{
-    super::{super::core::http::Body, connector::Connected, deadline::TimedBody},
+    super::{super::http::Body, connector::Connected, deadline::TimedBody},
     ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use compio::runtime;

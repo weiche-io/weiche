@@ -1,5 +1,5 @@
 //! request dispatch and conservative retry over the worker's connection pool.
-use super::super::core::http::Body;
+use super::super::http::Body;
 use super::{
     super::super::ir::Protocol,
     deadline::{Deadlines, ResponseDeadline, TimedBody},

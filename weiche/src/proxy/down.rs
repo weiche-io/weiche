@@ -1,10 +1,8 @@
 //! downstream listener transports and per-worker application reports.
-mod http;
 mod passthrough;
 pub mod quic;
 mod relay;
 pub mod tcp;
-mod tls;
 pub mod udp;
 
 use super::super::ir::{Revision, Transport};

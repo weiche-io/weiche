@@ -1,16 +1,17 @@
 //! supervise the gateway watch and its worker-local compio data planes.
+pub mod admission;
 pub mod config;
-pub mod core;
 pub mod down;
+pub mod http;
 mod io;
 pub mod up;
 mod watch;
 
 use super::ir::GatewaySnapshot;
+use admission::Admission;
 use anyhow::Context;
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use config::RuntimeConfig;
-use core::tcp::Admission;
 use down::{ListenerGroup, WorkerGroupState, tcp};
 use std::{mem::DropGuard, sync::Arc, thread};
 use tokio::sync::watch::{Receiver, Sender, channel};

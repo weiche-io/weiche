@@ -1,9 +1,6 @@
 //! upstream HTTP client handshakes and connections on the owning compio runtime.
 use super::{
-    super::{
-        core::{EndpointKey, http::Body},
-        io::Io,
-    },
+    super::{admission::EndpointKey, http::Body, io::Io},
     deadline::TimedBody,
     tls,
 };

@@ -1,18 +1,18 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::ir::{Binding, ServerTls},
+    super::ir::{Binding, ServerTls, hostname_matches},
+    admission::Permit,
     config::RuntimeConfig,
-    core::{http::ProxyService, tcp::Permit},
-    io::Io,
+    io::{AcceptedTls, Io, TlsIo},
     stopped,
     up::Tunnel,
 };
-use super::tls;
+use super::ProxyService;
 use compio::{net::TcpStream, runtime::time::timeout};
 use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::server::conn::auto::Builder;
-use std::{net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 /// downstream HTTP/1 and HTTP/2 server configured for one worker.
@@ -72,7 +72,7 @@ impl Server {
         let (stream, h2) = if listener.tls {
             let handshake = tokio::select! {
                 _ = shutdown.changed() => return,
-                result = timeout(self.handshake_timeout, tls::accept(stream, &certs)) => result,
+                result = timeout(self.handshake_timeout, accept_tls(stream, &certs)) => result,
             };
             let stream = match handshake {
                 Ok(Ok(stream)) => stream,
@@ -173,4 +173,19 @@ impl Owner {
             tracing::debug!(%error, "http tunnel ended");
         }
     }
+}
+
+/// a listener without a hostname also accepts clients that omit SNI.
+async fn accept_tls(stream: TcpStream, certs: &[Arc<ServerTls>]) -> io::Result<TlsIo> {
+    let handshake = AcceptedTls::accept(stream).await?;
+    let host = handshake
+        .client_hello()
+        .server_name()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let tls = certs
+        .iter()
+        .find(|tls| hostname_matches(&tls.hostname, &host))
+        .ok_or_else(|| io::Error::other("SNI does not match a listener hostname"))?;
+    handshake.into_stream(tls.config()).await
 }

@@ -3,7 +3,7 @@ mod http1;
 mod http2;
 
 use super::{
-    super::{super::ir::Protocol, config::RuntimeConfig, core::EndpointKey},
+    super::{super::ir::Protocol, admission::EndpointKey, config::RuntimeConfig},
     connector::Connector,
 };
 use bytes::Bytes;

@@ -1,5 +1,5 @@
 //! apply validated HTTPRoute filters without decoding the request path or query.
-use super::super::super::super::ir::{PathModifier, Redirect};
+use super::super::super::ir::{PathModifier, Redirect};
 use super::{
     Binding, Filters, HeaderChange, ProxyError, host_authority, strip_hop_headers,
 };

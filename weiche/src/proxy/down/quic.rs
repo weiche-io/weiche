@@ -5,8 +5,9 @@ mod h3;
 
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
+    admission::Admission,
     config::RuntimeConfig,
-    core::{http::ProxyService, tcp::Admission},
+    http::ProxyService,
     stopped,
 };
 use compio::{

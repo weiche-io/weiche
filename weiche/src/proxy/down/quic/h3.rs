@@ -2,10 +2,8 @@
 use super::{
     super::super::{
         super::ir::Binding,
-        core::{
-            http::{Body, ProxyService, strip_hop_headers},
-            tcp::Permit,
-        },
+        admission::Permit,
+        http::{Body, ProxyService, strip_hop_headers},
         up::ResponseDeadline,
     },
     RuntimeConfig, stopped,

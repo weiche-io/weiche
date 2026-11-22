@@ -1,14 +1,14 @@
 //! worker socket lifecycle for HTTP and transport routes.
 use super::{
+    super::http::server::Server,
     super::{
         super::ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
+        admission::Admission,
         config::{self, RuntimeConfig},
-        core::{http::ProxyService, tcp::Admission},
+        http::ProxyService,
         stopped,
     },
-    ListenerGroup, WorkerStatus, bind_socket,
-    http::Server,
-    quic,
+    ListenerGroup, WorkerStatus, bind_socket, quic,
 };
 use compio::{
     net::TcpListener,
