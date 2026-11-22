@@ -6,7 +6,6 @@ on:
       - 'weiche-gtwapi/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - '.github/workflows/test.yml'
       - 'rust-toolchain.toml'
   # warm branch caches on master so new pull requests reuse them.
   push:

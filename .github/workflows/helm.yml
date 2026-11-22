@@ -25,4 +25,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s\n' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - run: helm push "target/helm/weiche-$TAG.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+      - name: Push chart to GHCR
+        shell: bash
+        run: |
+          for delay in 0 5 15; do
+            sleep "$delay"
+            if helm push "target/helm/weiche-$TAG.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" 2>&1 | tee "$RUNNER_TEMP/helm-push.log"; then
+              exit 0
+            fi
+            # GHCR can briefly return 404 when Helm reads the manifest it just pushed.
+            grep -Eq 'failed to perform "Tag" on destination: sha256:[[:xdigit:]]+: not found' "$RUNNER_TEMP/helm-push.log" || exit 1
+          done
+          exit 1
