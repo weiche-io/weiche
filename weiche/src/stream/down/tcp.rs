@@ -2,7 +2,7 @@
 use super::{
     super::{
         super::{
-            ir::{Binding, ServerTls, StreamRoute, Transport},
+            ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
             routing,
             rtconf::RuntimeConfig,
         },
@@ -48,6 +48,7 @@ pub async fn run(
         (Transport, SocketAddr),
         (String, watch::Sender<Arc<StreamRoute>>),
     >::new();
+    let mut tls = BTreeMap::<SocketAddr, watch::Sender<Arc<TlsSocket>>>::new();
     let mut serving = FuturesUnordered::new();
     let stopping = stopped(stop.subscribe());
     tokio::pin!(stopping);
@@ -102,16 +103,41 @@ pub async fn run(
                 .get(key)
                 .is_some_and(|l| &l.gateway_uid == uid)
         });
+        tls.retain(|addr, tx| {
+            snapshot
+                .gateway
+                .tls
+                .get(addr)
+                .is_some_and(|s| s.gateway_uid == tx.borrow().gateway_uid)
+        });
+        for (address, socket) in &snapshot.gateway.tls {
+            if let Some(tx) = tls.get(address) {
+                update(tx, socket);
+                continue;
+            }
+            match listen(*address) {
+                Ok(listener) => {
+                    let (tx, rx) = watch::channel(socket.clone());
+                    serving.push(
+                        super::relay::serve(
+                            listener,
+                            rx,
+                            admission.clone(),
+                            runtime.clone(),
+                            super::passthrough::forward,
+                        )
+                        .boxed_local(),
+                    );
+                    tls.insert(*address, tx);
+                }
+                Err(error) => {
+                    tracing::warn!(%address, %error, "tls listener bind failed")
+                }
+            }
+        }
         for (&key, listener) in &snapshot.gateway.streams {
             if let Some((_, tx)) = streams.get(&key) {
-                tx.send_if_modified(|current| {
-                    if *current == listener.route {
-                        false
-                    } else {
-                        *current = listener.route.clone();
-                        true
-                    }
-                });
+                update(tx, &listener.route);
                 continue;
             }
             let (tx, rx) = watch::channel(listener.route.clone());
@@ -122,8 +148,8 @@ pub async fn run(
                         s,
                         rx,
                         admission.clone(),
-                        runtime.tcp_connect_timeout,
-                        runtime.connection_drain_timeout,
+                        runtime.clone(),
+                        super::relay::tcp,
                     )
                     .boxed_local()
                 }),
@@ -153,12 +179,14 @@ pub async fn run(
                 revision: snapshot.revision,
                 bound: sockets
                     .keys()
+                    .chain(tls.keys())
                     .map(|a| (Transport::Tcp, *a))
                     .chain(streams.keys().copied())
                     .collect(),
             },
         );
         let retry = sockets.len() != snapshot.gateway.sockets.len()
+            || tls.len() != snapshot.gateway.tls.len()
             || streams.len() != snapshot.gateway.streams.len();
         tokio::select! {
             biased;
@@ -170,10 +198,22 @@ pub async fn run(
     }
     drop(sockets);
     drop(streams);
+    drop(tls);
     while serving.next().await.is_some() {}
     listeners.report(id, WorkerStatus::default());
     server.service.close();
     Ok(())
+}
+
+/// notify an existing socket only when its forwarding table changes.
+fn update<T: PartialEq>(tx: &watch::Sender<Arc<T>>, desired: &Arc<T>) {
+    tx.send_if_modified(|current| {
+        if current == desired {
+            return false;
+        }
+        *current = desired.clone();
+        true
+    });
 }
 
 /// own the accept future and drain only the connections belonging to this binding.

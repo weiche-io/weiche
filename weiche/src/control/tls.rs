@@ -1,6 +1,6 @@
 //! resolve listener certificates and Service TLS policies against the local stores.
-//! HTTPS uses one kubernetes.io/tls Secret with tls.crt and tls.key. cross-namespace
-//! references require a ReferenceGrant from the Secret namespace.
+//! terminating HTTPS listeners use one kubernetes.io/tls Secret with tls.crt and tls.key.
+//! cross-namespace references require a ReferenceGrant from the Secret namespace.
 //! a BackendTLSPolicy selects a Service or named port, its DNS identity and either
 //! one ConfigMap containing ca.crt or the process's system trust store.
 use super::{
@@ -22,14 +22,25 @@ use weiche_gtwapi::v1::{
 /// condition reason and message, safe to publish in resource status.
 #[derive(Clone, Debug)]
 pub struct TlsError {
+    /// gateway API condition reason.
     pub reason: &'static str,
+    /// description suitable for inclusion in status.
     pub message: String,
 }
 
 impl TlsError {
+    /// construct a reportable TLS configuration error.
     fn new(reason: &'static str, message: impl Into<String>) -> Self {
         Self { reason, message: message.into() }
     }
+}
+
+/// identify listeners that forward the original TLS session without a certificate.
+pub fn passthrough(listener: &GatewayListeners) -> bool {
+    matches!(
+        listener.tls.as_ref().and_then(|tls| tls.mode.as_ref()),
+        Some(GatewayListenersTlsMode::Passthrough)
+    )
 }
 
 /// validate listener settings and resolve the single core certificate reference.
@@ -40,6 +51,22 @@ pub fn listener_tls(
 ) -> Result<Option<Arc<ServerTls>>, TlsError> {
     let invalid = |message| TlsError::new("InvalidCertificateRef", message);
     let tls = match (listener.protocol.as_str(), &listener.tls) {
+        ("TLS", Some(tls)) if passthrough(listener) => {
+            if tls.options.as_ref().is_some_and(|options| !options.is_empty()) {
+                return Err(TlsError::new(
+                    "UnsupportedValue",
+                    "unsupported passthrough TLS options",
+                ));
+            }
+            // the gateway API ignores certificateRefs in passthrough mode.
+            return Ok(None);
+        }
+        ("TLS", _) => {
+            return Err(TlsError::new(
+                "UnsupportedValue",
+                "TLS listeners require passthrough mode",
+            ));
+        }
         ("HTTP", None) => return Ok(None),
         ("HTTPS", Some(tls)) => tls,
         ("HTTPS", None) => return Err(invalid("HTTPS requires a certificate reference")),
@@ -49,7 +76,7 @@ pub fn listener_tls(
         _ => {
             return Err(TlsError::new(
                 "UnsupportedProtocol",
-                "supported listener protocols are HTTP and HTTPS",
+                "unsupported gateway listener protocol",
             ));
         }
     };
@@ -104,7 +131,9 @@ pub fn listener_tls(
 /// policy decisions for Service ports reached during this compilation.
 #[derive(Default)]
 pub struct Policies {
+    /// acceptance decisions for policies referenced by this listener.
     pub reports: HashMap<ObjectRef<BackendTlsPolicy>, Result<(), TlsError>>,
+    /// prepared backend trust settings per policy and transport protocol.
     configs: HashMap<
         (ObjectRef<BackendTlsPolicy>, Protocol),
         Result<Arc<BackendTls>, TlsError>,
@@ -244,6 +273,7 @@ fn policy_tls(
                 .map_err(|e| invalid(&e.to_string()))
         }
         ([], "System") => {
+            /// system trust anchors shared by policies that request system validation.
             static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
             let roots =
                 ROOTS.get_or_init(|| rustls_native_certs::load_native_certs().certs);

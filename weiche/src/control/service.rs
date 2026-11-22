@@ -1,6 +1,6 @@
 //! compile one Gateway and expose its proxy pods at the declared listener ports.
 use super::{
-    super::ir::{GatewaySnapshot, Listener, SocketRoutes, StreamListener},
+    super::ir::{GatewaySnapshot, Listener, SocketRoutes, StreamListener, TlsSocket},
     Compiled, GatewayStores, compile,
 };
 use kube::ResourceExt;
@@ -63,6 +63,21 @@ impl Plan {
                             gateway_uid: uid.clone(),
                             route: Arc::new(result.stream.take().unwrap_or_default()),
                         },
+                    );
+                } else if listener.protocol == "TLS" {
+                    let socket = snapshot.tls.entry(address).or_insert_with(|| {
+                        Arc::new(TlsSocket {
+                            gateway_uid: uid.clone(),
+                            hosts: Default::default(),
+                        })
+                    });
+                    Arc::make_mut(socket).hosts.insert(
+                        listener
+                            .hostname
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                        std::mem::take(&mut result.sni_routes),
                     );
                 } else {
                     let socket =

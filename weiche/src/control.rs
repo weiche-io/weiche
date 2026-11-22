@@ -34,7 +34,8 @@ use tokio::sync::watch;
 use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass,
     gateways::Gateway, grpcroutes::GrpcRoute, httproutes::HttpRoute,
-    referencegrants::ReferenceGrant, tcproutes::TcpRoute, udproutes::UdpRoute,
+    referencegrants::ReferenceGrant, tcproutes::TcpRoute, tlsroutes::TlsRoute,
+    udproutes::UdpRoute,
 };
 
 /// live snapshots maintained by kube-runtime, including updates and deletions.
@@ -48,6 +49,8 @@ pub struct GatewayStores {
     pub gateways: Store<Gateway>,
     /// watched routes for TCP listeners.
     pub tcp_routes: Store<TcpRoute>,
+    /// watched routes for TLS listeners.
+    pub tls_routes: Store<TlsRoute>,
     /// watched routes for UDP listeners.
     pub udp_routes: Store<UdpRoute>,
     /// watched routes for HTTP and HTTPS listeners.
@@ -86,6 +89,7 @@ impl GatewayController {
             cache(Api::all(client.clone()), defaults());
         let (gateways, gateways_watch) = cache(Api::all(client.clone()), defaults());
         let (tcp_routes, tcp_watch) = cache(Api::all(client.clone()), defaults());
+        let (tls_routes, tls_watch) = cache(Api::all(client.clone()), defaults());
         let (udp_routes, udp_watch) = cache(Api::all(client.clone()), defaults());
         let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
         let (grpc_routes, grpc_watch) = cache(Api::all(client.clone()), defaults());
@@ -104,6 +108,7 @@ impl GatewayController {
                 http_routes,
                 grpc_routes,
                 tcp_routes,
+                tls_routes,
                 udp_routes,
                 secrets,
                 namespaces,
@@ -119,6 +124,7 @@ impl GatewayController {
                 routes_watch,
                 grpc_watch,
                 tcp_watch,
+                tls_watch,
                 udp_watch,
                 secrets_watch,
                 namespaces_watch,

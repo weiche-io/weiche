@@ -1,11 +1,14 @@
 //! compile attached routes independently for each listener.
 use std::{net::SocketAddr, sync::Arc};
 
-use super::super::ir::{Route, RouteHost, StreamRoute, Transport, hostname_matches};
+use super::super::ir::{
+    RefError, Route, RouteHost, ServerTls, SniRoutes, StreamRoute, Transport,
+    hostname_matches,
+};
 use super::{
     GatewayStores, ResolveError,
     resolve::HttpRule,
-    tls::{Policies, listener_tls},
+    tls::{Policies, listener_tls, passthrough},
 };
 use kube::{Resource, ResourceExt};
 use serde::Serialize;
@@ -16,6 +19,7 @@ use weiche_gtwapi::v1::{
     grpcroutes::{GrpcRoute, GrpcRouteParentRefs},
     httproutes::{HttpRoute, HttpRouteParentRefs},
     tcproutes::{TcpRoute, TcpRouteParentRefs},
+    tlsroutes::{TlsRoute, TlsRouteParentRefs},
     udproutes::{UdpRoute, UdpRouteParentRefs},
 };
 
@@ -61,13 +65,15 @@ pub struct Compiled {
     /// local listening address.
     pub address: SocketAddr,
     /// terminating TLS configuration when configured.
-    pub tls: Option<Arc<super::super::ir::ServerTls>>,
+    pub tls: Option<Arc<ServerTls>>,
     /// protocol or hostname collision on the listener port.
     pub conflict: Option<&'static str>,
     /// route kinds permitted by the protocol and listener policy.
     pub supported_kinds: Vec<&'static str>,
     /// selected raw transport route.
     pub stream: Option<StreamRoute>,
+    /// earliest attached stream route per intersecting route hostname.
+    pub sni_routes: SniRoutes,
     /// underlying socket protocol.
     pub transport: Transport,
     /// resolved HTTP routes in attachment precedence order.
@@ -100,6 +106,7 @@ pub fn compile(
     let protocol_kinds: &[&str] = match l.protocol.as_str() {
         "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
         "TCP" => &["TCPRoute"],
+        "TLS" if passthrough(l) => &["TLSRoute"],
         "UDP" => &["UDPRoute"],
         _ => &[],
     };
@@ -131,34 +138,38 @@ pub fn compile(
         supported_kinds,
         transport,
         stream: None,
+        sni_routes: SniRoutes::new(),
         routes: vec![],
         reports: vec![],
         accepted: false,
         reason: "Invalid",
         message: "selected Gateway or listener is unavailable".into(),
     };
-    result.conflict = gateway.spec.listeners.iter().find_map(|other| {
-        if other.name == l.name
-            || other.port != l.port
-            || Transport::for_protocol(&other.protocol) != transport
-        {
-            return None;
-        }
-        if other.protocol != l.protocol || raw {
+    let mut peers = gateway.spec.listeners.iter().filter(|other| {
+        other.name != l.name
+            && other.port == l.port
+            && Transport::for_protocol(&other.protocol) == transport
+    });
+    let mixed = l.protocol == "TLS"
+        && peers
+            .clone()
+            .any(|other| other.protocol == "TLS" && passthrough(other) != passthrough(l));
+    result.conflict =
+        if mixed || peers.clone().any(|other| other.protocol != l.protocol || raw) {
             Some("ProtocolConflict")
-        } else if other
-            .hostname
-            .as_deref()
-            .unwrap_or_default()
-            .eq_ignore_ascii_case(l.hostname.as_deref().unwrap_or_default())
-        {
+        } else if peers.any(|other| {
+            other
+                .hostname
+                .as_deref()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(l.hostname.as_deref().unwrap_or_default())
+        }) {
             Some("HostnameConflict")
         } else {
             None
-        }
-    });
-    if result.conflict.is_some() && !protocol_kinds.is_empty() {
-        result.reason = "Conflicted";
+        };
+    if result.conflict.is_some() && (mixed || !protocol_kinds.is_empty()) {
+        result.reason = if mixed { "ProtocolConflict" } else { "Conflicted" };
         result.message =
             "listeners have conflicting protocols or hostnames on this port".into();
     } else if gateway.spec.tls.is_some() {
@@ -199,6 +210,7 @@ pub fn compile(
     collect(stores.http_routes.state(), stores, gateway, l, &mut result);
     collect(stores.grpc_routes.state(), stores, gateway, l, &mut result);
     collect(stores.tcp_routes.state(), stores, gateway, l, &mut result);
+    collect(stores.tls_routes.state(), stores, gateway, l, &mut result);
     collect(stores.udp_routes.state(), stores, gateway, l, &mut result);
     result
 }
@@ -211,6 +223,10 @@ trait Routed: Resource<DynamicType = ()> {
     fn parents(&self) -> &[Self::Parent];
     /// borrow common parent fields.
     fn parent(p: &Self::Parent) -> Parent<'_>;
+    /// report backend reference failures when attachment was rejected before binding.
+    fn unattached_ref_error(&self, _stores: &GatewayStores) -> Option<RefError> {
+        None
+    }
     /// attach this resource to a listener and record its status.
     fn bind(
         &self,
@@ -262,13 +278,44 @@ impl RouteReport {
         self.message = message.into();
     }
     /// record the first unresolved backend reference.
-    fn references(&mut self, error: Option<&super::super::ir::RefError>) {
+    fn references(&mut self, error: Option<&RefError>) {
         if let Some(error) = error {
             self.resolved = false;
             self.refs_reason = error.reason();
         }
     }
 }
+/// return effective and original hostnames for every allowed listener intersection.
+fn intersecting_hosts(
+    listener_host: &str,
+    hostnames: &[String],
+    report: &mut RouteReport,
+) -> Vec<(String, String)> {
+    let hosts: Vec<_> = hostnames
+        .iter()
+        .map(String::as_str)
+        .chain(hostnames.is_empty().then_some(""))
+        .map(str::to_ascii_lowercase)
+        .filter_map(|route| {
+            let effective = if hostname_matches(listener_host, &route) {
+                route.clone()
+            } else if hostname_matches(&route, listener_host) {
+                listener_host.to_owned()
+            } else {
+                return None;
+            };
+            Some((effective, route))
+        })
+        .collect();
+    if hosts.is_empty() {
+        report.reject(
+            "NoMatchingListenerHostname",
+            "route and listener hostnames do not intersect",
+        );
+    }
+    hosts
+}
+
 /// attach HTTP and gRPC rules using their original hostnames within the selected listener.
 fn bind_rules<R>(
     listener: &GatewayListeners,
@@ -278,30 +325,10 @@ fn bind_rules<R>(
     rules: &[R],
     mut resolve: impl FnMut(&R, &mut Policies) -> Result<HttpRule, ResolveError>,
 ) -> Result<(), ResolveError> {
-    let listener_host = listener.hostname.as_deref().unwrap_or("").to_ascii_lowercase();
-    let hosts: Vec<_> = hostnames
-        .filter(|hosts| !hosts.is_empty())
-        .unwrap_or(&[String::new()])
-        .iter()
-        .map(|h| h.to_ascii_lowercase())
-        .filter_map(|route| {
-            let effective = if hostname_matches(&listener_host, &route) {
-                route.clone()
-            } else if hostname_matches(&route, &listener_host) {
-                listener_host.clone()
-            } else {
-                return None;
-            };
-            let host = (!listener_host.is_empty())
-                .then(|| RouteHost { listener: listener_host.clone(), route });
-            Some((effective, host))
-        })
-        .collect();
+    let listener_host =
+        listener.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let hosts = intersecting_hosts(&listener_host, hostnames.unwrap_or_default(), report);
     if hosts.is_empty() {
-        report.reject(
-            "NoMatchingListenerHostname",
-            "route and listener hostnames do not intersect",
-        );
         return Ok(());
     }
     let mut dropped = Vec::new();
@@ -322,7 +349,10 @@ fn bind_rules<R>(
             for (hostname, host) in &hosts {
                 result.routes.push(Route {
                     hostname: hostname.clone(),
-                    host: host.clone(),
+                    host: (!listener_host.is_empty()).then(|| RouteHost {
+                        listener: listener_host.clone(),
+                        route: host.clone(),
+                    }),
                     http: http.clone(),
                     action: rule.action.clone(),
                 });
@@ -392,6 +422,36 @@ macro_rules! stream_route {
 stream_route!(TcpRoute, TcpRouteParentRefs, resolve_tcp);
 stream_route!(UdpRoute, UdpRouteParentRefs, resolve_udp);
 
+impl Routed for TlsRoute {
+    parents!(TlsRouteParentRefs);
+
+    fn unattached_ref_error(&self, stores: &GatewayStores) -> Option<RefError> {
+        stores.tls_ref_error(self)
+    }
+
+    /// keep the oldest backend per original hostname within this listener.
+    fn bind(
+        &self,
+        stores: &GatewayStores,
+        listener: &GatewayListeners,
+        result: &mut Compiled,
+        report: &mut RouteReport,
+    ) -> Result<(), ResolveError> {
+        let listener_host =
+            listener.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let hosts = intersecting_hosts(&listener_host, &self.spec.hostnames, report);
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let backend = Arc::new(stores.resolve_tls(self)?);
+        report.references(backend.backends.iter().find_map(|(_, b)| b.as_ref().err()));
+        for (_, original) in hosts {
+            result.sni_routes.entry(original).or_insert_with(|| backend.clone());
+        }
+        Ok(())
+    }
+}
+
 /// evaluate matching parent references in stable route precedence order.
 fn collect<R: Routed>(
     mut routes: Vec<Arc<R>>,
@@ -441,6 +501,9 @@ fn collect<R: Routed>(
                 );
             } else if let Err(error) = route.bind(stores, l, result, &mut report) {
                 report.reject(error.reason(), "unsupported route rule");
+            }
+            if !report.accepted {
+                report.references(route.unattached_ref_error(stores).as_ref());
             }
             result.reports.push(report);
         }

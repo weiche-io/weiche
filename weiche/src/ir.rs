@@ -3,6 +3,7 @@ mod backend;
 mod cors;
 mod route;
 mod snapshot;
+mod sni;
 mod tls;
 mod transport;
 pub mod wire;
@@ -20,4 +21,5 @@ pub use snapshot::{
     Binding, ForwardingPolicy, GatewaySnapshot, Listener, PublishedSnapshot, Revision,
     SocketRoutes,
 };
+pub use sni::{SniRoutes, TlsSocket};
 pub use tls::{BackendTls, ServerTls};

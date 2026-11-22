@@ -27,6 +27,7 @@ use weiche_gtwapi::v1::httproutes::{
 use weiche_gtwapi::v1::{
     grpcroutes::GrpcRouteRulesBackendRefs,
     tcproutes::{TcpRoute, TcpRouteRulesBackendRefs},
+    tlsroutes::{TlsRoute, TlsRouteRulesBackendRefs},
     udproutes::{UdpRoute, UdpRouteRulesBackendRefs},
 };
 
@@ -383,6 +384,7 @@ macro_rules! service_ref {
 service_ref!(HttpRouteRulesBackendRefs);
 service_ref!(GrpcRouteRulesBackendRefs);
 service_ref!(TcpRouteRulesBackendRefs);
+service_ref!(TlsRouteRulesBackendRefs);
 service_ref!(UdpRouteRulesBackendRefs);
 
 impl ServiceRef<'_> {
@@ -428,10 +430,10 @@ impl ServiceRef<'_> {
         &self,
         stores: &GatewayStores,
         namespace: &str,
+        source: &str,
         transport: Transport,
     ) -> Result<Vec<SocketAddr>, RefError> {
-        let (_, port) =
-            self.resolve(stores, namespace, transport.route_kind(), transport)?;
+        let (_, port) = self.resolve(stores, namespace, source, transport)?;
         Ok(endpoints(
             stores,
             self.namespace.unwrap_or(namespace),
@@ -442,48 +444,43 @@ impl ServiceRef<'_> {
     }
 }
 
-impl GatewayStores {
-    /// retain the weights of valid and invalid stream backends.
-    fn resolve_stream<'a>(
-        &self,
-        namespace: &str,
-        transport: Transport,
-        backends: impl Iterator<Item = (u32, ServiceRef<'a>)>,
-    ) -> StreamRoute {
-        StreamRoute {
-            backends: backends
-                .map(|(w, r)| (w, r.stream(self, namespace, transport)))
-                .collect(),
+/// resolve one stream rule using the referring route kind for cross-namespace grants.
+macro_rules! stream_resolver {
+    ($method:ident, $route:ty, $transport:expr) => {
+        /// retain the configured weights of both resolved and invalid backends.
+        pub fn $method(&self, route: &$route) -> Result<StreamRoute, ResolveError> {
+            let [rule] = route.spec.rules.as_slice() else {
+                return Err(ResolveError::UnsupportedValue);
+            };
+            let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
+            let kind = <$route as kube::Resource>::kind(&());
+            let backends = rule
+                .backend_refs
+                .iter()
+                .map(|r| {
+                    let target =
+                        ServiceRef::from(r).stream(self, namespace, &kind, $transport);
+                    (r.weight.unwrap_or(1), target)
+                })
+                .collect();
+            Ok(StreamRoute { backends })
         }
-    }
+    };
+}
 
-    /// resolve a TCPRoute into weighted backend endpoint sets.
-    pub fn resolve_tcp(&self, route: &TcpRoute) -> Result<StreamRoute, ResolveError> {
-        let [rule] = route.spec.rules.as_slice() else {
-            return Err(ResolveError::UnsupportedValue);
-        };
+impl GatewayStores {
+    stream_resolver!(resolve_tcp, TcpRoute, Transport::Tcp);
+    stream_resolver!(resolve_tls, TlsRoute, Transport::Tcp);
+    stream_resolver!(resolve_udp, UdpRoute, Transport::Udp);
+    /// validate an unattached TLSRoute's references without enumerating unused endpoints.
+    pub fn tls_ref_error(&self, route: &TlsRoute) -> Option<RefError> {
         let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        Ok(self.resolve_stream(
-            namespace,
-            Transport::Tcp,
-            rule.backend_refs
-                .iter()
-                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
-        ))
-    }
-
-    /// resolve a UDPRoute into weighted backend endpoint sets.
-    pub fn resolve_udp(&self, route: &UdpRoute) -> Result<StreamRoute, ResolveError> {
-        let [rule] = route.spec.rules.as_slice() else {
-            return Err(ResolveError::UnsupportedValue);
-        };
-        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        Ok(self.resolve_stream(
-            namespace,
-            Transport::Udp,
-            rule.backend_refs
-                .iter()
-                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
-        ))
+        route.spec.rules.iter().flat_map(|rule| &rule.backend_refs).find_map(
+            |reference| {
+                ServiceRef::from(reference)
+                    .resolve(self, namespace, "TLSRoute", Transport::Tcp)
+                    .err()
+            },
+        )
     }
 }

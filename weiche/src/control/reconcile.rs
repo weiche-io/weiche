@@ -69,6 +69,7 @@ async fn lead(
         stores.http_routes.wait_until_ready(),
         stores.grpc_routes.wait_until_ready(),
         stores.tcp_routes.wait_until_ready(),
+        stores.tls_routes.wait_until_ready(),
         stores.udp_routes.wait_until_ready(),
         stores.secrets.wait_until_ready(),
         stores.namespaces.wait_until_ready(),

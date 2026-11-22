@@ -76,6 +76,9 @@ pub struct GatewaySnapshot {
     pub streams: BTreeMap<(super::Transport, SocketAddr), super::StreamListener>,
     /// default upstream forwarding budgets.
     pub forwarding: ForwardingPolicy,
+    /// passthrough sockets indexed by IPv4 or IPv6 bind address.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tls: BTreeMap<SocketAddr, Arc<super::TlsSocket>>,
 }
 
 /// sequence number of a published configuration.

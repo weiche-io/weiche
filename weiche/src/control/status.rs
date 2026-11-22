@@ -130,6 +130,7 @@ pub async fn update_status(
             "HTTPRouteSchemeRedirect",
             "ReferenceGrant",
             "TCPRoute",
+            "TLSRoute",
             "UDPRoute",
         ]
         .into_iter()
@@ -167,6 +168,7 @@ pub async fn update_status(
     routes!(stores.http_routes);
     routes!(stores.grpc_routes);
     routes!(stores.tcp_routes);
+    routes!(stores.tls_routes);
     routes!(stores.udp_routes);
     Ok(())
 }
@@ -200,8 +202,16 @@ where
         .filter(|r| r.uid == route.uid())
     {
         let key = serde_json::to_string(&report.parent)?;
-        let score =
-            |r: &RouteReport| (r.accepted, r.reason != "NoMatchingParent", !r.resolved);
+        let score = |r: &RouteReport| {
+            // report the closest eligible listener when every attachment was rejected.
+            let matched = match r.reason {
+                "NoMatchingParent" => 0,
+                "NotAllowedByListeners" => 1,
+                "NoMatchingListenerHostname" => 2,
+                _ => 3,
+            };
+            (r.accepted, matched, !r.resolved)
+        };
         let chosen = reports.entry(key).or_insert(report);
         if score(report) > score(chosen) {
             *chosen = report;

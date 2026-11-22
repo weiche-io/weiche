@@ -26,6 +26,7 @@ use serde_json::json;
 use std::{collections::BTreeSet, fs, io, net::SocketAddr, time::Duration};
 use tokio::sync::watch;
 
+/// readiness marker containing the last applied snapshot digest.
 const READY: &str = "/run/weiche/ready";
 
 /// kubelet exec probe, including the applied configuration digest for diagnostics.
@@ -34,6 +35,7 @@ pub fn ready() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// withdraw the readiness marker until all workers acknowledge the new revision.
 fn pending() -> io::Result<()> {
     match fs::remove_file(READY) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -41,13 +43,18 @@ fn pending() -> io::Result<()> {
     }
 }
 
+/// snapshot identity and exact set of sockets that every worker must bind.
 struct Desired {
+    /// digest used to acknowledge this snapshot to the controller.
     version: String,
+    /// local publication sequence reported by workers.
     revision: usize,
+    /// expected transport and address pairs.
     sockets: BTreeSet<(Transport, SocketAddr)>,
 }
 
 impl Desired {
+    /// decode the snapshot and publish its listener configuration to the workers.
     fn apply(secret: &Secret, tx: &mut routing::Writer) -> anyhow::Result<Self> {
         ensure!(
             secret.type_.as_deref() == Some("weiche.io/snapshot"),
@@ -64,7 +71,13 @@ impl Desired {
             .streams
             .keys()
             .copied()
-            .chain(snapshot.sockets.keys().map(|addr| (Transport::Tcp, *addr)))
+            .chain(
+                snapshot
+                    .sockets
+                    .keys()
+                    .chain(snapshot.tls.keys())
+                    .map(|addr| (Transport::Tcp, *addr)),
+            )
             .collect();
         Ok(Self {
             version: wire::version(bytes),
@@ -73,6 +86,7 @@ impl Desired {
         })
     }
 
+    /// check every expected socket against its worker acknowledgements.
     fn applied(&self, workers: &WorkerGroupState) -> bool {
         !self.sockets.is_empty()
             && self
