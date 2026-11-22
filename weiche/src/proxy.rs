@@ -1,7 +1,6 @@
-//! worker-local data plane: listeners, route filters and upstream connections.
+//! supervise the gateway watch and its worker-local compio data planes.
 pub mod config;
 pub mod core;
-mod dataplane;
 pub mod down;
 mod io;
 pub mod up;
@@ -9,71 +8,133 @@ mod watch;
 
 use super::ir::GatewaySnapshot;
 use anyhow::Context;
+use compio::{driver::ProactorBuilder, runtime::Runtime};
 use config::RuntimeConfig;
-use dataplane::WorkerGroup;
-pub use dataplane::runtime;
-use down::WorkerGroupState;
-use std::thread;
-use tokio::sync::oneshot;
+use core::tcp::Admission;
+use down::{ListenerGroup, WorkerGroupState, tcp};
+use std::{mem::DropGuard, sync::Arc, thread};
+use tokio::sync::watch::{Receiver, Sender, channel};
 pub use watch::ready;
 
+/// build a thread-local compio io_uring runtime tuned for one worker thread.
+pub fn runtime() -> std::io::Result<Runtime> {
+    let mut proactor = ProactorBuilder::new();
+    proactor
+        .capacity(4096)
+        .single_issuer(true)
+        .defer_taskrun(true)
+        .coop_taskrun(true);
+    match Runtime::builder().with_proactor(proactor).build() {
+        Ok(rt) => Ok(rt),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            tracing::warn!(%error, "tuned io_uring flags unsupported, falling back to defaults");
+            Runtime::new()
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// wait for process shutdown or the shutdown sender to close.
-pub async fn stopped(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn stopped(mut shutdown: Receiver<bool>) {
     if !*shutdown.borrow_and_update() {
         let _ = shutdown.changed().await;
     }
 }
 
-/// start the watch thread and workers under the same shutdown signal.
-pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
-    let (config_tx, config_rx) = config::channel(GatewaySnapshot::default());
-    let (listener_tx, listener_rx) =
-        tokio::sync::watch::channel(WorkerGroupState::default());
-    let (stop, stopped) = tokio::sync::watch::channel(false);
-    let control_stop = stopped.clone();
-    let (done_tx, mut done_rx) = oneshot::channel();
-    let http3 = runtime.http3;
-    let group = WorkerGroup::new(runtime, config_rx, listener_tx)?;
-    let control = thread::Builder::new()
-        .name("weiche-proxy-watch".into())
-        .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("create control-plane Tokio runtime")?;
-                runtime.block_on(watch::run(
-                    name,
-                    http3,
-                    config_tx,
-                    listener_rx,
-                    control_stop,
-                ))
-            })();
-            let _ = done_tx.send(result);
-        })
-        .context("spawn control-plane thread")?;
-    let data = group.run(stopped);
-    tokio::pin!(data);
-    let (mut result, data_done, control_done) = tokio::select! {
-        result = &mut data => (result, true, false),
-        result = &mut done_rx => (
-            result.context("control thread panicked").and_then(|r| r),
-            false,
-            true,
-        ),
-    };
-    stop.send_replace(true);
-    if !data_done {
-        result = result.and(data.await);
+/// threads that share a shutdown signal with the worker on the caller's runtime.
+struct Threads {
+    /// stopping any member wakes the entire group.
+    stop: Sender<bool>,
+    /// join every started thread, including after a partial startup failure.
+    handles: Vec<thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl Threads {
+    /// signal the group on return or unwind and retain the result for the supervisor.
+    fn spawn(
+        &mut self,
+        name: String,
+        run: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let stop = self.stop.clone();
+        let handle = thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || {
+                let _on_exit = DropGuard::new(stop, |stop| {
+                    stop.send_replace(true);
+                });
+                run()
+            })
+            .with_context(|| format!("spawn {name}"))?;
+        self.handles.push(handle);
+        Ok(())
     }
-    if !control_done {
-        let control_result =
-            done_rx.await.context("control thread panicked").and_then(|r| r);
-        result = result.and(control_result);
+
+    /// request shutdown, join all threads and report each failure with its origin.
+    fn join(self, local: anyhow::Result<()>) -> anyhow::Result<()> {
+        self.stop.send_replace(true);
+        let mut errors: Vec<_> = local.err().into_iter().collect();
+        for handle in self.handles {
+            let name = handle.thread().name().unwrap_or("proxy thread").to_owned();
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")));
+            if let Err(error) = result.context(name) {
+                errors.push(error);
+            }
+        }
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.pop().unwrap()),
+            _ => anyhow::bail!(
+                "{}",
+                errors
+                    .iter()
+                    .map(|error| format!("{error:#}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
     }
-    if control.join().is_err() {
-        result = result.and(Err(anyhow::anyhow!("control thread panicked")));
+}
+
+/// start the watch on Tokio, run worker zero locally and join the other compio workers.
+pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
+    policy.validate()?;
+    let policy = Arc::new(policy);
+    let (writer, reader) = config::channel(GatewaySnapshot::default());
+    let (reports, state) = channel(WorkerGroupState::default());
+    let (stop, shutdown) = channel(false);
+    let mut threads = Threads { stop, handles: Vec::new() };
+    let http3 = policy.http3;
+    let watch_stop = shutdown.clone();
+    threads.spawn("weiche-proxy-watch".into(), move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("create control-plane Tokio runtime")?
+            .block_on(watch::run(name, http3, writer, state, watch_stop))
+    })?;
+
+    let listeners = Arc::new(ListenerGroup::new(policy.workers.get(), reports));
+    let admission = Arc::new(Admission::new(policy.downstream_connections_global.get()));
+    for id in 1..policy.workers.get() {
+        // construct the worker-local future on its owning runtime.
+        let config = reader.clone();
+        let policy = policy.clone();
+        let admission = admission.clone();
+        let listeners = listeners.clone();
+        let stop = shutdown.clone();
+        let started = threads.spawn(format!("weiche-worker-{id}"), move || {
+            let io = runtime().context("create worker compio runtime")?;
+            tracing::info!(worker = id, driver = ?io.driver_type(), "starting compio worker");
+            io.block_on(tcp::run(id, config, policy, admission, listeners, stop))
+        });
+        if started.is_err() {
+            return threads.join(started);
+        }
     }
-    result
+    let result =
+        tcp::run(0, reader, policy, admission, listeners.clone(), shutdown).await;
+    threads.join(result.context("worker 0"))
 }

@@ -35,7 +35,7 @@ pub async fn run(
     runtime: Arc<RuntimeConfig>,
     admission: Arc<Admission>,
     listeners: Arc<ListenerGroup>,
-    stop: watch::Sender<bool>,
+    stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let snapshot = config.snapshot();
     let service = ProxyService::new(snapshot, &runtime)?;
@@ -50,7 +50,7 @@ pub async fn run(
     let mut revision = None;
     let mut tls = BTreeMap::<SocketAddr, watch::Sender<Arc<TlsSocket>>>::new();
     let mut serving = FuturesUnordered::new();
-    let stopping = stopped(stop.subscribe());
+    let stopping = stopped(stop);
     tokio::pin!(stopping);
     loop {
         let snapshot = config.snapshot();
