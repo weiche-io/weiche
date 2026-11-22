@@ -6,13 +6,13 @@ rust-version = "1.100"
 description = "A Kubernetes networking gateway"
 
 [features]
-quic = ["compio/quic"]
+quic = []
 
 [dependencies]
 anyhow = "1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-compio = { version = "0.20.0-beta.1", features = ["net", "time", "ring"] }
+compio = { version = "0.20.0-beta.1", features = ["net", "time", "ring", "h3"] }
 cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "dde9bdc7787effd98c4dff18b8b58970ec10b5f6", default-features = false }
 fastrand = "2"
 flate2 = "1"
@@ -33,6 +33,7 @@ kube = { version = "5", default-features = false, features = [
     "ring",
 ] }
 kube-lease-manager = "0.13"
+libc = "0.2"
 regex = "1.13.1"
 ring = "0.17"
 rmp-serde = "1"

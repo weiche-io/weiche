@@ -4,6 +4,7 @@ use anyhow::ensure;
 use compio::tls::rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, DnsName, PrivateKeyDer, pem::PemObject},
+    sign::{CertifiedKey, SingleCertAndKey},
 };
 use ring::digest::{self, SHA256};
 use serde::{Deserialize, Serialize, Serializer};
@@ -15,12 +16,16 @@ use std::{
 
 /// identify equivalent configurations across independent watch compilations.
 struct Config<T, S> {
-    inner: Arc<T>,
+    /// validated runtime configuration.
+    inner: T,
+    /// original inputs used to reconstruct the configuration on another worker.
     source: S,
+    /// immutable identity for comparisons across snapshots.
     fingerprint: [u8; 32],
 }
 
 impl<T, S> Config<T, S> {
+    /// fingerprint each length-delimited input while retaining the prepared state.
     fn new(
         inner: T,
         source: S,
@@ -33,7 +38,7 @@ impl<T, S> Config<T, S> {
             digest.update(bytes);
         }
         Self {
-            inner: Arc::new(inner),
+            inner,
             source,
             fingerprint: digest.finish().as_ref().try_into().unwrap(),
         }
@@ -67,11 +72,15 @@ impl<T, S: Serialize> Serialize for Config<T, S> {
 /// rebuild rustls state from the authenticated snapshot's original inputs.
 #[derive(Deserialize)]
 struct Material<S> {
+    /// listener pattern or backend verification name.
     hostname: String,
+    /// original serialized TLS inputs.
     config: S,
 }
 
+/// serialized certificate chain and private key.
 type Identity = (Vec<u8>, Vec<u8>);
+/// serialized trust anchors and upstream ALPN selection.
 type Trust = (Vec<Vec<u8>>, Protocol);
 
 impl TryFrom<Material<Identity>> for ServerTls {
@@ -94,8 +103,10 @@ impl TryFrom<Material<Trust>> for BackendTls {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Material<Identity>")]
 pub struct ServerTls {
+    /// lowercase SNI pattern or an empty catch-all.
     pub hostname: String,
-    config: Config<ServerConfig, Identity>,
+    /// parsed identity shared by the TCP and QUIC handshake paths.
+    config: Config<(Arc<ServerConfig>, Arc<CertifiedKey>), Identity>,
 }
 
 impl ServerTls {
@@ -104,19 +115,34 @@ impl ServerTls {
         let certs =
             CertificateDer::pem_slice_iter(chain).collect::<Result<Vec<_>, _>>()?;
         let parsed_key = PrivateKeyDer::from_pem_slice(key)?;
-        let mut config = ServerConfig::builder()
+        let builder = ServerConfig::builder();
+        let certified = Arc::new(CertifiedKey::from_der(
+            certs,
+            parsed_key,
+            builder.crypto_provider(),
+        )?);
+        let mut config = builder
             .with_no_client_auth()
-            .with_single_cert(certs, parsed_key)?;
+            .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified.clone())));
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
             hostname: hostname.to_ascii_lowercase(),
-            config: Config::new(config, (chain.to_vec(), key.to_vec()), [chain, key]),
+            config: Config::new(
+                (Arc::new(config), certified),
+                (chain.to_vec(), key.to_vec()),
+                [chain, key],
+            ),
         })
     }
 
     /// clone the prepared configuration for one handshake.
     pub fn config(&self) -> Arc<ServerConfig> {
-        self.config.inner.clone()
+        self.config.inner.0.clone()
+    }
+
+    /// share the validated certificate chain and signing key with QUIC.
+    pub fn certified_key(&self) -> Arc<CertifiedKey> {
+        self.config.inner.1.clone()
     }
 }
 
@@ -124,8 +150,10 @@ impl ServerTls {
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "Material<Trust>")]
 pub struct BackendTls {
+    /// verification name used in backend TLS handshakes.
     pub hostname: String,
-    config: Config<ClientConfig, Trust>,
+    /// prepared client settings with their serialized trust inputs.
+    config: Config<Arc<ClientConfig>, Trust>,
 }
 
 impl BackendTls {
@@ -151,7 +179,7 @@ impl BackendTls {
         Ok(Self {
             hostname: hostname.as_ref().to_owned(),
             config: Config::new(
-                config,
+                Arc::new(config),
                 (certs.iter().map(|c| c.as_ref().to_vec()).collect(), protocol),
                 certs.iter().map(AsRef::as_ref).chain([alpn]),
             ),

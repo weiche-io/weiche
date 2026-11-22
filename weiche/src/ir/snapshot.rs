@@ -81,6 +81,21 @@ pub struct GatewaySnapshot {
     pub tls: BTreeMap<SocketAddr, Arc<super::TlsSocket>>,
 }
 
+impl GatewaySnapshot {
+    /// prefer exact SNI, then the longest wildcard suffix, then an unrestricted listener.
+    pub fn order_certificates(&mut self) {
+        for socket in self.sockets.values_mut() {
+            socket.listener.tls.sort_by_key(|tls| {
+                let name = &tls.hostname;
+                std::cmp::Reverse((
+                    !name.is_empty() && !name.starts_with("*."),
+                    name.len(),
+                ))
+            });
+        }
+    }
+}
+
 /// sequence number of a published configuration.
 pub type Revision = usize;
 
