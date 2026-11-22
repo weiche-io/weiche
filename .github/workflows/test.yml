@@ -1,9 +1,14 @@
 name: test
 on:
   pull_request:
+    paths-ignore: &web
+      - 'weiche.io/**'
+      - 'mk/site.mk'
+      - '.github/workflows/web.yml'
   # warm branch caches on master so new pull requests reuse them.
   push:
     branches: [master]
+    paths-ignore: *web
 permissions:
   contents: read
 concurrency:
@@ -51,15 +56,3 @@ jobs:
           name: gateway-api-conformance
           path: target/conformance/report.yaml
           if-no-files-found: error
-  docs:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: typst-community/setup-typst@48aeee7543d37f01afd1ffb27307dc277387ba13 # v4
-        with:
-          typst-version: 0.15.1
-      - run: sudo apt-get update && sudo apt-get install -y minify
-      - run: make MINIFY=y full

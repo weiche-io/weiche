@@ -6,9 +6,28 @@ use super::{
     stopped,
 };
 use anyhow::Context;
+use compio::{driver::ProactorBuilder, runtime::Runtime};
 use futures::{StreamExt, stream::FuturesUnordered};
-use std::{sync::Arc, thread};
+use std::{io, sync::Arc, thread};
 use tokio::sync::{oneshot, watch};
+
+/// build a thread-local compio io_uring runtime tuned for one worker thread.
+pub fn runtime() -> io::Result<Runtime> {
+    let mut proactor = ProactorBuilder::new();
+    proactor
+        .capacity(4096)
+        .single_issuer(true)
+        .defer_taskrun(true)
+        .coop_taskrun(true);
+    match Runtime::builder().with_proactor(proactor).build() {
+        Ok(rt) => Ok(rt),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            tracing::warn!(%error, "tuned io_uring flags unsupported, falling back to defaults");
+            Runtime::new()
+        }
+        Err(error) => Err(error),
+    }
+}
 
 pub struct WorkerGroup {
     runtime: Arc<RuntimeConfig>,
@@ -55,7 +74,7 @@ impl WorkerGroup {
                 let (done_tx, done_rx) = oneshot::channel();
                 threads.push(thread::Builder::new().name(format!("weiche-worker-{id}")).spawn(move || {
                     let result = (|| -> anyhow::Result<()> {
-                        let runtime = compio::runtime::Runtime::new().context("create worker compio runtime")?;
+                        let runtime = self::runtime().context("create worker compio runtime")?;
                         tracing::info!(worker = id, driver = ?runtime.driver_type(), "starting compio worker");
                         runtime.block_on(tcp::run(id, config, runtime_config, admission, listeners, stop))
                     })().with_context(|| format!("worker {id}"));

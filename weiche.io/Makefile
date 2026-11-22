@@ -3,21 +3,18 @@ SHELL       := bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
 
-.PHONY: build full assets css fonts serve clean distclean
-.DEFAULT_GOAL := build
+.PHONY: web
+.DEFAULT_GOAL := web
 
 include mk/log.mk
 
 MINIFY ?= n
-PORT   ?= 8000
 
 MINIFY_CMD := minify --html-keep-quotes --html-keep-end-tags --html-keep-document-tags
 
 INSTALL := install -D -m 0644
 MKDIR_P := mkdir -p
 CP_R    := cp -r
-RM_RF   := rm -rf
-FIND    := find
 
 SRC_PAGES    := $(shell find src -mindepth 2 -type f -name index.typ | sort)
 SRC_SECTIONS := $(patsubst src/%/index.typ,%,$(SRC_PAGES))
@@ -30,14 +27,7 @@ include mk/typst.mk
 
 .SECONDARY: $(STAGED_PAGES)
 
-build: assets fonts build/nav.typ build/index.html $(TARGET_PAGES)
-
-full: build
-	$(Q)$(MAKE) --no-print-directory clean
-
-assets: css $(addprefix build/,$(ASSET_STATIC))
-css: $(addprefix build/,$(ASSET_CSS))
-fonts: $(addprefix build/,$(ASSET_FONTS))
+web: build/index.html $(TARGET_PAGES) $(addprefix build/,$(ASSET_CSS) $(ASSET_STATIC) $(ASSET_FONTS))
 
 build/nav.typ: $(SRC_META) src
 	$(call log,NAV,$@)
@@ -65,19 +55,3 @@ build/%/index.typ: src/%/index.typ src/%/meta.typ src/%
 	$(Q)$(MKDIR_P) $(@D)
 	$(Q)$(CP_R) $(<D)/. $(@D)/
 	$(Q)touch $@
-
-serve: build
-	$(call log,SERVE,http://[::1]:$(PORT)/)
-	$(Q)python3 -m http.server -b ::1 $(PORT) --directory build
-
-clean:
-	$(Q)if [ -d build ]; then \
-		$(FIND) build \( -name '*.bib' -o -name '*.typ' \) | sort | while IFS= read -r f; do \
-			printf '%-6s %s\n' RM "$$f"; \
-			rm -f "$$f"; \
-		done; \
-	fi
-
-distclean:
-	$(call log,RM,build)
-	$(Q)$(RM_RF) build

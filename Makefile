@@ -3,7 +3,7 @@ SHELL     := bash
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 .DELETE_ON_ERROR:
-.DEFAULT_GOAL := weiche.io
+.DEFAULT_GOAL := web
 
 include mk/log.mk
 include mk/site.mk
