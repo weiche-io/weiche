@@ -63,28 +63,20 @@ impl Applied {
         if self.0.get(&key).is_some_and(|(old, _)| old == &digest) {
             return Ok(());
         }
-        let api = Api::<DynamicObject>::namespaced_with(
-            client.clone(),
-            target.namespace,
-            &kind,
-        );
-        if let Some(old) = api.get_opt(target.name).await? {
+        let ns = target.namespace;
+        let name = target.name;
+        let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, &kind);
+        if let Some(old) = api.get_opt(name).await? {
             ensure!(
                 controlled_by(&old, &target.owner.uid),
-                "{} {}/{} has another owner",
-                kind.kind,
-                target.namespace,
-                target.name
+                "{} {ns}/{name} has another owner",
+                kind.kind
             );
             // pin the checked object across replacement while allowing other field managers
             // to update their own fields, including the proxy's ConfigMap acknowledgements.
             fields["metadata"]["uid"] = json!(old.uid().context("missing workload uid")?);
-            api.patch(
-                target.name,
-                &PatchParams::apply("weiche").force(),
-                &Patch::Apply(fields),
-            )
-            .await?;
+            api.patch(name, &PatchParams::apply("weiche").force(), &Patch::Apply(fields))
+                .await?;
         } else {
             let params = PostParams {
                 field_manager: Some("weiche".into()),
@@ -122,14 +114,12 @@ pub async fn reconcile(
         .config_maps
         .get(&ObjectRef::new(&name).within(&ns))
         .filter(|report| controlled_by(report.as_ref(), &uid));
-    let requested_ips = match requested_addresses(g, &options.service) {
-        Ok(ips) => Some(ips),
-        Err(message) => {
+    let requested_ips = requested_addresses(g, &options.service)
+        .inspect_err(|error| {
             plan.issue_reason = Some("AddressNotAssigned");
-            plan.issue = Some(message.to_string());
-            None
-        }
-    };
+            plan.issue = Some(error.to_string());
+        })
+        .ok();
     let payload = if plan.accepted() && plan.issue.is_none() && !snapshot.is_empty() {
         snapshot
             .encode()
@@ -157,35 +147,32 @@ pub async fn reconcile(
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
-    applied.ensure(client, &target, target.owned::<ConfigMap>()).await?;
-    applied.ensure(client, &target, target.snapshot(payload)).await?;
-    applied
-        .ensure(client, &target, target.owned::<ServiceAccount>())
-        .await?;
-    applied
-        .ensure(client, &target, target.role(&options.provisioner_binding))
-        .await?;
-    applied.ensure(client, &target, target.role_binding()).await?;
+    /// apply each typed resource in order, stopping at the first failed request.
+    macro_rules! apply {
+        ($($resource:expr),+ $(,)?) => { $(applied.ensure(client, &target, $resource).await?;)+ };
+    }
     let replicas = if active { settings.replicas } else { 0 };
-    applied
-        .ensure(client, &target, target.deployment(settings, replicas))
-        .await?;
+    apply!(
+        target.owned::<ConfigMap>(),
+        target.snapshot(payload),
+        target.owned::<ServiceAccount>(),
+        target.role(&options.provisioner_binding),
+        target.role_binding(),
+        target.deployment(settings, replicas),
+    );
     let Some(ips) = requested_ips else { return Ok(()) };
     let ports = plan.ports(options.http3.enabled);
     if !ports.is_empty() {
-        applied
-            .ensure(client, &target, target.service(ports, &options.service, &ips))
-            .await?;
+        apply!(target.service(ports, &options.service, &ips));
     }
     let Some(service) = existing_service else { return Ok(()) };
     plan.addresses = if options.service.r#type == ServiceType::LoadBalancer {
         service
             .status
             .as_ref()
-            .and_then(|s| s.load_balancer.as_ref())
-            .and_then(|s| s.ingress.as_ref())
-            .into_iter()
-            .flatten()
+            .and_then(|s| s.load_balancer.as_ref()?.ingress.as_deref())
+            .unwrap_or_default()
+            .iter()
             .flat_map(|i| {
                 i.ip.iter()
                     .map(|v| ("IPAddress".into(), v.clone()))
@@ -196,9 +183,9 @@ pub async fn reconcile(
         service
             .spec
             .as_ref()
-            .and_then(|s| s.cluster_ips.as_ref())
-            .into_iter()
-            .flatten()
+            .and_then(|s| s.cluster_ips.as_deref())
+            .unwrap_or_default()
+            .iter()
             .map(|ip| ("IPAddress".into(), ip.clone()))
             .collect()
     };
@@ -291,16 +278,10 @@ pub async fn retired(
 ) -> anyhow::Result<()> {
     let options = &settings.installation;
     for cm in stores.config_maps.state() {
-        if cm
-            .labels()
-            .get("app.kubernetes.io/managed-by")
-            .is_none_or(|v| v != "weiche")
-        {
-            continue;
-        }
-        let instance = cm.labels().get("app.kubernetes.io/instance").map(String::as_str);
-        if instance != Some(options.release.as_str())
-            && !(instance.is_none() && options.release == "weiche")
+        let labels = cm.labels();
+        let label = |key: &str| labels.get(key).map(String::as_str);
+        if label("app.kubernetes.io/managed-by") != Some("weiche")
+            || label("app.kubernetes.io/instance").unwrap_or("weiche") != options.release
         {
             continue;
         }
