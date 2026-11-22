@@ -2,9 +2,9 @@
 use super::{
     GatewayController, GatewayStores,
     config::Settings,
+    provision::{self, Applied},
     service::Plan,
     status::update_status,
-    workload::{self, Applied},
 };
 use anyhow::Context;
 use kube::{Client, ResourceExt};
@@ -117,7 +117,7 @@ async fn lead(
             }
             let (mut plan, snapshot) =
                 Plan::compile(stores, gateway, settings.bind_address);
-            if let Err(error) = workload::reconcile(
+            if let Err(error) = provision::reconcile(
                 client,
                 stores,
                 settings,
@@ -144,7 +144,7 @@ async fn lead(
             retry = true;
         }
         if let Err(error) =
-            super::cleanup::retired(client, stores, settings, &plans, &mut applied).await
+            provision::retired(client, stores, settings, &plans, &mut applied).await
         {
             tracing::warn!(%error, "could not retire gateway resources");
             retry = true;

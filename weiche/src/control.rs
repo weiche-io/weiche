@@ -1,13 +1,12 @@
 //! maintain Kubernetes watches and their live resource caches.
-mod cleanup;
 mod compile;
 mod config;
+mod provision;
 mod reconcile;
 mod resolve;
 mod service;
 mod status;
 mod tls;
-mod workload;
 
 pub use compile::{CONTROLLER_NAME, Compiled, compile};
 pub use reconcile::run;

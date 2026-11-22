@@ -20,7 +20,10 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{ApiResource, DynamicObject, Patch, PatchParams, PostParams},
+    api::{
+        ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams,
+        Preconditions,
+    },
     runtime::reflector::ObjectRef,
 };
 use serde_json::{Value, json};
@@ -47,9 +50,12 @@ struct Target<'a> {
     infra: Option<&'a GatewayInfrastructure>,
 }
 
-/// cache successful applies; periodically recheck for external drift.
+/// cache manifest digests until the next drift check.
 #[derive(Default)]
-pub struct Applied(BTreeMap<(String, String, String), (String, Instant)>);
+pub struct Applied(
+    /// last successful digest and apply time by namespace, resource name and kind.
+    BTreeMap<(String, String, String), (String, Instant)>,
+);
 
 impl Applied {
     /// forget cached applies after the drift check interval.
@@ -58,7 +64,7 @@ impl Applied {
     }
 
     /// forget retired resources so an eligible gateway can recreate them immediately.
-    pub fn forget(&mut self, namespace: &str, name: &str) {
+    fn forget(&mut self, namespace: &str, name: &str) {
         self.0
             .retain(|(ns, resource, _), _| ns != namespace || resource != name);
     }
@@ -574,4 +580,96 @@ fn proxy_service(
         service["metadata"]["annotations"] = json!(settings.service.annotations);
     }
     service
+}
+
+/// delete the observed resource only while its gateway ownership still matches.
+async fn remove(
+    client: &Client,
+    kind: ApiResource,
+    ns: &str,
+    name: &str,
+    owner_uid: &str,
+) -> anyhow::Result<()> {
+    let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, &kind);
+    let Some(obj) = api.get_opt(name).await? else { return Ok(()) };
+    if controlled_by(&obj, owner_uid) {
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: obj.uid(),
+                resource_version: obj.resource_version(),
+            }),
+            ..Default::default()
+        };
+        match api.delete(name, &params).await {
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            result => {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// remove this installation's resources for gateways that lost their class or eligibility.
+pub async fn retired(
+    client: &Client,
+    stores: &GatewayStores,
+    settings: &Settings,
+    plans: &[Plan],
+    applied: &mut Applied,
+) -> anyhow::Result<()> {
+    for cm in stores.config_maps.state() {
+        if cm
+            .labels()
+            .get("app.kubernetes.io/managed-by")
+            .is_none_or(|v| v != "weiche")
+        {
+            continue;
+        }
+        let instance = cm.labels().get("app.kubernetes.io/instance").map(String::as_str);
+        if instance != Some(settings.release.as_str())
+            && !(instance.is_none() && settings.release == "weiche")
+        {
+            continue;
+        }
+        let Some(owner) = cm.owner_references().iter().find(|r| {
+            r.controller == Some(true)
+                && r.kind == "Gateway"
+                && r.api_version == "gateway.networking.k8s.io/v1"
+        }) else {
+            continue;
+        };
+        let name = cm.name_any();
+        let ns = cm.namespace().unwrap_or_default();
+        if !settings.namespaces.contains(&ns)
+            || name != format!("weiche-gw-{}", owner.uid)
+            || plans.iter().any(|p| {
+                !p.denied
+                    && !p.invalid_parameters
+                    && p.gateway.uid().as_deref() == Some(&owner.uid)
+            })
+        {
+            continue;
+        }
+        // kubernetes garbage-collects workloads for deleted gateways.
+        if !stores.gateways.state().iter().any(|g| {
+            g.uid().as_deref() == Some(&owner.uid)
+                && g.metadata.deletion_timestamp.is_none()
+        }) {
+            continue;
+        }
+        applied.forget(&ns, &name);
+        for kind in [
+            ApiResource::erase::<Secret>(&()),
+            ApiResource::erase::<Deployment>(&()),
+            ApiResource::erase::<Service>(&()),
+            ApiResource::erase::<RoleBinding>(&()),
+            ApiResource::erase::<Role>(&()),
+            ApiResource::erase::<ServiceAccount>(&()),
+            ApiResource::erase::<ConfigMap>(&()),
+        ] {
+            remove(client, kind, &ns, &name, &owner.uid).await?;
+        }
+    }
+    Ok(())
 }
