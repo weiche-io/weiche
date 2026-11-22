@@ -13,8 +13,9 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         core::v1::{
-            ConfigMap, LocalObjectReference, ResourceRequirements, SeccompProfile,
-            Secret, Service, ServiceAccount,
+            Affinity, ConfigMap, EnvVar, LocalObjectReference, ResourceRequirements,
+            SeccompProfile, Secret, Service, ServiceAccount, Toleration,
+            TopologySpreadConstraint,
         },
         rbac::v1::{Role, RoleBinding},
     },
@@ -51,6 +52,40 @@ fn default_provisioner_binding() -> String {
     "weiche-gateway-provisioner".into()
 }
 
+/// default graceful termination window in seconds for proxy pods.
+fn default_termination_grace() -> i64 {
+    30
+}
+
+/// default proxy log level.
+fn default_log_level() -> String {
+    "info".into()
+}
+
+/// default proxy log format.
+fn default_log_format() -> String {
+    "text".into()
+}
+
+/// platform logging defaults for provisioned proxy containers.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LogSettings {
+    /// default RUST_LOG filter applied to proxy pods.
+    pub level: String,
+    /// output log format (`text` or `json`).
+    pub format: String,
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
+    }
+}
+
 /// installation policy supplied by the platform, outside of tenant-writable Gateway specs.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,14 +120,56 @@ pub struct Settings {
     replicas: i32,
     /// compio worker thread count inside each proxy pod.
     workers: std::num::NonZeroUsize,
+    /// bind proxy listeners directly on the host network namespace.
+    #[serde(default)]
+    host_network: bool,
+    /// optional Kubernetes DNS policy override for proxy pods.
+    #[serde(default)]
+    dns_policy: Option<String>,
+    /// graceful termination window in seconds for proxy pods.
+    #[serde(default = "default_termination_grace")]
+    termination_grace_period_seconds: i64,
+    /// additional node selector labels merged with kubernetes.io/os=linux.
+    #[serde(default)]
+    node_selector: BTreeMap<String, String>,
+    /// scheduling tolerations applied to proxy pods.
+    #[serde(default)]
+    tolerations: Vec<Toleration>,
+    /// scheduling affinity rules applied to proxy pods.
+    #[serde(default)]
+    affinity: Option<Affinity>,
+    /// topology spread constraints applied to proxy pods.
+    #[serde(default)]
+    topology_spread_constraints: Vec<TopologySpreadConstraint>,
+    /// optional priorityClassName applied to proxy pods.
+    #[serde(default)]
+    priority_class_name: Option<String>,
+    /// additional pod template labels applied to proxy pods.
+    #[serde(default)]
+    pod_labels: BTreeMap<String, String>,
+    /// additional pod template annotations applied to proxy pods.
+    #[serde(default)]
+    pod_annotations: BTreeMap<String, String>,
+    /// proxy container logging settings.
+    #[serde(default)]
+    log: LogSettings,
+    /// extra environment variables appended to proxy containers.
+    #[serde(default)]
+    extra_env: Vec<EnvVar>,
     /// Kubernetes Service type provisioned for each Gateway.
     service_type: String,
 }
 impl Settings {
     /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
-        let settings: Self =
+        let mut settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
+        if settings.dns_policy.as_deref() == Some("") {
+            settings.dns_policy = None;
+        }
+        if settings.priority_class_name.as_deref() == Some("") {
+            settings.priority_class_name = None;
+        }
         ensure!(
             !settings.release.is_empty()
                 && !settings.controller_name.is_empty()
@@ -100,12 +177,24 @@ impl Settings {
                 && !settings.provisioner_binding.is_empty()
                 && !settings.namespaces.is_empty()
                 && settings.replicas > 0
+                && settings.termination_grace_period_seconds > 0
                 && !settings.image.is_empty(),
             "invalid proxy installation settings"
         );
         ensure!(
+            matches!(settings.log.format.as_str(), "text" | "json"),
+            "unsupported proxy log format"
+        );
+        ensure!(
             matches!(settings.service_type.as_str(), "ClusterIP" | "LoadBalancer"),
             "unsupported gateway service type"
+        );
+        ensure!(
+            !settings.extra_env.iter().any(|var| matches!(
+                var.name.as_str(),
+                "POD_UID" | "WEICHE_PROVISIONER_BINDING" | "WEICHE_WORKERS"
+            )),
+            "proxy extraEnv cannot override reserved environment variables"
         );
         Ok(settings)
     }
@@ -244,7 +333,7 @@ pub async fn reconcile(
             &name,
             &settings.release,
             &owner,
-            proxy_deployment(&name, &labels, settings),
+            proxy_deployment(&name, &uid, &labels, settings),
         )
         .await?;
     applied
@@ -382,51 +471,112 @@ fn proxy_role_binding(name: &str, namespace: &str) -> Value {
     })
 }
 
-fn proxy_deployment(name: &str, labels: &Value, settings: &Settings) -> Value {
+/// render the per-Gateway proxy Deployment using platform scheduling and runtime settings.
+fn proxy_deployment(
+    name: &str,
+    uid: &str,
+    selector: &Value,
+    settings: &Settings,
+) -> Value {
+    let mut pod_labels = settings.pod_labels.clone();
+    pod_labels.insert(OWNER.into(), uid.into());
+    pod_labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
+    pod_labels.insert("app.kubernetes.io/instance".into(), settings.release.clone());
+
+    let mut node_selector = settings.node_selector.clone();
+    node_selector.insert("kubernetes.io/os".into(), "linux".into());
+
+    let mut env = vec![
+        json!({"name": "WEICHE_WORKERS", "value": settings.workers.to_string()}),
+        json!({"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding}),
+        json!({"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}}),
+    ];
+    if !settings.log.level.is_empty()
+        && !settings.extra_env.iter().any(|v| v.name == "RUST_LOG")
+    {
+        env.push(json!({"name": "RUST_LOG", "value": settings.log.level}));
+    }
+    if !settings.extra_env.iter().any(|v| v.name == "WEICHE_LOG_FORMAT") {
+        env.push(json!({"name": "WEICHE_LOG_FORMAT", "value": settings.log.format}));
+    }
+    for var in &settings.extra_env {
+        env.push(json!(var));
+    }
+
+    let capabilities = if settings.host_network {
+        json!({"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]})
+    } else {
+        json!({"drop": ["ALL"]})
+    };
+    let mut pod_spec = json!({
+        "serviceAccountName": name,
+        "nodeSelector": node_selector,
+        "imagePullSecrets": settings.pull_secrets,
+        "terminationGracePeriodSeconds": settings.termination_grace_period_seconds,
+        "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
+        "containers": [{
+            "name": "proxy",
+            "image": settings.image,
+            "imagePullPolicy": settings.pull_policy,
+            "args": ["proxy", name],
+            "resources": settings.resources,
+            "env": env,
+            "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
+            "readinessProbe": {
+                "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
+                "periodSeconds": 2,
+                "failureThreshold": 1,
+            },
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 65532,
+                "allowPrivilegeEscalation": false,
+                "capabilities": capabilities,
+                "seccompProfile": settings.seccomp_profile,
+            },
+        }],
+    });
+    if settings.host_network {
+        pod_spec["hostNetwork"] = json!(true);
+        pod_spec["dnsPolicy"] =
+            json!(settings.dns_policy.as_deref().unwrap_or("ClusterFirstWithHostNet"));
+    } else {
+        if let Some(dns_policy) = &settings.dns_policy {
+            pod_spec["dnsPolicy"] = json!(dns_policy);
+        }
+        // network-namespaced sysctls are forbidden under hostNetwork.
+        pod_spec["securityContext"] = json!({
+            "sysctls": [{
+                "name": "net.ipv4.ip_unprivileged_port_start",
+                "value": "0",
+            }]
+        });
+    }
+    if !settings.tolerations.is_empty() {
+        pod_spec["tolerations"] = json!(settings.tolerations);
+    }
+    if let Some(affinity) = &settings.affinity {
+        pod_spec["affinity"] = json!(affinity);
+    }
+    if !settings.topology_spread_constraints.is_empty() {
+        pod_spec["topologySpreadConstraints"] =
+            json!(settings.topology_spread_constraints);
+    }
+    if let Some(priority_class) = &settings.priority_class_name {
+        pod_spec["priorityClassName"] = json!(priority_class);
+    }
+
+    let mut pod_meta = json!({"labels": pod_labels});
+    if !settings.pod_annotations.is_empty() {
+        pod_meta["annotations"] = json!(settings.pod_annotations);
+    }
     json!({
         "spec": {
             "replicas": settings.replicas,
-            "selector": {"matchLabels": labels},
+            "selector": {"matchLabels": selector},
             "template": {
-                "metadata": {"labels": labels},
-                "spec": {
-                    "serviceAccountName": name,
-                    "nodeSelector": {"kubernetes.io/os": "linux"},
-                    "imagePullSecrets": settings.pull_secrets,
-                    "securityContext": {
-                        "sysctls": [{
-                            "name": "net.ipv4.ip_unprivileged_port_start",
-                            "value": "0",
-                        }]
-                    },
-                    "terminationGracePeriodSeconds": 10,
-                    "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
-                    "containers": [{
-                        "name": "proxy",
-                        "image": settings.image,
-                        "imagePullPolicy": settings.pull_policy,
-                        "args": ["proxy", name],
-                        "resources": settings.resources,
-                        "env": [
-                            {"name": "WEICHE_WORKERS", "value": settings.workers.to_string()},
-                            {"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding},
-                            {"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
-                        ],
-                        "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
-                        "readinessProbe": {
-                            "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
-                            "periodSeconds": 2,
-                            "failureThreshold": 1,
-                        },
-                        "securityContext": {
-                            "runAsNonRoot": true,
-                            "runAsUser": 65532,
-                            "allowPrivilegeEscalation": false,
-                            "capabilities": {"drop": ["ALL"]},
-                            "seccompProfile": settings.seccomp_profile,
-                        },
-                    }],
-                },
+                "metadata": pod_meta,
+                "spec": pod_spec,
             },
         }
     })
