@@ -15,7 +15,10 @@ use compio::{driver::ProactorBuilder, runtime::Runtime};
 use config::RuntimeConfig;
 use net::{ListenerGroup, WorkerGroupState};
 use std::{mem::DropGuard, sync::Arc, thread};
-use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio::sync::{
+    oneshot,
+    watch::{Receiver, Sender, channel},
+};
 pub use watch::ready;
 
 /// build a thread-local compio io_uring runtime tuned for one worker thread.
@@ -43,12 +46,20 @@ pub async fn stopped(mut shutdown: Receiver<bool>) {
     }
 }
 
+/// completion signal and result of one supervised OS thread.
+struct ProxyThread {
+    /// wakes the caller's runtime when the thread exits or unwinds.
+    finished: oneshot::Receiver<()>,
+    /// retains the result or panic until the supervisor joins.
+    handle: thread::JoinHandle<anyhow::Result<()>>,
+}
+
 /// threads that share a shutdown signal with the worker on the caller's runtime.
 struct Threads {
     /// stopping any member wakes the entire group.
     stop: Sender<bool>,
     /// join every started thread, including after a partial startup failure.
-    handles: Vec<thread::JoinHandle<anyhow::Result<()>>>,
+    handles: Vec<ProxyThread>,
 }
 
 impl Threads {
@@ -59,24 +70,28 @@ impl Threads {
         run: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
         let stop = self.stop.clone();
+        let (done, finished) = oneshot::channel();
         let handle = thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
-                let _on_exit = DropGuard::new(stop, |stop| {
+                let _on_exit = DropGuard::new((stop, done), |(stop, done)| {
                     stop.send_replace(true);
+                    let _ = done.send(());
                 });
                 run()
             })
             .with_context(|| format!("spawn {name}"))?;
-        self.handles.push(handle);
+        self.handles.push(ProxyThread { finished, handle });
         Ok(())
     }
 
     /// request shutdown, join all threads and report each failure with its origin.
-    fn join(self, local: anyhow::Result<()>) -> anyhow::Result<()> {
+    async fn join(mut self, local: anyhow::Result<()>) -> anyhow::Result<()> {
         self.stop.send_replace(true);
         let mut errors: Vec<_> = local.err().into_iter().collect();
-        for handle in self.handles {
+        for ProxyThread { finished, handle } in self.handles.drain(..) {
+            // keep driving worker zero's runtime while other workers drain.
+            let _ = finished.await;
             let name = handle.thread().name().unwrap_or("proxy thread").to_owned();
             let result = handle
                 .join()
@@ -97,6 +112,13 @@ impl Threads {
                     .join("; ")
             ),
         }
+    }
+}
+
+impl Drop for Threads {
+    /// wake the watch and workers if the caller drops the supervisor future.
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
     }
 }
 
@@ -133,10 +155,10 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
             io.block_on(worker::run(id, config, policy, admission, listeners, stop))
         });
         if started.is_err() {
-            return threads.join(started);
+            return threads.join(started).await;
         }
     }
     let result =
         worker::run(0, reader, policy, admission, listeners.clone(), shutdown).await;
-    threads.join(result.context("worker 0"))
+    threads.join(result.context("worker 0")).await
 }
