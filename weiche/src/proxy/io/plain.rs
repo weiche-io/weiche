@@ -80,6 +80,7 @@ impl PlainIo {
 }
 
 impl Read for PlainIo {
+    /// receive into the uninitialized portion of the caller's buffer.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -109,6 +110,7 @@ impl Read for PlainIo {
 }
 
 impl Write for PlainIo {
+    /// write immediately while cached socket readiness allows.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -132,6 +134,7 @@ impl Write for PlainIo {
         Poll::Ready(Ok(n))
     }
 
+    /// send the supplied buffers together and record partial writes.
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -157,14 +160,17 @@ impl Write for PlainIo {
         Poll::Ready(Ok(n))
     }
 
+    /// advertise support for vectored socket sends.
     fn is_write_vectored(&self) -> bool {
         true
     }
 
+    /// complete immediately because plain writes have no userspace buffer.
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
+    /// shut down the socket write half and retire its pending readiness poll.
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,

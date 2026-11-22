@@ -135,6 +135,7 @@ fn copy_plaintext(conn: &mut Connection, buf: &mut ReadBufCursor<'_>) -> io::Res
 }
 
 impl Read for TlsIo {
+    /// deliver buffered plaintext before driving the next record read.
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -163,6 +164,7 @@ impl Read for TlsIo {
 }
 
 impl HyperWrite for TlsIo {
+    /// queue a plaintext slice and drive any pending ciphertext write.
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -174,10 +176,12 @@ impl HyperWrite for TlsIo {
         self.write_plaintext(cx, |writer| writer.write(buf))
     }
 
+    /// advertise support for vectored plaintext writes.
     fn is_write_vectored(&self) -> bool {
         true
     }
 
+    /// pass the caller's slices to the rustls plaintext writer.
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -189,6 +193,7 @@ impl HyperWrite for TlsIo {
         self.write_plaintext(cx, |writer| writer.write_vectored(bufs))
     }
 
+    /// flush queued records to the socket.
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -196,6 +201,7 @@ impl HyperWrite for TlsIo {
         self.poll_output(cx, false)
     }
 
+    /// flush close_notify before shutting down the socket write half.
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

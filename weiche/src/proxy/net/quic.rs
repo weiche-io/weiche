@@ -43,7 +43,10 @@ pub fn listen(address: SocketAddr, config: ServerConfig) -> io::Result<Endpoint>
 
 /// ordered certificate table shared by the listener and rustls handshakes.
 #[derive(Debug, Default)]
-struct Certificates(RwLock<Vec<(String, Arc<CertifiedKey>)>>);
+struct Certificates(
+    /// ordered hostname patterns and signing keys for new handshakes.
+    RwLock<Vec<(String, Arc<CertifiedKey>)>>,
+);
 
 impl Certificates {
     /// atomically replace the keys in the same specificity order used by TCP.
@@ -82,6 +85,7 @@ pub struct Listener {
 }
 
 impl Drop for Listener {
+    /// withdraw the HTTP/3 advertisement when this endpoint is retired.
     fn drop(&mut self) {
         self.service.set_http3(&self.binding, None);
     }

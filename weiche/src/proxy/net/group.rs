@@ -11,7 +11,10 @@ use std::{
 
 /// live groups indexed by address, shared across all compio runtimes.
 #[derive(Clone, Default)]
-pub struct Groups(Arc<Mutex<BTreeMap<SocketAddr, Group>>>);
+pub struct Groups(
+    /// address registry locked across group creation and retirement.
+    Arc<Mutex<BTreeMap<SocketAddr, Group>>>,
+);
 
 /// sockets in kernel bind order and the protocol that currently owns them.
 struct Group {
@@ -60,6 +63,7 @@ pub struct Reader {
 }
 
 impl Drop for Reader {
+    /// release the worker reservation and retire a group after its last reader.
     fn drop(&mut self) {
         let mut groups = self.groups.0.lock().unwrap();
         let group = groups.get_mut(&self.addr).expect("registered socket group");

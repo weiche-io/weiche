@@ -13,7 +13,10 @@ use std::{
 
 /// absolute cutoff for flushing a streaming response to the downstream transport.
 #[derive(Clone, Copy)]
-pub struct ResponseDeadline(pub Instant);
+pub struct ResponseDeadline(
+    /// absolute deadline on the worker clock.
+    pub Instant,
+);
 
 /// the request deadline survives retries while each attempt gets a fresh backend budget.
 #[derive(Clone, Copy)]
@@ -63,7 +66,10 @@ impl Deadlines {
 }
 
 /// an HTTP body with optional cancellation independent of transport flow control.
-pub struct TimedBody<B>(Storage<B>);
+pub struct TimedBody<B>(
+    /// body state and optional deadline task.
+    Storage<B>,
+);
 
 /// unconfigured routes and empty bodies use the direct path without a timer task.
 enum Storage<B> {
@@ -117,6 +123,7 @@ where
     type Data = B::Data;
     type Error = io::Error;
 
+    /// enforce the deadline before delivering the next data or trailer frame.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -147,6 +154,7 @@ where
         frame.map(|frame| frame.map(|r| r.map_err(io::Error::other)))
     }
 
+    /// report completion from the current storage state.
     fn is_end_stream(&self) -> bool {
         match &self.0 {
             Storage::Done => true,
@@ -157,6 +165,7 @@ where
         }
     }
 
+    /// forward the available body's size estimate.
     fn size_hint(&self) -> SizeHint {
         match &self.0 {
             Storage::Done => SizeHint::with_exact(0),

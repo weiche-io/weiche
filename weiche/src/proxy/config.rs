@@ -2,7 +2,6 @@
 use super::super::ir::{GatewaySnapshot, PublishedSnapshot, Revision};
 use anyhow::Context;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-
 use tokio::sync::watch;
 
 /// process-wide limits and downstream listener policy.

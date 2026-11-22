@@ -17,7 +17,10 @@ use std::{
 };
 
 /// worker-local HTTP transport covering plain TCP and io_uring TLS connections.
-pub struct Io(send_wrapper::SendWrapper<Transport>);
+pub struct Io(
+    /// transport restricted to the thread that created it.
+    send_wrapper::SendWrapper<Transport>,
+);
 
 /// hyper erases upgraded transports behind a Send bound. all polling and destruction
 /// stays on the owning compio worker, enforced by the wrapper's thread check.
@@ -41,6 +44,7 @@ impl Io {
 }
 
 impl Read for Io {
+    /// read from the transport selected for this connection.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -54,6 +58,7 @@ impl Read for Io {
 }
 
 impl Write for Io {
+    /// write to the active plain or encrypted stream.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -65,6 +70,7 @@ impl Write for Io {
         }
     }
 
+    /// preserve vectored writes through either adapter.
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -78,6 +84,7 @@ impl Write for Io {
         }
     }
 
+    /// report the active adapter's vectored write support.
     fn is_write_vectored(&self) -> bool {
         match &*self.0 {
             Transport::Plain(stream) => stream.is_write_vectored(),
@@ -85,6 +92,7 @@ impl Write for Io {
         }
     }
 
+    /// flush pending writes on the active transport.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self.get_mut().0 {
             Transport::Plain(stream) => Pin::new(stream).poll_flush(cx),
@@ -92,6 +100,7 @@ impl Write for Io {
         }
     }
 
+    /// let the transport complete its write-side shutdown.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self.get_mut().0 {
             Transport::Plain(stream) => Pin::new(stream).poll_shutdown(cx),

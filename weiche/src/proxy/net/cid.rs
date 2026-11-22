@@ -8,7 +8,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use std::{io, os::fd::AsRawFd, time::Duration};
 
 /// eight-byte CID with a stable reuseport index and a fresh random suffix.
-pub struct Generator(pub u16);
+pub struct Generator(
+    /// reuseport socket index encoded in each connection ID.
+    pub u16,
+);
 
 impl ConnectionIdGenerator for Generator {
     /// encode the worker in network byte order.

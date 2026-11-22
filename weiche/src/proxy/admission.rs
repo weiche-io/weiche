@@ -90,8 +90,12 @@ impl Admission {
 }
 
 /// returns the connection slot when dropped, including on cancellation.
-pub struct Permit(Arc<Admission>);
+pub struct Permit(
+    /// shared budget credited when this permit drops.
+    Arc<Admission>,
+);
 impl Drop for Permit {
+    /// return the connection or flow reservation to the global budget.
     fn drop(&mut self) {
         self.0.live.fetch_sub(1, Ordering::Relaxed);
     }

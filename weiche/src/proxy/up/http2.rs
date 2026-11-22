@@ -104,9 +104,13 @@ impl Http2Connection {
 }
 
 /// upload and response share this guard. the upload must not keep its driver alive.
-struct Stream(Weak<Http2Connection>);
+struct Stream(
+    /// weak reference used to return stream capacity on completion.
+    Weak<Http2Connection>,
+);
 
 impl Drop for Stream {
+    /// release stream capacity and record when the connection becomes idle.
     fn drop(&mut self) {
         if let Some(connection) = self.0.upgrade() {
             let remaining = connection.active.get() - 1;
@@ -163,6 +167,7 @@ impl hyper::body::Body for Upload {
     type Data = Bytes;
     type Error = std::io::Error;
 
+    /// deliver upload frames while retaining the HTTP/2 stream reservation.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -170,9 +175,11 @@ impl hyper::body::Body for Upload {
         Pin::new(&mut self.body).poll_frame(cx)
     }
 
+    /// report whether the original upload has finished.
     fn is_end_stream(&self) -> bool {
         self.body.is_end_stream()
     }
+    /// forward the original upload's size estimate.
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()
     }

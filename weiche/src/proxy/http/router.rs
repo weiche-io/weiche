@@ -180,6 +180,7 @@ pub struct Hosts<T> {
 }
 
 impl<T> FromIterator<(String, T)> for Hosts<T> {
+    /// index exact, wildcard and fallback hostnames in selection order.
     fn from_iter<I: IntoIterator<Item = (String, T)>>(entries: I) -> Self {
         let mut hosts = Self {
             exact: BTreeMap::new(),

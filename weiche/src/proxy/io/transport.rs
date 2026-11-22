@@ -39,6 +39,7 @@ struct SendWake {
 }
 
 impl ArcWake for SendWake {
+    /// wake both halves so either can advance the shared ciphertext send.
     fn wake_by_ref(this: &Arc<Self>) {
         this.reader.wake();
         this.writer.wake();

@@ -3,8 +3,6 @@
 use super::{
     super::{super::ir::Protocol, admission::EndpointKey, config::RuntimeConfig},
     connector::Connector,
-};
-use super::{
     http1::{Idle, Lease},
     http2::{Http2Connection, Http2Lease},
 };
@@ -36,6 +34,7 @@ pub struct Slot {
     pub budget: Rc<Budget>,
 }
 impl Drop for Slot {
+    /// release the socket slot and wake pending requests.
     fn drop(&mut self) {
         self.budget.live.set(self.budget.live.get() - 1);
         self.budget.changed.notify_waiters();
@@ -257,6 +256,7 @@ impl ConnectionPool {
 }
 
 impl Drop for ConnectionPool {
+    /// retire endpoint generations when the worker releases its pool.
     fn drop(&mut self) {
         self.close();
     }
@@ -308,6 +308,7 @@ impl hyper::body::Body for PooledBody {
     type Data = Bytes;
     type Error = hyper::Error;
 
+    /// release the response lease on completion or failure.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -328,10 +329,12 @@ impl hyper::body::Body for PooledBody {
         frame
     }
 
+    /// report whether the upstream body has finished.
     fn is_end_stream(&self) -> bool {
         self.body.is_end_stream()
     }
 
+    /// forward the size estimate of the upstream response.
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()
     }
