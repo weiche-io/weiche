@@ -1,15 +1,14 @@
 //! maintain one QUIC endpoint per terminating HTTPS socket on each worker.
-use super::{cid, group, h3};
-
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
     admission::Admission,
     config::RuntimeConfig,
     http::ProxyService,
     stopped,
+    worker::{HttpListener, Task, Worker},
 };
+use super::{cid, group, h3};
 use compio::{
-    net::UdpSocket,
     quic::{
         Endpoint, EndpointConfig, ServerConfig, TransportConfig,
         crypto::rustls::QuicServerConfig,
@@ -21,7 +20,7 @@ use compio::{
         sign::CertifiedKey,
     },
 };
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{
     io,
     net::SocketAddr,
@@ -31,26 +30,16 @@ use std::{
 };
 use tokio::sync::watch;
 
-/// bind a standalone QUIC endpoint with caller-supplied TLS and transport settings.
-pub fn listen(address: SocketAddr, config: ServerConfig) -> io::Result<Endpoint> {
-    Endpoint::new(
-        super::udp::listen(address)?,
-        EndpointConfig::default(),
-        Some(config),
-        None,
-    )
-}
-
 /// ordered certificate table shared by the listener and rustls handshakes.
 #[derive(Debug, Default)]
-struct Certificates(
+pub struct Certificates(
     /// ordered hostname patterns and signing keys for new handshakes.
     RwLock<Vec<(String, Arc<CertifiedKey>)>>,
 );
 
 impl Certificates {
     /// atomically replace the keys in the same specificity order used by TCP.
-    fn update(&self, certs: &[Arc<ServerTls>]) {
+    pub fn update(&self, certs: &[Arc<ServerTls>]) {
         let keys = certs
             .iter()
             .map(|c| (c.hostname.clone(), c.certified_key()))
@@ -79,7 +68,7 @@ pub struct Listener {
     /// router shared with TCP and the owner of this listener's advertisement.
     service: Rc<ProxyService>,
     /// dynamically reloadable SNI resolver.
-    certificates: Arc<Certificates>,
+    pub certificates: Arc<Certificates>,
     /// closing this channel stops new handshakes and drains active connections.
     stop: watch::Sender<bool>,
 }
@@ -94,15 +83,20 @@ impl Drop for Listener {
 impl Listener {
     /// configure the TLS identity, QUIC version and transport limits before accepting.
     pub fn bind(
-        socket: UdpSocket,
-        service: Rc<ProxyService>,
-        binding: Rc<Binding>,
-        certs: &[Arc<ServerTls>],
-        id: usize,
-        runtime: &RuntimeConfig,
-    ) -> io::Result<(Self, Endpoint)> {
+        worker: &Worker,
+        address: SocketAddr,
+        http: &HttpListener,
+    ) -> io::Result<(Self, Task)> {
+        let runtime = &worker.runtime;
+        let (socket, reader) = worker.group.datagrams.acquire(
+            address,
+            worker.id,
+            runtime.workers.get(),
+            true,
+        )?;
         let certificates = Arc::new(Certificates::default());
-        certificates.update(certs);
+        let binding = http.binding.clone();
+        certificates.update(&http.certs.borrow());
         let mut tls = rustls::ServerConfig::builder_with_protocol_versions(&[
             &rustls::version::TLS13,
         ])
@@ -121,25 +115,24 @@ impl Listener {
         config.transport_config(Arc::new(transport));
         let mut endpoint = EndpointConfig::default();
         endpoint.supported_versions(vec![1]);
-        if let Ok(worker) = u16::try_from(id) {
+        if let Ok(worker) = u16::try_from(worker.id) {
             endpoint.cid_generator(move || Box::new(cid::Generator(worker)));
         }
         let endpoint = Endpoint::new(socket, endpoint, Some(config), None)?;
         let (stop, _) = watch::channel(false);
+        let service = worker.server.service.clone();
         service.set_http3(
             &binding,
             Some(runtime.http3_advertised_port.unwrap_or(binding.port)),
         );
-        Ok((Self { binding, service, certificates, stop }, endpoint))
-    }
-
-    /// swap only the certificate table when a snapshot changes.
-    pub fn update(&self, certs: &[Arc<ServerTls>]) {
-        self.certificates.update(certs);
+        let listener = Self { binding, service, certificates, stop };
+        let task =
+            listener.serve(endpoint, worker.admission.clone(), runtime.clone(), reader);
+        Ok((listener, task.boxed_local()))
     }
 
     /// drive admissions concurrently, then bound the lifetime of all remaining work.
-    pub fn serve(
+    fn serve(
         &self,
         endpoint: Endpoint,
         admission: Arc<Admission>,

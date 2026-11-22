@@ -3,15 +3,14 @@ use super::{
     super::{
         super::ir::StreamRoute,
         admission::{Admission, Permit},
-        config::RuntimeConfig,
+        worker::{Task, Worker},
     },
     bind_socket,
-    group::Groups,
 };
 use compio::{net::UdpSocket, runtime::time::timeout};
 use futures::{
     FutureExt, StreamExt,
-    future::{AbortHandle, LocalBoxFuture, abortable},
+    future::{AbortHandle, abortable},
     stream::FuturesUnordered,
 };
 use std::{
@@ -35,18 +34,21 @@ pub fn listen(address: SocketAddr) -> io::Result<UdpSocket> {
 
 /// bind a raw listener and reserve its group slot through socket close when sharing UDP with QUIC.
 pub fn bind(
+    worker: &Worker,
     address: SocketAddr,
-    id: usize,
-    groups: &Groups,
-    config: &RuntimeConfig,
     routes: watch::Receiver<Arc<StreamRoute>>,
-    admission: Arc<Admission>,
-) -> io::Result<LocalBoxFuture<'static, io::Result<()>>> {
-    let idle = config.upstream_idle_timeout;
-    if !config.http3 {
+) -> io::Result<Task> {
+    let idle = worker.runtime.upstream_idle_timeout;
+    let admission = worker.admission.clone();
+    if !worker.runtime.http3 {
         return Ok(serve(listen(address)?, routes, admission, idle).boxed_local());
     }
-    let (socket, reader) = groups.acquire(address, id, config.workers.get(), false)?;
+    let (socket, reader) = worker.group.datagrams.acquire(
+        address,
+        worker.id,
+        worker.runtime.workers.get(),
+        false,
+    )?;
     Ok(async move {
         let result = serve(socket.clone(), routes, admission, idle).await;
         socket.close().await?;

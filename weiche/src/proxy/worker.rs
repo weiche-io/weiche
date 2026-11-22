@@ -16,14 +16,14 @@ use std::{collections::BTreeMap, io, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::watch;
 
 /// accept or datagram loop driven on the worker that owns its socket.
-type Task = LocalBoxFuture<'static, io::Result<()>>;
+pub type Task = LocalBoxFuture<'static, io::Result<()>>;
 
 /// identity and reloadable certificate table of a bound HTTP socket.
-struct HttpListener {
+pub struct HttpListener {
     /// immutable identity shared with accepted connections and the QUIC endpoint.
-    binding: Rc<Binding>,
+    pub binding: Rc<Binding>,
     /// latest certificate table for new handshakes on this socket.
-    certs: watch::Sender<Rc<[Arc<ServerTls>]>>,
+    pub certs: watch::Sender<Rc<[Arc<ServerTls>]>>,
 }
 
 impl HttpListener {
@@ -51,18 +51,23 @@ struct StreamListener {
     routes: watch::Sender<Arc<StreamRoute>>,
 }
 
-/// active bindings, their serving tasks and the resources shared by this worker.
-struct Listeners {
+/// resources shared by listener tasks on one compio runtime.
+pub struct Worker {
     /// index in the reuseport group and worker status table.
-    id: usize,
+    pub id: usize,
     /// immutable timeouts, worker count and HTTP/3 policy.
-    runtime: Arc<RuntimeConfig>,
+    pub runtime: Arc<RuntimeConfig>,
     /// connection and flow budget shared with the other workers.
-    admission: Arc<Admission>,
+    pub admission: Arc<Admission>,
     /// datagram reservations and status reports for the group.
-    group: Arc<ListenerGroup>,
+    pub group: Arc<ListenerGroup>,
     /// worker-local HTTP service shared by TCP and QUIC listeners.
-    server: Rc<Server>,
+    pub server: Rc<Server>,
+}
+
+/// active bindings and their serving tasks on one worker.
+#[derive(Default)]
+struct Listeners {
     /// last revision reconciled, including snapshots still waiting for a socket.
     revision: Option<Revision>,
     /// active QUIC handles that own the HTTP/3 advertisements.
@@ -78,38 +83,35 @@ struct Listeners {
 }
 
 impl Listeners {
-    /// create the worker's routing service before opening any sockets.
-    fn new(
-        id: usize,
+    /// apply routes and report actual bindings after retiring obsolete socket owners.
+    fn reconcile(
+        &mut self,
+        worker: &Worker,
         snapshot: Arc<PublishedSnapshot>,
-        runtime: Arc<RuntimeConfig>,
-        admission: Arc<Admission>,
-        group: Arc<ListenerGroup>,
-    ) -> anyhow::Result<Self> {
-        let service = ProxyService::new(snapshot, &runtime)?;
-        let server = Rc::new(Server::new(service, &runtime));
-        Ok(Self {
-            id,
-            runtime,
-            admission,
-            group,
-            server,
-            revision: None,
-            quic: BTreeMap::new(),
-            http: BTreeMap::new(),
-            streams: BTreeMap::new(),
-            tls: BTreeMap::new(),
-            serving: FuturesUnordered::new(),
-        })
-    }
-
-    /// apply routes, report actual bindings and request a retry for any missing socket.
-    fn reconcile(&mut self, snapshot: Arc<PublishedSnapshot>) -> anyhow::Result<bool> {
-        self.server.service.apply(snapshot.clone())?;
+    ) -> anyhow::Result<bool> {
+        worker.server.service.apply(&snapshot)?;
         let gateway = &snapshot.gateway;
-        self.reconcile_http(gateway);
+        self.http.retain(|address, http| {
+            gateway
+                .sockets
+                .get(address)
+                .is_some_and(|socket| http.reload(&socket.listener))
+        });
+        for (&address, socket) in &gateway.sockets {
+            if self.http.contains_key(&address) {
+                continue;
+            }
+            match worker.bind_http(address, &socket.listener) {
+                Ok((listener, task)) => {
+                    self.serving.push(task);
+                    self.http.insert(address, listener);
+                }
+                Err(error) => tracing::warn!(%address, %error, "listener bind failed"),
+            }
+        }
         let changed = self.revision.replace(snapshot.revision) != Some(snapshot.revision);
-        let retry_quic = self.runtime.http3 && self.reconcile_http3(gateway, changed);
+        let retry_quic =
+            worker.runtime.http3 && self.reconcile_http3(worker, gateway, changed);
         // release obsolete stream routes before binding replacement passthrough sockets.
         self.streams.retain(|key, stream| {
             gateway
@@ -117,54 +119,22 @@ impl Listeners {
                 .get(key)
                 .is_some_and(|listener| listener.gateway_uid == stream.gateway_uid)
         });
-        self.reconcile_tls(gateway);
-        self.reconcile_streams(gateway);
-        self.group.report(self.id, self.status(snapshot.revision));
+        self.reconcile_tls(worker, gateway);
+        self.reconcile_streams(worker, gateway);
+        worker.group.report(worker.id, self.status(snapshot.revision));
         Ok(retry_quic
             || self.http.len() != gateway.sockets.len()
             || self.tls.len() != gateway.tls.len()
             || self.streams.len() != gateway.streams.len())
     }
 
-    /// retain matching bindings and start an accept loop for each newly bound HTTP socket.
-    fn reconcile_http(&mut self, gateway: &GatewaySnapshot) {
-        self.http.retain(|address, http| {
-            gateway
-                .sockets
-                .get(address)
-                .is_some_and(|socket| http.reload(&socket.listener))
-        });
-        for (&address, routes) in &gateway.sockets {
-            if self.http.contains_key(&address) {
-                continue;
-            }
-            let socket = match tcp::listen(address) {
-                Ok(socket) => socket,
-                Err(error) => {
-                    tracing::warn!(%address, %error, "listener bind failed");
-                    continue;
-                }
-            };
-            let binding = Rc::new(routes.listener.binding());
-            let (certs, rx) = watch::channel(Rc::from(routes.listener.tls.as_slice()));
-            self.serving.push(
-                self.server
-                    .clone()
-                    .accept(
-                        socket,
-                        binding.clone(),
-                        self.admission.clone(),
-                        rx,
-                        self.runtime.worker_drain_timeout,
-                    )
-                    .boxed_local(),
-            );
-            self.http.insert(address, HttpListener { binding, certs });
-        }
-    }
-
     /// follow terminating HTTP bindings unless an explicit UDP route owns the address.
-    fn reconcile_http3(&mut self, gateway: &GatewaySnapshot, changed: bool) -> bool {
+    fn reconcile_http3(
+        &mut self,
+        worker: &Worker,
+        gateway: &GatewaySnapshot,
+        changed: bool,
+    ) -> bool {
         self.quic.retain(|addr, listener| {
             self.http
                 .get(addr)
@@ -177,18 +147,18 @@ impl Listeners {
                 continue;
             }
             if gateway.streams.contains_key(&(Transport::Udp, address)) {
-                if changed && self.id == 0 {
+                if changed && worker.id == 0 {
                     tracing::warn!(%address, "explicit udp listener takes precedence over http/3");
                 }
                 continue;
             }
             if let Some(listener) = self.quic.get(&address) {
                 if changed {
-                    listener.update(&http.certs.borrow());
+                    listener.certificates.update(&http.certs.borrow());
                 }
                 continue;
             }
-            match self.bind_http3(address, http) {
+            match quic::Listener::bind(worker, address, http) {
                 Ok((listener, task)) => {
                     self.serving.push(task);
                     self.quic.insert(address, listener);
@@ -204,37 +174,8 @@ impl Listeners {
         retry
     }
 
-    /// reserve this worker's UDP slot and keep it until the QUIC endpoint shuts down.
-    fn bind_http3(
-        &self,
-        address: SocketAddr,
-        http: &HttpListener,
-    ) -> io::Result<(quic::Listener, Task)> {
-        let (socket, reader) = self.group.datagrams.acquire(
-            address,
-            self.id,
-            self.runtime.workers.get(),
-            true,
-        )?;
-        let (listener, endpoint) = quic::Listener::bind(
-            socket,
-            self.server.service.clone(),
-            http.binding.clone(),
-            &http.certs.borrow(),
-            self.id,
-            &self.runtime,
-        )?;
-        let task = listener.serve(
-            endpoint,
-            self.admission.clone(),
-            self.runtime.clone(),
-            reader,
-        );
-        Ok((listener, task.boxed_local()))
-    }
-
     /// preserve passthrough sockets while their owning gateway stays the same.
-    fn reconcile_tls(&mut self, gateway: &GatewaySnapshot) {
+    fn reconcile_tls(&mut self, worker: &Worker, gateway: &GatewaySnapshot) {
         self.tls.retain(|addr, tx| {
             gateway
                 .tls
@@ -246,19 +187,10 @@ impl Listeners {
                 update(tx, socket);
                 continue;
             }
-            match tcp::listen(address) {
-                Ok(listener) => {
-                    let (tx, rx) = watch::channel(socket.clone());
-                    self.serving.push(
-                        tcp::serve(
-                            listener,
-                            rx,
-                            self.admission.clone(),
-                            self.runtime.clone(),
-                            tcp::passthrough,
-                        )
-                        .boxed_local(),
-                    );
+            let (tx, rx) = watch::channel(socket.clone());
+            match tcp::bind(worker, address, rx, tcp::passthrough) {
+                Ok(task) => {
+                    self.serving.push(task);
                     self.tls.insert(address, tx);
                 }
                 Err(error) => {
@@ -269,7 +201,7 @@ impl Listeners {
     }
 
     /// update forwarding tables in place and bind missing raw TCP and UDP sockets.
-    fn reconcile_streams(&mut self, gateway: &GatewaySnapshot) {
+    fn reconcile_streams(&mut self, worker: &Worker, gateway: &GatewaySnapshot) {
         for (&key, listener) in &gateway.streams {
             if let Some(stream) = self.streams.get(&key) {
                 update(&stream.routes, &listener.route);
@@ -277,7 +209,11 @@ impl Listeners {
             }
             let (tx, rx) = watch::channel(listener.route.clone());
             let (transport, address) = key;
-            match self.bind_stream(transport, address, rx) {
+            let task = match transport {
+                Transport::Tcp => tcp::bind(worker, address, rx, tcp::forward),
+                Transport::Udp => udp::bind(worker, address, rx),
+            };
+            match task {
                 Ok(task) => {
                     self.serving.push(task);
                     self.streams.insert(
@@ -293,37 +229,6 @@ impl Listeners {
                     tracing::warn!(%address, ?transport, %error, "transport listener bind failed")
                 }
             }
-        }
-    }
-
-    /// bind a raw listener and return the task that owns its socket.
-    fn bind_stream(
-        &self,
-        transport: Transport,
-        address: SocketAddr,
-        routes: watch::Receiver<Arc<StreamRoute>>,
-    ) -> io::Result<Task> {
-        let admission = self.admission.clone();
-        match transport {
-            Transport::Tcp => {
-                let listener = tcp::listen(address)?;
-                let task = tcp::serve(
-                    listener,
-                    routes,
-                    admission,
-                    self.runtime.clone(),
-                    tcp::forward,
-                );
-                Ok(task.boxed_local())
-            }
-            Transport::Udp => udp::bind(
-                address,
-                self.id,
-                &self.group.datagrams,
-                &self.runtime,
-                routes,
-                admission,
-            ),
         }
     }
 
@@ -343,14 +248,35 @@ impl Listeners {
     }
 
     /// withdraw advertisements and routes, then drain before clearing status and closing upstreams.
-    async fn drain(mut self) {
+    async fn drain(mut self, worker: &Worker) {
         self.quic.clear();
         self.http.clear();
         self.streams.clear();
         self.tls.clear();
         while self.serving.next().await.is_some() {}
-        self.group.report(self.id, WorkerStatus::default());
-        self.server.service.close();
+        worker.group.report(worker.id, WorkerStatus::default());
+        worker.server.service.close();
+    }
+}
+
+impl Worker {
+    /// bind an HTTP socket with a certificate watch for new handshakes.
+    fn bind_http(
+        &self,
+        address: SocketAddr,
+        listener: &Listener,
+    ) -> io::Result<(HttpListener, Task)> {
+        let socket = tcp::listen(address)?;
+        let binding = Rc::new(listener.binding());
+        let (certs, rx) = watch::channel(Rc::from(listener.tls.as_slice()));
+        let task = self.server.clone().accept(
+            socket,
+            binding.clone(),
+            self.admission.clone(),
+            rx,
+            self.runtime.worker_drain_timeout,
+        );
+        Ok((HttpListener { binding, certs }, task.boxed_local()))
     }
 }
 
@@ -375,17 +301,16 @@ pub async fn run(
     stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let retry_interval = runtime.listener_retry_interval;
-    let mut listeners = Listeners::new(
-        id,
-        config.borrow_and_update().clone(),
-        runtime,
-        admission,
-        group,
-    )?;
+    let snapshot = config.borrow_and_update().clone();
+    let service = ProxyService::new(snapshot, &runtime)?;
+    let server = Rc::new(Server::new(service, &runtime));
+    let worker = Worker { id, runtime, admission, group, server };
+    let mut listeners = Listeners::default();
     let stopping = stopped(stop);
     tokio::pin!(stopping);
     loop {
-        let retry = listeners.reconcile(config.borrow_and_update().clone())?;
+        let snapshot = config.borrow_and_update().clone();
+        let retry = listeners.reconcile(&worker, snapshot)?;
         tokio::select! {
             biased;
             _ = &mut stopping => break,
@@ -394,6 +319,6 @@ pub async fn run(
             _ = sleep(retry_interval), if retry => {}
         }
     }
-    listeners.drain().await;
+    listeners.drain(&worker).await;
     Ok(())
 }

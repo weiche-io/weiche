@@ -158,13 +158,12 @@ impl ProxyService {
     }
 
     /// publish the snapshot and retire endpoints removed by the controller.
-    pub fn apply(&self, snapshot: Arc<PublishedSnapshot>) -> anyhow::Result<Revision> {
+    pub fn apply(&self, snapshot: &PublishedSnapshot) -> anyhow::Result<Revision> {
         if self.view.borrow().revision == snapshot.revision {
             return Ok(snapshot.revision);
         }
         // preparation cannot mutate the live view or retire its connections.
-        let (next, endpoints) =
-            WorkerView::prepare(&snapshot, Some(&self.view.borrow()))?;
+        let (next, endpoints) = WorkerView::prepare(snapshot, Some(&self.view.borrow()))?;
         // commit has no await or fallible operation; requests observe one complete local view.
         self.pool.reconcile(&endpoints);
         *self.view.borrow_mut() = next;
