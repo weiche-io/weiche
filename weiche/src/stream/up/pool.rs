@@ -11,8 +11,8 @@ use super::{
 };
 use bytes::Bytes;
 use compio::runtime;
-use http1::{Idle, Lease};
-pub use http2::Upload;
+use http1::Idle;
+pub use http1::Lease;
 use http2::{Http2Connection, Http2Lease};
 use hyper::body::Incoming;
 use std::{
@@ -25,13 +25,18 @@ use std::{
 };
 use tokio::sync::{Notify, futures::Notified};
 
+/// worker-wide connection slot counter and admission notifications.
 #[derive(Default)]
 struct Budget {
+    /// number of slots currently reserved.
     live: Cell<usize>,
+    /// wake admissions when capacity or stream availability changes.
     changed: Notify,
 }
 
+/// exclusive reservation released when the transport is dropped.
 struct Slot {
+    /// shared socket capacity on this worker.
     budget: Rc<Budget>,
 }
 impl Drop for Slot {
@@ -41,17 +46,26 @@ impl Drop for Slot {
     }
 }
 
+/// one generation of a resolved upstream endpoint.
 pub struct Endpoint {
+    /// immutable address, protocol and TLS identity.
     pub key: EndpointKey,
+    /// whether new requests may use this generation.
     enabled: Cell<bool>,
+    /// wake waiters when the endpoint is retired.
     closed: Notify,
+    /// idle reusable HTTP/1 connections.
     idle: RefCell<Vec<Idle>>,
+    /// multiplexed HTTP/2 transports.
     http2: RefCell<Vec<Rc<Http2Connection>>>,
+    /// whether an HTTP/2 handshake is already in progress.
     connecting: Cell<bool>,
+    /// shared socket capacity on this worker.
     budget: Rc<Budget>,
 }
 
 impl Endpoint {
+    /// retire this pool or endpoint and wake pending requests.
     fn close(&self) {
         self.enabled.set(false);
         self.idle.borrow_mut().clear();
@@ -59,6 +73,7 @@ impl Endpoint {
         self.closed.notify_waiters();
     }
 
+    /// evict closed and expired idle transports.
     fn prune(&self, timeout: Duration) {
         self.idle.borrow_mut().retain(|idle| idle.reusable(timeout));
         self.http2
@@ -82,6 +97,7 @@ impl Endpoint {
         }
     }
 
+    /// remove the selected idle connection.
     fn evict_idle(&self, index: usize) {
         match self.key.protocol {
             Protocol::Http1 => {
@@ -94,18 +110,28 @@ impl Endpoint {
     }
 }
 
+/// bounded worker-local pool of active endpoint generations.
 pub struct ConnectionPool {
+    /// current connection state keyed by endpoint identity.
     endpoints: RefCell<HashMap<EndpointKey, Rc<Endpoint>>>,
+    /// maximum simultaneous socket reservations.
     limit: usize,
+    /// maximum active streams per HTTP/2 connection.
     max_streams: usize,
+    /// maximum idle age before a connection expires.
     idle_timeout: Duration,
+    /// handshake limits used for fresh transports.
     connector: Connector,
+    /// shared socket capacity on this worker.
     budget: Rc<Budget>,
+    /// whether the worker has stopped accepting new connections.
     closed: Cell<bool>,
+    /// task expiring idle transports.
     reaper: RefCell<Option<runtime::JoinHandle<()>>>,
 }
 
 impl ConnectionPool {
+    /// initialize socket budgets and schedule idle eviction.
     pub fn new(config: &RuntimeConfig) -> Rc<Self> {
         let pool = Rc::new(Self {
             endpoints: RefCell::new(HashMap::new()),
@@ -162,10 +188,12 @@ impl ConnectionPool {
         self.budget.changed.notify_waiters();
     }
 
+    /// look up the current generation for a selected address.
     pub fn endpoint(&self, key: EndpointKey) -> Option<Rc<Endpoint>> {
         self.endpoints.borrow().get(&key).cloned()
     }
 
+    /// retire all endpoint generations.
     pub fn close(&self) {
         self.closed.set(true);
         self.reaper.borrow_mut().take();
@@ -175,6 +203,7 @@ impl ConnectionPool {
         self.budget.changed.notify_waiters();
     }
 
+    /// make room for a dial by removing the oldest idle socket.
     fn evict_idle(&self) {
         // reclaim the oldest idle socket when a different backend needs space.
         let endpoints = self.endpoints.borrow();
@@ -190,6 +219,7 @@ impl ConnectionPool {
         }
     }
 
+    /// subscribe to capacity changes while the endpoint is still usable.
     fn watch_capacity(&self, endpoint: &Endpoint) -> anyhow::Result<Notified<'_>> {
         anyhow::ensure!(
             !self.closed.get() && endpoint.enabled.get(),
@@ -199,6 +229,7 @@ impl ConnectionPool {
         Ok(self.budget.changed.notified())
     }
 
+    /// reserve a free slot after evicting an idle socket if necessary.
     fn try_reserve(&self) -> Option<Slot> {
         if self.budget.live.get() == self.limit {
             self.evict_idle();
@@ -211,6 +242,7 @@ impl ConnectionPool {
         Some(Slot { budget: self.budget.clone() })
     }
 
+    /// cancel a handshake if its endpoint is removed.
     async fn dial<T>(
         &self,
         endpoint: &Endpoint,
@@ -234,26 +266,39 @@ impl Drop for ConnectionPool {
     }
 }
 
+/// transport-specific ownership retained by an ordinary response.
 enum ResponseLease {
+    /// exclusive HTTP/1 transport.
     Http1(Lease),
+    /// one stream on a shared HTTP/2 transport.
     Http2(Http2Lease),
 }
 
+/// upstream body retaining capacity until framing completes.
 pub struct PooledBody {
+    /// incoming body carrying data and trailers.
     body: Incoming,
+    /// live transport guard until EOF or error.
     lease: Option<ResponseLease>,
 }
 
 impl PooledBody {
+    /// upgraded transports hand their connection lease to the tunnel.
+    pub fn upgraded(body: Incoming) -> Self {
+        Self { body, lease: None }
+    }
+
+    /// attach the lease and release it immediately for empty bodies.
     fn new(body: Incoming, lease: ResponseLease) -> Self {
         let mut body = Self { body, lease: Some(lease) };
-        // HEAD, 204 and empty bodies may never be polled by the downstream.
+        // responses to HEAD, status 204 and empty bodies may never be polled by the downstream.
         if hyper::body::Body::is_end_stream(&body.body) {
             body.complete();
         }
         body
     }
 
+    /// return capacity after the final data or trailer frame.
     fn complete(&mut self) {
         match self.lease.take() {
             Some(ResponseLease::Http1(lease)) => lease.recycle(),

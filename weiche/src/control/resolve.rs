@@ -1,8 +1,11 @@
 //! translate watched route resources against the controller's local stores.
+mod filters;
+mod grpc;
+
 use super::{
     super::ir::{
-        ClusterSpec, HeaderChange, Http, Protocol, Redirect, RefError, RouteAction,
-        StreamRoute, Transport,
+        Backend, ClusterSpec, Filters, Http, PathMatch, Protocol, RefError, RouteAction,
+        StreamRoute, Timeouts, Transport, ValueMatch,
     },
     GatewayStores,
     tls::Policies,
@@ -10,167 +13,208 @@ use super::{
 use k8s_openapi::api::core::v1::{Service, ServicePort};
 use kube::{ResourceExt, runtime::reflector::ObjectRef};
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 use weiche_gtwapi::v1::httproutes::{
-    HttpRoute, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
+    HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeadersType as HeaderType,
     HttpRouteRulesMatchesMethod as Method, HttpRouteRulesMatchesPathType as PathType,
+    HttpRouteRulesMatchesQueryParamsType as QueryType,
 };
 use weiche_gtwapi::v1::{
+    grpcroutes::GrpcRouteRulesBackendRefs,
     tcproutes::{TcpRoute, TcpRouteRulesBackendRefs},
+    tlsroutes::{TlsRoute, TlsRouteRulesBackendRefs},
     udproutes::{UdpRoute, UdpRouteRulesBackendRefs},
 };
 
 /// errors which prevent the route itself from being accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveError {
+    /// a match, filter value or timeout cannot be implemented.
     UnsupportedValue,
+    /// a rule combines filters that cannot coexist.
+    IncompatibleFilters,
 }
 
-/// resolved matches and action for one HTTPRoute rule.
+impl ResolveError {
+    /// gateway API reason for rejecting the route.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnsupportedValue => "UnsupportedValue",
+            Self::IncompatibleFilters => "IncompatibleFilters",
+        }
+    }
+}
+
+/// resolved predicates and forwarding action for one HTTP or gRPC rule.
 pub struct HttpRule {
+    /// alternative predicates that select this action.
     pub matches: Vec<Http>,
+    /// shared forwarding and filter configuration.
     pub action: RouteAction,
 }
 
 impl GatewayStores {
-    /// retain policy status for the Service ports used by accepted routes.
+    /// resolve one rule independently so a bad filter cannot detach sibling rules.
     pub fn resolve_http(
         &self,
-        route: &HttpRoute,
+        namespace: &str,
+        rule: &HttpRouteRules,
         policies: &mut Policies,
-    ) -> Result<Vec<HttpRule>, ResolveError> {
-        let rules = route.spec.rules.as_deref().unwrap_or_default();
-        if rules.iter().any(unsupported_rule) {
+    ) -> Result<HttpRule, ResolveError> {
+        if rule.retry.is_some() {
             return Err(ResolveError::UnsupportedValue);
         }
+        let matches = match rule.matches.as_deref() {
+            None | Some([]) => vec![Http::default()],
+            Some(matches) => matches.iter().map(http_match).collect::<Result<_, _>>()?,
+        };
+        let timeouts = timeouts(rule)?;
+        let filters =
+            filters::rule_filters(rule, rule.filters.as_deref().unwrap_or_default())?;
+        let references = rule.backend_refs.as_deref().unwrap_or_default();
+        if filters.redirect.is_some() && !references.is_empty() {
+            return Err(ResolveError::IncompatibleFilters);
+        }
+        // validate the entire rule before recording any backend TLS policy status.
+        let mut validated = Vec::with_capacity(references.len());
+        for reference in references {
+            let backend = filters::backend_filters(
+                rule,
+                reference.filters.as_deref().unwrap_or_default(),
+            )?;
+            if backend.redirect.is_some()
+                && rule.filters.iter().flatten().any(|f| f.url_rewrite.is_some())
+            {
+                return Err(ResolveError::IncompatibleFilters);
+            }
+            validated.push((
+                reference.weight.unwrap_or(1),
+                ServiceRef::from(reference),
+                backend,
+            ));
+        }
+        let backends = self.resolve_backends(namespace, "HTTPRoute", policies, validated);
+        Ok(HttpRule {
+            matches,
+            action: RouteAction { backends, filters: Arc::new(filters), timeouts },
+        })
+    }
 
-        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        rules
-            .iter()
-            .map(|rule| {
-                let mut action = filters(rule)?;
-                for backend in rule.backend_refs.iter().flatten() {
-                    action.backends.push((
-                        backend.weight.unwrap_or(1),
-                        resolve_backend(self, policies, namespace, backend).map(Arc::new),
-                    ));
-                }
-                Ok(HttpRule {
-                    matches: rule.matches.as_ref().map_or_else(
-                        || vec![Http::default()],
-                        |m| m.iter().map(http_match).collect(),
-                    ),
-                    action,
-                })
+    /// keep an unresolved reference in its weighted slot and bind filters to that slot.
+    fn resolve_backends(
+        &self,
+        namespace: &str,
+        source: &str,
+        policies: &mut Policies,
+        validated: Vec<(u32, ServiceRef<'_>, Filters)>,
+    ) -> Vec<Backend<Arc<ClusterSpec>>> {
+        validated
+            .into_iter()
+            .map(|(weight, reference, filters)| Backend {
+                weight,
+                cluster: resolve_backend(self, policies, namespace, source, reference)
+                    .map(Arc::new),
+                filters: Arc::new(filters),
             })
             .collect()
     }
 }
 
-fn unsupported_rule(rule: &HttpRouteRules) -> bool {
-    rule.retry.is_some()
-        || rule.timeouts.is_some()
-        || rule
-            .backend_refs
-            .iter()
-            .flatten()
-            .any(|b| b.filters.as_ref().is_some_and(|f| !f.is_empty()))
-        || rule.matches.iter().flatten().any(|predicate| {
-            predicate
-                .query_params
-                .as_ref()
-                .is_some_and(|params| !params.is_empty())
-                || matches!(
-                    predicate.path.as_ref().and_then(|path| path.r#type.as_ref()),
-                    Some(PathType::RegularExpression)
-                )
-                || predicate.headers.iter().flatten().any(|header| {
-                    matches!(header.r#type, Some(HeaderType::RegularExpression))
-                })
-        })
-}
-
-/// a redirect hostname is a DNS name without a wildcard, userinfo or port.
-fn valid_redirect_hostname(host: &str) -> bool {
-    host.len() <= 253
-        && host.parse::<IpAddr>().is_err()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-}
-
-fn filters(rule: &HttpRouteRules) -> Result<RouteAction, ResolveError> {
-    use weiche_gtwapi::v1::httproutes::HttpRouteRulesFiltersType as Kind;
-    let invalid = ResolveError::UnsupportedValue;
-    let mut action = RouteAction {
-        backends: Vec::new(),
-        headers: Vec::new(),
-        redirect: None,
-    };
-    for filter in rule.filters.iter().flatten() {
-        match filter.r#type {
-            Kind::RequestHeaderModifier => {
-                let h = filter.request_header_modifier.as_ref().ok_or(invalid)?;
-                for entry in h.set.iter().flatten() {
-                    action.headers.push(HeaderChange::Set(
-                        entry.name.parse().map_err(|_| invalid)?,
-                        entry.value.parse().map_err(|_| invalid)?,
-                    ));
-                }
-                for entry in h.add.iter().flatten() {
-                    action.headers.push(HeaderChange::Add(
-                        entry.name.parse().map_err(|_| invalid)?,
-                        entry.value.parse().map_err(|_| invalid)?,
-                    ));
-                }
-                for name in h.remove.iter().flatten() {
-                    action
-                        .headers
-                        .push(HeaderChange::Remove(name.parse().map_err(|_| invalid)?));
-                }
-            }
-            Kind::RequestRedirect => {
-                let r = filter.request_redirect.as_ref().ok_or(invalid)?;
-                if r.path.is_some()
-                    || r.scheme.is_some()
-                    || r.port.is_some()
-                    || r.hostname
-                        .as_deref()
-                        .is_some_and(|host| !valid_redirect_hostname(host))
-                {
-                    return Err(invalid);
-                }
-                let status = match r.status_code.unwrap_or(302) {
-                    301 => http::StatusCode::MOVED_PERMANENTLY,
-                    302 => http::StatusCode::FOUND,
-                    _ => return Err(invalid),
-                };
-                action.redirect = Some(Redirect { status, hostname: r.hostname.clone() });
-            }
-            _ => return Err(invalid),
+/// parse one to four GEP-2257 components, each with one to five decimal digits.
+fn duration(mut input: &str) -> Result<Duration, ResolveError> {
+    let mut millis = 0;
+    for _ in 0..4 {
+        let digits = input.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=5).contains(&digits) {
+            break;
+        }
+        let (value, suffix) = input.split_at(digits);
+        let Some((unit, scale)) =
+            [("ms", 1), ("s", 1000), ("m", 60_000), ("h", 3_600_000)]
+                .into_iter()
+                .find(|(unit, _)| suffix.starts_with(unit))
+        else {
+            break;
+        };
+        millis +=
+            value.parse::<u64>().map_err(|_| ResolveError::UnsupportedValue)? * scale;
+        input = &suffix[unit.len()..];
+        if input.is_empty() {
+            return Ok(Duration::from_millis(millis));
         }
     }
-    Ok(action)
+    Err(ResolveError::UnsupportedValue)
 }
 
-fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
+/// validate the request budget and preserve explicit zero durations.
+fn timeouts(rule: &HttpRouteRules) -> Result<Timeouts, ResolveError> {
+    let Some(t) = &rule.timeouts else { return Ok(Timeouts::default()) };
+    let request = t.request.as_deref().map(duration).transpose()?;
+    let backend_request = t.backend_request.as_deref().map(duration).transpose()?;
+    if let (Some(total), Some(attempt)) = (request, backend_request)
+        && !total.is_zero()
+        && attempt > total
+    {
+        return Err(ResolveError::UnsupportedValue);
+    }
+    Ok(Timeouts { request, backend_request })
+}
+
+/// validate the same unanchored Rust regex that the worker will compile.
+fn regex(pattern: &str) -> Result<String, ResolveError> {
+    regex::Regex::new(pattern).map_err(|_| ResolveError::UnsupportedValue)?;
+    Ok(pattern.to_owned())
+}
+
+impl ValueMatch<String> {
+    /// validate a literal or Rust regex for one method component or metadata value.
+    fn resolve(value: &str, regular: bool) -> Result<Self, ResolveError> {
+        if regular {
+            Ok(Self::RegularExpression { regex: regex(value)? })
+        } else {
+            Ok(Self::Exact(value.into()))
+        }
+    }
+}
+
+/// retain the first predicate per name, ignoring later entries even for validation.
+fn named_matches<'a>(
+    predicates: impl Iterator<Item = (String, &'a str, bool)>,
+) -> Result<Vec<(String, ValueMatch<String>)>, ResolveError> {
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for (name, value, regular) in predicates {
+        if seen.insert(name.clone()) {
+            matches.push((name, ValueMatch::resolve(value, regular)?));
+        }
+    }
+    Ok(matches)
+}
+
+/// normalize path elements and named predicates before resolving any backend.
+fn http_match(predicate: &HttpRouteRulesMatches) -> Result<Http, ResolveError> {
     let path = predicate.path.as_ref();
-    let exact =
-        matches!(path.and_then(|path| path.r#type.as_ref()), Some(PathType::Exact));
-    let path = path.and_then(|path| path.value.as_deref()).unwrap_or("/");
-    let path = if exact { path } else { path.trim_end_matches('/') };
-    Http {
-        path: if path.is_empty() { "/".into() } else { path.into() },
-        exact,
+    let value = path.and_then(|p| p.value.as_deref()).unwrap_or("/");
+    let path = match path.and_then(|p| p.r#type.as_ref()) {
+        Some(PathType::RegularExpression) => {
+            PathMatch::RegularExpression { regex: regex(value)? }
+        }
+        Some(PathType::Exact) => PathMatch::Literal { path: value.into(), exact: true },
+        None | Some(PathType::PathPrefix) => {
+            let prefix = value.trim_end_matches('/');
+            PathMatch::Literal {
+                path: if prefix.is_empty() { "/" } else { prefix }.into(),
+                exact: false,
+            }
+        }
+    };
+    Ok(Http {
+        path,
         method: predicate.method.as_ref().map(|method| {
             match method {
                 Method::Get => "GET",
@@ -185,13 +229,21 @@ fn http_match(predicate: &HttpRouteRulesMatches) -> Http {
             }
             .into()
         }),
-        headers: predicate
-            .headers
-            .iter()
-            .flatten()
-            .map(|header| (header.name.to_ascii_lowercase(), header.value.clone()))
-            .collect(),
-    }
+        headers: named_matches(predicate.headers.iter().flatten().map(|h| {
+            (
+                h.name.to_ascii_lowercase(),
+                h.value.as_str(),
+                matches!(h.r#type, Some(HeaderType::RegularExpression)),
+            )
+        }))?,
+        query_params: named_matches(predicate.query_params.iter().flatten().map(|p| {
+            (
+                p.name.clone(),
+                p.value.as_str(),
+                matches!(p.r#type, Some(QueryType::RegularExpression)),
+            )
+        }))?,
+    })
 }
 
 impl RefError {
@@ -207,32 +259,78 @@ impl RefError {
     }
 }
 
+/// application protocol declared on a backend Service port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppProtocol {
+    /// the route selects the wire protocol.
+    None,
+    /// serve HTTP with optional transport security.
+    Http,
+    /// secure HTTP.
+    Https,
+    /// negotiate HTTP/2 over TLS.
+    H2,
+    /// cleartext HTTP/2.
+    H2c,
+    /// cleartext WebSocket.
+    Ws,
+    /// secure WebSocket.
+    Wss,
+    /// unrecognized service name or domain-prefixed protocol.
+    Unsupported,
+}
+
+impl AppProtocol {
+    /// recognize case-insensitive IANA names and exact Kubernetes protocol names.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::None,
+            Some("kubernetes.io/http") => Self::Http,
+            Some("kubernetes.io/h2c") => Self::H2c,
+            Some("kubernetes.io/ws") => Self::Ws,
+            Some("kubernetes.io/wss") => Self::Wss,
+            Some(name) if name.eq_ignore_ascii_case("http") => Self::Http,
+            Some(name) if name.eq_ignore_ascii_case("https") => Self::Https,
+            Some(name) if name.eq_ignore_ascii_case("h2") => Self::H2,
+            Some(_) => Self::Unsupported,
+        }
+    }
+}
+
 /// resolve a Service backend into a validated cluster or a Gateway API status reason.
 fn resolve_backend(
     stores: &GatewayStores,
     policies: &mut Policies,
     namespace: &str,
-    backend: &HttpRouteRulesBackendRefs,
+    source: &str,
+    reference: ServiceRef<'_>,
 ) -> Result<ClusterSpec, RefError> {
-    let reference = ServiceRef::from(backend);
-    let (service, port) =
-        reference.resolve(stores, namespace, "HTTPRoute", Transport::Tcp)?;
+    let (service, port) = reference.resolve(stores, namespace, source, Transport::Tcp)?;
     let namespace = reference.namespace.unwrap_or(namespace);
-    // https and h2 require an authenticated transport; h2c explicitly uses cleartext.
-    let protocol = match port.app_protocol.as_deref() {
-        None | Some("http" | "kubernetes.io/http" | "https") => Protocol::Http1,
-        Some("kubernetes.io/h2c" | "h2") => Protocol::Http2,
-        _ => return Err(RefError::UnsupportedProtocol),
-    };
+    let app = AppProtocol::parse(port.app_protocol.as_deref());
+    let protocol =
+        if source == "GRPCRoute" || matches!(app, AppProtocol::H2 | AppProtocol::H2c) {
+            Protocol::Http2
+        } else {
+            Protocol::Http1
+        };
+    // record the policy's Gateway ancestor even if this route cannot use the port.
     let tls =
-        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol)?;
-    match (port.app_protocol.as_deref(), &tls) {
-        (Some("https" | "h2"), None) | (Some("kubernetes.io/h2c"), Some(_)) => {
-            return Err(RefError::UnsupportedProtocol);
-        }
-        _ => {}
+        policies.backend(stores, namespace, &service, port.name.as_deref(), protocol);
+    if app == AppProtocol::Unsupported
+        || (source == "GRPCRoute" && matches!(app, AppProtocol::Ws | AppProtocol::Wss))
+    {
+        return Err(RefError::UnsupportedProtocol);
     }
-    let endpoints = endpoints(stores, namespace, &backend.name, &port, Transport::Tcp);
+    let tls = tls?;
+    if matches!(
+        (app, &tls),
+        (AppProtocol::Https | AppProtocol::H2 | AppProtocol::Wss, None)
+            | (AppProtocol::H2c | AppProtocol::Ws, Some(_))
+    ) {
+        return Err(RefError::UnsupportedProtocol);
+    }
+    let endpoints = endpoints(stores, namespace, reference.name, &port, Transport::Tcp);
     Ok(ClusterSpec { endpoints, protocol, tls })
 }
 
@@ -289,15 +387,22 @@ fn endpoints(
 
 /// the identical core Service reference fields generated for each Route kind.
 struct ServiceRef<'a> {
+    /// referenced API group.
     group: Option<&'a str>,
+    /// referenced resource kind.
     kind: Option<&'a str>,
+    /// target namespace when different from the route.
     namespace: Option<&'a str>,
+    /// referenced Service name.
     name: &'a str,
+    /// requested Service port.
     port: Option<u16>,
 }
+/// borrow common Service reference fields from each generated type.
 macro_rules! service_ref {
     ($ty:ty) => {
         impl<'a> From<&'a $ty> for ServiceRef<'a> {
+            /// borrow the backend identity and port from the route reference.
             fn from(r: &'a $ty) -> Self {
                 Self {
                     group: r.group.as_deref(),
@@ -311,10 +416,13 @@ macro_rules! service_ref {
     };
 }
 service_ref!(HttpRouteRulesBackendRefs);
+service_ref!(GrpcRouteRulesBackendRefs);
 service_ref!(TcpRouteRulesBackendRefs);
+service_ref!(TlsRouteRulesBackendRefs);
 service_ref!(UdpRouteRulesBackendRefs);
 
 impl ServiceRef<'_> {
+    /// check the grant and locate the requested Service port.
     fn resolve(
         &self,
         stores: &GatewayStores,
@@ -351,14 +459,15 @@ impl ServiceRef<'_> {
             .ok_or(RefError::BackendNotFound)?;
         Ok((service, port))
     }
+    /// resolve a transport reference to its ready endpoint addresses.
     fn stream(
         &self,
         stores: &GatewayStores,
         namespace: &str,
+        source: &str,
         transport: Transport,
     ) -> Result<Vec<SocketAddr>, RefError> {
-        let (_, port) =
-            self.resolve(stores, namespace, transport.route_kind(), transport)?;
+        let (_, port) = self.resolve(stores, namespace, source, transport)?;
         Ok(endpoints(
             stores,
             self.namespace.unwrap_or(namespace),
@@ -369,47 +478,43 @@ impl ServiceRef<'_> {
     }
 }
 
-impl GatewayStores {
-    fn resolve_stream<'a>(
-        &self,
-        namespace: &str,
-        transport: Transport,
-        backends: impl Iterator<Item = (u32, ServiceRef<'a>)>,
-    ) -> StreamRoute {
-        StreamRoute {
-            backends: backends
-                .map(|(w, r)| (w, r.stream(self, namespace, transport)))
-                .collect(),
+/// resolve one stream rule using the referring route kind for cross-namespace grants.
+macro_rules! stream_resolver {
+    ($method:ident, $route:ty, $transport:expr) => {
+        /// retain the configured weights of both resolved and invalid backends.
+        pub fn $method(&self, route: &$route) -> Result<StreamRoute, ResolveError> {
+            let [rule] = route.spec.rules.as_slice() else {
+                return Err(ResolveError::UnsupportedValue);
+            };
+            let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
+            let kind = <$route as kube::Resource>::kind(&());
+            let backends = rule
+                .backend_refs
+                .iter()
+                .map(|r| {
+                    let target =
+                        ServiceRef::from(r).stream(self, namespace, &kind, $transport);
+                    (r.weight.unwrap_or(1), target)
+                })
+                .collect();
+            Ok(StreamRoute { backends })
         }
-    }
+    };
+}
 
-    /// resolve a TCPRoute into weighted backend endpoint sets.
-    pub fn resolve_tcp(&self, route: &TcpRoute) -> Result<StreamRoute, ResolveError> {
-        let [rule] = route.spec.rules.as_slice() else {
-            return Err(ResolveError::UnsupportedValue);
-        };
+impl GatewayStores {
+    stream_resolver!(resolve_tcp, TcpRoute, Transport::Tcp);
+    stream_resolver!(resolve_tls, TlsRoute, Transport::Tcp);
+    stream_resolver!(resolve_udp, UdpRoute, Transport::Udp);
+    /// validate an unattached TLSRoute's references without enumerating unused endpoints.
+    pub fn tls_ref_error(&self, route: &TlsRoute) -> Option<RefError> {
         let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        Ok(self.resolve_stream(
-            namespace,
-            Transport::Tcp,
-            rule.backend_refs
-                .iter()
-                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
-        ))
-    }
-
-    /// resolve a UDPRoute into weighted backend endpoint sets.
-    pub fn resolve_udp(&self, route: &UdpRoute) -> Result<StreamRoute, ResolveError> {
-        let [rule] = route.spec.rules.as_slice() else {
-            return Err(ResolveError::UnsupportedValue);
-        };
-        let namespace = route.metadata.namespace.as_deref().unwrap_or_default();
-        Ok(self.resolve_stream(
-            namespace,
-            Transport::Udp,
-            rule.backend_refs
-                .iter()
-                .map(|r| (r.weight.unwrap_or(1), ServiceRef::from(r))),
-        ))
+        route.spec.rules.iter().flat_map(|rule| &rule.backend_refs).find_map(
+            |reference| {
+                ServiceRef::from(reference)
+                    .resolve(self, namespace, "TLSRoute", Transport::Tcp)
+                    .err()
+            },
+        )
     }
 }

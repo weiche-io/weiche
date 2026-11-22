@@ -5,7 +5,9 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use ring::digest::{SHA256, digest};
 use std::io::{Read, Write};
 
+/// key used for the snapshot payload in the gateway Secret.
 pub const SNAPSHOT_KEY: &str = "routes.v1";
+/// maximum uncompressed snapshot size accepted by the workers.
 const MAX_DECODED: usize = 64 * 1024 * 1024;
 
 impl GatewaySnapshot {
@@ -30,7 +32,11 @@ impl GatewaySnapshot {
             .take(MAX_DECODED as u64 + 1)
             .read_to_end(&mut data)?;
         ensure!(data.len() <= MAX_DECODED, "snapshot exceeds decoded size limit");
-        rmp_serde::from_slice(&data).context("decode gateway snapshot")
+        let mut snapshot: Self =
+            rmp_serde::from_slice(&data).context("decode gateway snapshot")?;
+        // older controllers could order an exact name after an equally long wildcard.
+        snapshot.order_certificates();
+        Ok(snapshot)
     }
 }
 

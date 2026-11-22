@@ -1,6 +1,6 @@
 //! hold the Kubernetes writer lease while compiling and reconciling gateway workloads.
 use super::{
-    CONTROLLER_NAME, GatewayController, GatewayStores,
+    GatewayController, GatewayStores,
     service::Plan,
     status::update_status,
     workload::{self, Applied, Settings},
@@ -11,6 +11,7 @@ use kube_lease_manager::LeaseManagerBuilder;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// start resource watches and reconcile while holding the writer lease.
 pub async fn run() -> anyhow::Result<()> {
     let settings = Settings::load()?;
     let mut lease_config = kube::Config::infer().await?;
@@ -21,7 +22,7 @@ pub async fn run() -> anyhow::Result<()> {
     lease_config.read_timeout = Some(Duration::from_secs(2));
     lease_config.write_timeout = Some(Duration::from_secs(2));
     let lease =
-        LeaseManagerBuilder::new(Client::try_from(lease_config)?, "weiche-controller")
+        LeaseManagerBuilder::new(Client::try_from(lease_config)?, &settings.lease_name)
             .with_namespace(namespace)
             .with_identity(
                 std::env::var("POD_UID").context("missing controller pod UID")?,
@@ -55,6 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
     result
 }
 
+/// wait for all initial lists and publish changes while elected.
 async fn lead(
     client: &Client,
     stores: &GatewayStores,
@@ -65,7 +67,9 @@ async fn lead(
         stores.gateway_classes.wait_until_ready(),
         stores.gateways.wait_until_ready(),
         stores.http_routes.wait_until_ready(),
+        stores.grpc_routes.wait_until_ready(),
         stores.tcp_routes.wait_until_ready(),
+        stores.tls_routes.wait_until_ready(),
         stores.udp_routes.wait_until_ready(),
         stores.secrets.wait_until_ready(),
         stores.namespaces.wait_until_ready(),
@@ -85,7 +89,7 @@ async fn lead(
             if gateway.metadata.deletion_timestamp.is_some()
                 || !stores.gateway_classes.state().iter().any(|c| {
                     c.name_any() == gateway.spec.gateway_class_name
-                        && c.spec.controller_name == CONTROLLER_NAME
+                        && c.spec.controller_name == settings.controller_name
                         && c.spec.parameters_ref.is_none()
                         && c.metadata.deletion_timestamp.is_none()
                 })
@@ -95,6 +99,18 @@ async fn lead(
             if !settings.namespaces.contains(&gateway.namespace().unwrap_or_default()) {
                 let mut plan = Plan::new(gateway);
                 plan.denied = true;
+                plans.push(plan);
+                continue;
+            }
+            if gateway
+                .spec
+                .infrastructure
+                .as_ref()
+                .and_then(|infra| infra.parameters_ref.as_ref())
+                .is_some()
+            {
+                let mut plan = Plan::new(gateway);
+                plan.invalid_parameters = true;
                 plans.push(plan);
                 continue;
             }
@@ -120,12 +136,14 @@ async fn lead(
             // give lease renewal and watch delivery time during a large cached resync.
             tokio::task::yield_now().await;
         }
-        if let Err(error) = update_status(client, stores, &plans).await {
+        if let Err(error) =
+            update_status(client, stores, &settings.controller_name, &plans).await
+        {
             tracing::warn!(%error, "could not update gateway status");
             retry = true;
         }
         if let Err(error) =
-            super::cleanup::retired(client, stores, settings, &plans).await
+            super::cleanup::retired(client, stores, settings, &plans, &mut applied).await
         {
             tracing::warn!(%error, "could not retire gateway resources");
             retry = true;

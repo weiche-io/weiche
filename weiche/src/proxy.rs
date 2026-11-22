@@ -26,6 +26,7 @@ use serde_json::json;
 use std::{collections::BTreeSet, fs, io, net::SocketAddr, time::Duration};
 use tokio::sync::watch;
 
+/// readiness marker containing the last applied snapshot digest.
 const READY: &str = "/run/weiche/ready";
 
 /// kubelet exec probe, including the applied configuration digest for diagnostics.
@@ -34,6 +35,7 @@ pub fn ready() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// withdraw the readiness marker until all workers acknowledge the new revision.
 fn pending() -> io::Result<()> {
     match fs::remove_file(READY) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -41,14 +43,23 @@ fn pending() -> io::Result<()> {
     }
 }
 
+/// snapshot identity and exact set of sockets that every worker must bind.
 struct Desired {
+    /// digest used to acknowledge this snapshot to the controller.
     version: String,
+    /// local publication sequence reported by workers.
     revision: usize,
+    /// expected transport and address pairs.
     sockets: BTreeSet<(Transport, SocketAddr)>,
 }
 
 impl Desired {
-    fn apply(secret: &Secret, tx: &mut routing::Writer) -> anyhow::Result<Self> {
+    /// decode the snapshot and publish its listener configuration to the workers.
+    fn apply(
+        secret: &Secret,
+        tx: &mut routing::Writer,
+        http3: bool,
+    ) -> anyhow::Result<Self> {
         ensure!(
             secret.type_.as_deref() == Some("weiche.io/snapshot"),
             "unexpected snapshot Secret type"
@@ -64,8 +75,24 @@ impl Desired {
             .streams
             .keys()
             .copied()
-            .chain(snapshot.sockets.keys().map(|addr| (Transport::Tcp, *addr)))
-            .collect();
+            .chain(
+                snapshot
+                    .sockets
+                    .keys()
+                    .chain(snapshot.tls.keys())
+                    .map(|addr| (Transport::Tcp, *addr)),
+            )
+            .chain(
+                snapshot
+                    .sockets
+                    .iter()
+                    .filter(|(_, s)| http3 && !s.listener.tls.is_empty())
+                    .map(|(addr, _)| (Transport::Udp, *addr)),
+            )
+            .collect::<BTreeSet<_>>();
+        if sockets.is_empty() {
+            tracing::info!(secret = %secret.name_any(), "snapshot has no active listeners; proxy readiness withdrawn");
+        }
         Ok(Self {
             version: wire::version(bytes),
             revision: tx.publish(snapshot),
@@ -73,6 +100,7 @@ impl Desired {
         })
     }
 
+    /// check every expected socket against its worker acknowledgements.
     fn applied(&self, workers: &WorkerGroupState) -> bool {
         !self.sockets.is_empty()
             && self
@@ -82,12 +110,17 @@ impl Desired {
     }
 }
 
+/// default RoleBinding and ClusterRole name granting namespace authorization.
+const DEFAULT_PROVISIONER_BINDING: &str = "weiche-gateway-provisioner";
+
 /// a withdrawn Helm namespace binding also withdraws permission to serve cached routes.
-async fn authorized(bindings: &Api<RoleBinding>) -> anyhow::Result<bool> {
-    match bindings.get_opt("weiche-gateway-provisioner").await {
+async fn authorized(
+    bindings: &Api<RoleBinding>,
+    binding_name: &str,
+) -> anyhow::Result<bool> {
+    match bindings.get_opt(binding_name).await {
         Ok(binding) => Ok(binding.is_some_and(|b| {
-            b.role_ref.kind == "ClusterRole"
-                && b.role_ref.name == "weiche-gateway-provisioner"
+            b.role_ref.kind == "ClusterRole" && b.role_ref.name == binding_name
         })),
         Err(kube::Error::Api(e)) if e.code == 403 => Ok(false),
         Err(e) => Err(e.into()),
@@ -97,6 +130,7 @@ async fn authorized(bindings: &Api<RoleBinding>) -> anyhow::Result<bool> {
 /// watch only the named Secret; transient API errors leave the last valid snapshot serving.
 pub async fn run(
     name: String,
+    http3: bool,
     mut tx: routing::Writer,
     mut workers: watch::Receiver<WorkerGroupState>,
     stop: watch::Receiver<bool>,
@@ -105,8 +139,15 @@ pub async fn run(
     let client = Client::try_default().await?;
     let ns = client.default_namespace();
     let pod = std::env::var("POD_UID").context("missing pod UID")?;
+    let binding_name = std::env::var("WEICHE_PROVISIONER_BINDING")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVISIONER_BINDING.to_owned());
     let bindings = Api::<RoleBinding>::namespaced(client.clone(), ns);
-    ensure!(authorized(&bindings).await?, "gateway namespace authorization withdrawn");
+    ensure!(
+        authorized(&bindings, &binding_name).await?,
+        "gateway namespace authorization withdrawn"
+    );
     let reports = Api::<ConfigMap>::namespaced(client.clone(), ns);
     let secrets = Api::<Secret>::namespaced(client.clone(), ns);
     let (store, writer) = reflector::store();
@@ -158,7 +199,7 @@ pub async fn run(
             _ = &mut stop => break,
             change = workers.changed() => { change.context("worker reports stopped")?; }
             _ = refresh.tick() => {
-                match authorized(&bindings).await {
+                match authorized(&bindings, &binding_name).await {
                     Ok(false) => { tracing::info!("gateway namespace authorization withdrawn"); break; }
                     Ok(true) => refresh_due = true,
                     Err(error) => tracing::warn!(%error, "could not refresh namespace authorization"),
@@ -170,7 +211,7 @@ pub async fn run(
                     | watcher::Event::Delete(_)
                     | watcher::Event::InitDone,
                 ) => match store.get(&secret_ref) {
-                    Some(secret) => match Desired::apply(&secret, &mut tx) {
+                    Some(secret) => match Desired::apply(&secret, &mut tx, http3) {
                         Ok(next) => desired = Some(next),
                         Err(e) => {
                             tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot");

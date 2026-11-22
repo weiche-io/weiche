@@ -4,8 +4,8 @@ use super::{
         GatewaySnapshot,
         wire::{self, SNAPSHOT_KEY},
     },
-    GatewayStores,
-    service::{OWNER, Plan},
+    CONTROLLER_NAME, GatewayStores,
+    service::{GATEWAY_NAME, OWNER, Plan, controlled_by},
 };
 use anyhow::{Context, ensure};
 use k8s_openapi::{
@@ -13,11 +13,13 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         core::v1::{
-            ConfigMap, LocalObjectReference, ResourceRequirements, SeccompProfile,
-            Secret, Service, ServiceAccount,
+            Affinity, ConfigMap, EnvVar, LocalObjectReference, ResourceRequirements,
+            SeccompProfile, Secret, Service, ServiceAccount, Toleration,
+            TopologySpreadConstraint,
         },
         rbac::v1::{Role, RoleBinding},
     },
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -28,40 +30,296 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     time::{Duration, Instant},
 };
+use weiche_gtwapi::v1::gateways::{Gateway, GatewayInfrastructure};
+
+/// default Helm release instance label for generated workloads.
+fn default_release() -> String {
+    "weiche".into()
+}
+
+/// default GatewayClass controllerName owned by this installation.
+fn default_controller_name() -> String {
+    CONTROLLER_NAME.into()
+}
+
+/// default leader-election Lease name in the release namespace.
+fn default_lease_name() -> String {
+    "weiche-controller".into()
+}
+
+/// default provisioner RoleBinding and ClusterRole name in authorized namespaces.
+fn default_provisioner_binding() -> String {
+    "weiche-gateway-provisioner".into()
+}
+
+/// default graceful termination window in seconds for proxy pods.
+fn default_termination_grace() -> i64 {
+    30
+}
+
+/// default proxy log level.
+fn default_log_level() -> String {
+    "info".into()
+}
+
+/// default proxy log format.
+fn default_log_format() -> String {
+    "text".into()
+}
+
+/// default Kubernetes IP family policy for Gateway Services.
+fn default_ip_family_policy() -> String {
+    "PreferDualStack".into()
+}
+
+/// platform logging defaults for provisioned proxy containers.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LogSettings {
+    /// default RUST_LOG filter applied to proxy pods.
+    pub level: String,
+    /// output log format (`text` or `json`).
+    pub format: String,
+}
+
+impl Default for LogSettings {
+    /// use the installation's default proxy log level and format.
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
+    }
+}
+
+/// platform networking defaults for provisioned Gateway Services.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ServiceSettings {
+    /// gateway Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
+    pub r#type: String,
+    /// gateway IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
+    pub ip_family_policy: String,
+    /// optional ordered IP families (`IPv4`, `IPv6`).
+    pub ip_families: Vec<String>,
+    /// optional external traffic policy (`Cluster` or `Local`) for LoadBalancer or NodePort.
+    pub external_traffic_policy: Option<String>,
+    /// default annotations merged onto every Gateway Service.
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for ServiceSettings {
+    /// prefer dual-stack allocation and leave the Service type to installation settings.
+    fn default() -> Self {
+        Self {
+            r#type: String::new(),
+            ip_family_policy: default_ip_family_policy(),
+            ip_families: Vec::new(),
+            external_traffic_policy: None,
+            annotations: BTreeMap::new(),
+        }
+    }
+}
 
 /// installation policy supplied by the platform, outside of tenant-writable Gateway specs.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    pub bind_address: std::net::IpAddr,
+    /// release instance name used to isolate multi-release workloads.
+    #[serde(default = "default_release")]
+    pub release: String,
+    /// gateway class controller name matched by this controller.
+    #[serde(default = "default_controller_name")]
+    pub controller_name: String,
+    /// coordination Lease name used for leader election.
+    #[serde(default = "default_lease_name")]
+    pub lease_name: String,
+    /// provisioner RoleBinding and ClusterRole name checked by proxies.
+    #[serde(default = "default_provisioner_binding")]
+    pub provisioner_binding: String,
+    /// local IP address bound by proxy listeners.
+    pub bind_address: IpAddr,
+    /// namespaces authorized to host Gateway proxy workloads.
     pub namespaces: BTreeSet<String>,
+    /// container image rendered into per-Gateway proxy Deployments.
     image: String,
+    /// image pull policy for proxy containers.
     pull_policy: String,
+    /// image pull secrets copied onto proxy pods.
     pull_secrets: Vec<LocalObjectReference>,
+    /// container resource requests and limits for proxy pods.
     resources: ResourceRequirements,
+    /// seccomp profile required for proxy io_uring workers.
     seccomp_profile: SeccompProfile,
+    /// desired proxy Deployment replica count.
     replicas: i32,
+    /// compio worker thread count inside each proxy pod.
     workers: std::num::NonZeroUsize,
-    service_type: String,
+    /// bind proxy listeners directly on the host network namespace.
+    #[serde(default)]
+    host_network: bool,
+    /// optional Kubernetes DNS policy override for proxy pods.
+    #[serde(default)]
+    dns_policy: Option<String>,
+    /// graceful termination window in seconds for proxy pods.
+    #[serde(default = "default_termination_grace")]
+    termination_grace_period_seconds: i64,
+    /// additional node selector labels merged with kubernetes.io/os=linux.
+    #[serde(default)]
+    node_selector: BTreeMap<String, String>,
+    /// scheduling tolerations applied to proxy pods.
+    #[serde(default)]
+    tolerations: Vec<Toleration>,
+    /// scheduling affinity rules applied to proxy pods.
+    #[serde(default)]
+    affinity: Option<Affinity>,
+    /// topology spread constraints applied to proxy pods.
+    #[serde(default)]
+    topology_spread_constraints: Vec<TopologySpreadConstraint>,
+    /// optional priorityClassName applied to proxy pods.
+    #[serde(default)]
+    priority_class_name: Option<String>,
+    /// additional pod template labels applied to proxy pods.
+    #[serde(default)]
+    pod_labels: BTreeMap<String, String>,
+    /// additional pod template annotations applied to proxy pods.
+    #[serde(default)]
+    pod_annotations: BTreeMap<String, String>,
+    /// proxy container logging settings.
+    #[serde(default)]
+    log: LogSettings,
+    /// extra environment variables appended to proxy containers.
+    #[serde(default)]
+    extra_env: Vec<EnvVar>,
+    /// networking defaults for every Gateway Service.
+    #[serde(default)]
+    service: ServiceSettings,
+    /// legacy flat serviceType field retained for backward compatibility.
+    #[serde(default)]
+    service_type: Option<String>,
+    /// opt-in downstream HTTP/3 configuration for this installation.
+    #[serde(default)]
+    http3: Http3Settings,
 }
+
+/// platform policy for exposing HTTPS listeners over QUIC.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Http3Settings {
+    /// serve HTTP/3 on eligible HTTPS ports.
+    enabled: bool,
+    /// external UDP port advertised to HTTPS clients.
+    advertised_port: Option<u16>,
+}
+
 impl Settings {
+    /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
-        let settings: Self =
+        let mut settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
+        if settings.service.r#type.is_empty() {
+            settings.service.r#type =
+                settings.service_type.take().unwrap_or_else(|| "ClusterIP".into());
+        }
+        if settings.service.external_traffic_policy.as_deref() == Some("") {
+            settings.service.external_traffic_policy = None;
+        }
+        if settings.dns_policy.as_deref() == Some("") {
+            settings.dns_policy = None;
+        }
+        if settings.priority_class_name.as_deref() == Some("") {
+            settings.priority_class_name = None;
+        }
         ensure!(
-            !settings.namespaces.is_empty()
+            !settings.release.is_empty()
+                && !settings.controller_name.is_empty()
+                && !settings.lease_name.is_empty()
+                && !settings.provisioner_binding.is_empty()
+                && !settings.namespaces.is_empty()
                 && settings.replicas > 0
+                && settings.termination_grace_period_seconds > 0
                 && !settings.image.is_empty(),
             "invalid proxy installation settings"
         );
         ensure!(
-            matches!(settings.service_type.as_str(), "ClusterIP" | "LoadBalancer"),
+            matches!(settings.log.format.as_str(), "text" | "json"),
+            "unsupported proxy log format"
+        );
+        ensure!(
+            matches!(
+                settings.service.r#type.as_str(),
+                "ClusterIP" | "LoadBalancer" | "NodePort"
+            ),
             "unsupported gateway service type"
+        );
+        ensure!(
+            matches!(
+                settings.service.ip_family_policy.as_str(),
+                "SingleStack" | "PreferDualStack" | "RequireDualStack"
+            ),
+            "unsupported gateway service ipFamilyPolicy"
+        );
+        let mut seen = BTreeSet::new();
+        for family in &settings.service.ip_families {
+            ensure!(
+                matches!(family.as_str(), "IPv4" | "IPv6")
+                    && seen.insert(family.as_str()),
+                "invalid gateway service ipFamilies"
+            );
+        }
+        ensure!(
+            !(settings.service.ip_family_policy == "SingleStack"
+                && settings.service.ip_families.len() > 1)
+                && !(settings.service.ip_family_policy == "RequireDualStack"
+                    && settings.service.ip_families.len() == 1),
+            "gateway service ipFamilies conflicts with ipFamilyPolicy"
+        );
+        if let Some(policy) = settings.service.external_traffic_policy.as_deref() {
+            ensure!(
+                matches!(policy, "Cluster" | "Local")
+                    && matches!(
+                        settings.service.r#type.as_str(),
+                        "LoadBalancer" | "NodePort"
+                    ),
+                "invalid gateway service externalTrafficPolicy"
+            );
+        }
+        ensure!(
+            settings.http3.advertised_port != Some(0),
+            "invalid advertised HTTP/3 port"
+        );
+        ensure!(
+            !settings.extra_env.iter().any(|var| matches!(
+                var.name.as_str(),
+                "POD_UID"
+                    | "WEICHE_PROVISIONER_BINDING"
+                    | "WEICHE_WORKERS"
+                    | "WEICHE_HTTP3"
+                    | "WEICHE_HTTP3_PORT"
+            )),
+            "proxy extraEnv cannot override reserved environment variables"
         );
         Ok(settings)
     }
+}
+
+/// common identity and metadata shared by all resources owned by one Gateway.
+struct Target<'a> {
+    /// gateway namespace hosting the provisioned resources.
+    namespace: &'a str,
+    /// deterministic resource name (`weiche-gw-<uid>`).
+    name: &'a str,
+    /// gateway name used in the standard infrastructure label.
+    gateway_name: &'a str,
+    /// release instance label isolating multi-release ownership.
+    instance: &'a str,
+    /// controller ownerReference pointing back to the Gateway.
+    owner: &'a OwnerReference,
+    /// optional Gateway-level labels and annotations to propagate.
+    infra: Option<&'a GatewayInfrastructure>,
 }
 
 /// cache successful applies; periodically recheck for external drift.
@@ -69,44 +327,74 @@ impl Settings {
 pub struct Applied(BTreeMap<(String, String, String), (String, Instant)>);
 
 impl Applied {
+    /// forget cached applies after the drift check interval.
     pub fn expire(&mut self) {
         self.0.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(30));
     }
 
+    /// forget retired resources so an eligible gateway can recreate them immediately.
+    pub fn forget(&mut self, namespace: &str, name: &str) {
+        self.0
+            .retain(|(ns, resource, _), _| ns != namespace || resource != name);
+    }
+
+    /// create or update fields owned by this gateway.
     async fn ensure<K: Resource<DynamicType = ()>>(
         &mut self,
         client: &Client,
-        namespace: &str,
-        name: &str,
-        owner: &Value,
+        target: &Target<'_>,
         mut fields: Value,
     ) -> anyhow::Result<()> {
         let kind = ApiResource::erase::<K>(&());
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
+        if let Some(infra) = target.infra {
+            if let Some(labels) = &infra.labels {
+                for (k, v) in labels {
+                    fields["metadata"]["labels"][k] = json!(v);
+                }
+            }
+            if let Some(annotations) = &infra.annotations {
+                for (k, v) in annotations {
+                    fields["metadata"]["annotations"][k] = json!(v);
+                }
+            }
+        }
+        fields["metadata"]["labels"][GATEWAY_NAME] = json!(target.gateway_name);
         fields["metadata"]["labels"]["app.kubernetes.io/managed-by"] = json!("weiche");
-        fields["metadata"]["name"] = json!(name);
-        fields["metadata"]["namespace"] = json!(namespace);
-        fields["metadata"]["ownerReferences"] = json!([owner]);
-        let key = (namespace.to_owned(), name.to_owned(), kind.kind.clone());
+        fields["metadata"]["labels"]["app.kubernetes.io/instance"] =
+            json!(target.instance);
+        fields["metadata"]["name"] = json!(target.name);
+        fields["metadata"]["namespace"] = json!(target.namespace);
+        fields["metadata"]["ownerReferences"] = json!([target.owner]);
+        let key =
+            (target.namespace.to_owned(), target.name.to_owned(), kind.kind.clone());
         let digest = wire::version(&serde_json::to_vec(&fields)?);
         if self.0.get(&key).is_some_and(|(old, _)| old == &digest) {
             return Ok(());
         }
-        let api = Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &kind);
-        if let Some(old) = api.get_opt(name).await? {
+        let api = Api::<DynamicObject>::namespaced_with(
+            client.clone(),
+            target.namespace,
+            &kind,
+        );
+        if let Some(old) = api.get_opt(target.name).await? {
             ensure!(
-                old.owner_references()
-                    .iter()
-                    .any(|r| r.controller == Some(true) && json!(r.uid) == owner["uid"]),
-                "{} {namespace}/{name} has another owner",
-                kind.kind
+                controlled_by(&old, &target.owner.uid),
+                "{} {}/{} has another owner",
+                kind.kind,
+                target.namespace,
+                target.name
             );
             // pin the checked object across replacement while allowing other field managers
             // to update their own fields, including the proxy's ConfigMap acknowledgements.
             fields["metadata"]["uid"] = json!(old.uid().context("missing workload uid")?);
-            api.patch(name, &PatchParams::apply("weiche").force(), &Patch::Apply(fields))
-                .await?;
+            api.patch(
+                target.name,
+                &PatchParams::apply("weiche").force(),
+                &Patch::Apply(fields),
+            )
+            .await?;
         } else {
             let params = PostParams {
                 field_manager: Some("weiche".into()),
@@ -128,73 +416,94 @@ pub async fn reconcile(
     plan: &mut Plan,
     snapshot: &GatewaySnapshot,
 ) -> anyhow::Result<()> {
+    plan.programmed = false;
+    plan.addresses.clear();
     let g = &plan.gateway;
     let ns = g.namespace().context("missing gateway namespace")?;
     let uid = g.uid().context("missing gateway uid")?;
     // a distinct prefix also allows migration from the legacy GatewayClass-owned Services.
     let name = format!("weiche-gw-{uid}");
+    let existing_service = stores
+        .services
+        .get(&ObjectRef::new(&name).within(&ns))
+        .filter(|service| controlled_by(service.as_ref(), &uid));
+    let existing_report = stores
+        .config_maps
+        .get(&ObjectRef::new(&name).within(&ns))
+        .filter(|report| controlled_by(report.as_ref(), &uid));
+    let requested_ips = match requested_addresses(g, &settings.service) {
+        Ok(ips) => Some(ips),
+        Err(message) => {
+            plan.issue_reason = Some("AddressNotAssigned");
+            plan.issue = Some(message);
+            None
+        }
+    };
+    let payload = if plan.accepted() && plan.issue.is_none() && !snapshot.is_empty() {
+        snapshot
+            .encode()
+            .inspect_err(|err| plan.issue = Some(err.to_string()))
+            .ok()
+    } else {
+        None
+    };
+    let active = payload.is_some();
+    let payload = match payload {
+        Some(payload) => payload,
+        None if existing_service.is_none() && existing_report.is_none() => return Ok(()),
+        // withdraw routes and private keys when a provisioned gateway cannot serve.
+        None => GatewaySnapshot::default().encode()?,
+    };
+    let revision = wire::version(&payload);
     let mut owner = g.controller_owner_ref(&()).context("missing gateway owner")?;
     owner.block_owner_deletion = None;
-    let owner = json!(owner);
-    let labels = json!({(OWNER):uid});
-    // withdraw the previous routes if an oversized replacement cannot be delivered.
-    let payload = snapshot.encode().or_else(|err| {
-        plan.issue = Some(err.to_string());
-        GatewaySnapshot::default().encode()
-    })?;
-    let revision = wire::version(&payload);
-    applied
-        .ensure::<ConfigMap>(client, &ns, &name, &owner, json!({}))
-        .await?;
+    let target = Target {
+        namespace: &ns,
+        name: &name,
+        gateway_name: &g.name_any(),
+        instance: &settings.release,
+        owner: &owner,
+        infra: g.spec.infrastructure.as_ref(),
+    };
+    applied.ensure::<ConfigMap>(client, &target, json!({})).await?;
     applied
         .ensure::<Secret>(
             client,
-            &ns,
-            &name,
-            &owner,
+            &target,
             json!({
                 "type":"weiche.io/snapshot", "data":{(SNAPSHOT_KEY):ByteString(payload)}
             }),
         )
         .await?;
+    applied.ensure::<ServiceAccount>(client, &target, json!({})).await?;
     applied
-        .ensure::<ServiceAccount>(client, &ns, &name, &owner, json!({}))
+        .ensure::<Role>(client, &target, proxy_role(&name, &settings.provisioner_binding))
         .await?;
     applied
-        .ensure::<Role>(client, &ns, &name, &owner, proxy_role(&name))
+        .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
         .await?;
-    applied
-        .ensure::<RoleBinding>(client, &ns, &name, &owner, proxy_role_binding(&name, &ns))
-        .await?;
+    let replicas = if active { settings.replicas } else { 0 };
+    let selector = json!({(OWNER):uid});
     applied
         .ensure::<Deployment>(
             client,
-            &ns,
-            &name,
-            &owner,
-            proxy_deployment(&name, &labels, settings),
+            &target,
+            proxy_deployment(&target, &selector, settings, replicas),
         )
         .await?;
-    applied
-        .ensure::<Service>(
-            client,
-            &ns,
-            &name,
-            &owner,
-            proxy_service(&labels, plan.ports(), settings),
-        )
-        .await?;
-    let Some(service) = stores.services.get(&ObjectRef::new(&name).within(&ns)) else {
-        return Ok(());
-    };
-    if !service
-        .owner_references()
-        .iter()
-        .any(|r| r.uid == uid && r.controller == Some(true))
-    {
-        return Ok(());
+    let Some(ips) = requested_ips else { return Ok(()) };
+    let ports = plan.ports(settings.http3.enabled);
+    if !ports.is_empty() {
+        applied
+            .ensure::<Service>(
+                client,
+                &target,
+                proxy_service(&selector, ports, settings, &ips),
+            )
+            .await?;
     }
-    plan.addresses = if settings.service_type == "LoadBalancer" {
+    let Some(service) = existing_service else { return Ok(()) };
+    plan.addresses = if settings.service.r#type == "LoadBalancer" {
         service
             .status
             .as_ref()
@@ -218,14 +527,14 @@ pub async fn reconcile(
             .map(|ip| ("IPAddress".into(), ip.clone()))
             .collect()
     };
-    let Some(report) = stores.config_maps.get(&ObjectRef::new(&name).within(&ns)) else {
-        return Ok(());
-    };
+    let Some(report) = existing_report else { return Ok(()) };
     let acknowledgements = report.data.as_ref();
     let service_uid = service.uid().context("missing service uid")?;
     let mut members = BTreeSet::new();
+    let mut acknowledged = false;
     for slice in stores.endpoint_slices.state() {
         if slice.namespace().as_deref() != Some(&ns)
+            || slice.metadata.deletion_timestamp.is_some()
             || !slice.owner_references().iter().any(|r| r.uid == service_uid)
         {
             continue;
@@ -241,7 +550,7 @@ pub async fn reconcile(
                 .is_some_and(|c| c.ready == Some(true) && c.terminating != Some(true))
                 && acknowledgements.and_then(|a| a.get(pod)) == Some(&revision)
             {
-                plan.programmed = !plan.addresses.is_empty();
+                acknowledged = true;
             }
         }
     }
@@ -265,10 +574,12 @@ pub async fn reconcile(
             )
             .await?;
     }
+    plan.programmed = active && !plan.addresses.is_empty() && acknowledged;
     Ok(())
 }
 
-fn proxy_role(name: &str) -> Value {
+/// render least-privilege RBAC for one proxy pod.
+fn proxy_role(name: &str, provisioner_binding: &str) -> Value {
     json!({
         "rules": [
             {
@@ -286,13 +597,14 @@ fn proxy_role(name: &str) -> Value {
             {
                 "apiGroups": ["rbac.authorization.k8s.io"],
                 "resources": ["rolebindings"],
-                "resourceNames": ["weiche-gateway-provisioner"],
+                "resourceNames": [provisioner_binding],
                 "verbs": ["get"],
             },
         ]
     })
 }
 
+/// bind the gateway role to its proxy service account.
 fn proxy_role_binding(name: &str, namespace: &str) -> Value {
     json!({
         "roleRef": {
@@ -308,62 +620,231 @@ fn proxy_role_binding(name: &str, namespace: &str) -> Value {
     })
 }
 
-fn proxy_deployment(name: &str, labels: &Value, settings: &Settings) -> Value {
+/// return the Kubernetes IP family name for an IP address.
+fn ip_family(ip: IpAddr) -> &'static str {
+    if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+}
+
+/// validate and parse optional static IP addresses requested in `Gateway.spec.addresses`.
+fn requested_addresses(
+    gateway: &Gateway,
+    service: &ServiceSettings,
+) -> Result<Vec<IpAddr>, String> {
+    let mut ips = Vec::new();
+    for addr in gateway.spec.addresses.as_deref().unwrap_or_default() {
+        let kind = addr.r#type.as_deref().unwrap_or("IPAddress");
+        if kind != "IPAddress" {
+            return Err("only IPAddress gateway addresses are supported".into());
+        }
+        let Some(raw) = addr.value.as_deref().filter(|v| !v.is_empty()) else {
+            return Err("requested gateway address value is required".into());
+        };
+        let ip: IpAddr = raw
+            .parse()
+            .map_err(|_| format!("invalid gateway IP address: {raw}"))?;
+        if ips.contains(&ip) {
+            return Err(format!("duplicate gateway IP address: {ip}"));
+        }
+        ips.push(ip);
+    }
+    if ips.is_empty() {
+        return Ok(ips);
+    }
+    if service.r#type == "LoadBalancer" {
+        if ips.len() > 1 {
+            return Err(
+                "LoadBalancer Service supports at most one requested IP address".into()
+            );
+        }
+        if !service.ip_families.is_empty()
+            && !service.ip_families.iter().any(|f| f == ip_family(ips[0]))
+        {
+            return Err("requested IP family does not match service ipFamilies".into());
+        }
+        return Ok(ips);
+    }
+    if ips.len() > 2
+        || (service.ip_family_policy == "SingleStack" && ips.len() > 1)
+        || (ips.len() == 2 && ips[0].is_ipv4() == ips[1].is_ipv4())
+    {
+        return Err(
+            "requested gateway addresses are incompatible with Service IP families"
+                .into(),
+        );
+    }
+    if !service.ip_families.is_empty()
+        && (ips.len() > service.ip_families.len()
+            || ips
+                .iter()
+                .zip(&service.ip_families)
+                .any(|(ip, family)| ip_family(*ip) != family))
+    {
+        return Err(
+            "requested IP families do not match configured service ipFamilies".into()
+        );
+    }
+    Ok(ips)
+}
+
+/// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
+fn proxy_deployment(
+    target: &Target<'_>,
+    selector: &Value,
+    settings: &Settings,
+    replicas: i32,
+) -> Value {
+    let name = target.name;
+    let infra = target.infra;
+    let mut pod_labels = settings.pod_labels.clone();
+    if let Some(labels) = infra.and_then(|i| i.labels.as_ref()) {
+        pod_labels.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    pod_labels.insert(OWNER.into(), target.owner.uid.clone());
+    pod_labels.insert(GATEWAY_NAME.into(), target.gateway_name.into());
+    pod_labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
+    pod_labels.insert("app.kubernetes.io/instance".into(), settings.release.clone());
+
+    let mut pod_annotations = settings.pod_annotations.clone();
+    if let Some(annotations) = infra.and_then(|i| i.annotations.as_ref()) {
+        pod_annotations.extend(annotations.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    let mut node_selector = settings.node_selector.clone();
+    node_selector.insert("kubernetes.io/os".into(), "linux".into());
+
+    let mut env = vec![
+        json!({"name": "WEICHE_WORKERS", "value": settings.workers.to_string()}),
+        json!({"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding}),
+        json!({"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}}),
+    ];
+    if settings.http3.enabled {
+        env.push(json!({"name": "WEICHE_HTTP3", "value": "true"}));
+        if let Some(port) = settings.http3.advertised_port {
+            env.push(json!({"name": "WEICHE_HTTP3_PORT", "value": port.to_string()}));
+        }
+    }
+    if !settings.log.level.is_empty()
+        && !settings.extra_env.iter().any(|v| v.name == "RUST_LOG")
+    {
+        env.push(json!({"name": "RUST_LOG", "value": settings.log.level}));
+    }
+    if !settings.extra_env.iter().any(|v| v.name == "WEICHE_LOG_FORMAT") {
+        env.push(json!({"name": "WEICHE_LOG_FORMAT", "value": settings.log.format}));
+    }
+    for var in &settings.extra_env {
+        env.push(json!(var));
+    }
+
+    let capabilities = if settings.host_network {
+        json!({"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]})
+    } else {
+        json!({"drop": ["ALL"]})
+    };
+    let mut pod_spec = json!({
+        "serviceAccountName": name,
+        "nodeSelector": node_selector,
+        "imagePullSecrets": settings.pull_secrets,
+        "terminationGracePeriodSeconds": settings.termination_grace_period_seconds,
+        "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
+        "containers": [{
+            "name": "proxy",
+            "image": settings.image,
+            "imagePullPolicy": settings.pull_policy,
+            "args": ["proxy", name],
+            "resources": settings.resources,
+            "env": env,
+            "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
+            "readinessProbe": {
+                "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
+                "periodSeconds": 2,
+                "failureThreshold": 1,
+            },
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 65532,
+                "allowPrivilegeEscalation": false,
+                "capabilities": capabilities,
+                "seccompProfile": settings.seccomp_profile,
+            },
+        }],
+    });
+    if settings.host_network {
+        pod_spec["hostNetwork"] = json!(true);
+        pod_spec["dnsPolicy"] =
+            json!(settings.dns_policy.as_deref().unwrap_or("ClusterFirstWithHostNet"));
+    } else {
+        if let Some(dns_policy) = &settings.dns_policy {
+            pod_spec["dnsPolicy"] = json!(dns_policy);
+        }
+        // network-namespaced sysctls are forbidden under hostNetwork.
+        pod_spec["securityContext"] = json!({
+            "sysctls": [{
+                "name": "net.ipv4.ip_unprivileged_port_start",
+                "value": "0",
+            }]
+        });
+    }
+    if !settings.tolerations.is_empty() {
+        pod_spec["tolerations"] = json!(settings.tolerations);
+    }
+    if let Some(affinity) = &settings.affinity {
+        pod_spec["affinity"] = json!(affinity);
+    }
+    if !settings.topology_spread_constraints.is_empty() {
+        pod_spec["topologySpreadConstraints"] =
+            json!(settings.topology_spread_constraints);
+    }
+    if let Some(priority_class) = &settings.priority_class_name {
+        pod_spec["priorityClassName"] = json!(priority_class);
+    }
+
+    let mut pod_meta = json!({"labels": pod_labels});
+    if !pod_annotations.is_empty() {
+        pod_meta["annotations"] = json!(pod_annotations);
+    }
     json!({
         "spec": {
-            "replicas": settings.replicas,
-            "selector": {"matchLabels": labels},
+            "replicas": replicas,
+            "selector": {"matchLabels": selector},
             "template": {
-                "metadata": {"labels": labels},
-                "spec": {
-                    "serviceAccountName": name,
-                    "nodeSelector": {"kubernetes.io/os": "linux"},
-                    "imagePullSecrets": settings.pull_secrets,
-                    "securityContext": {
-                        "sysctls": [{
-                            "name": "net.ipv4.ip_unprivileged_port_start",
-                            "value": "0",
-                        }]
-                    },
-                    "terminationGracePeriodSeconds": 10,
-                    "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
-                    "containers": [{
-                        "name": "proxy",
-                        "image": settings.image,
-                        "imagePullPolicy": settings.pull_policy,
-                        "args": ["proxy", name],
-                        "resources": settings.resources,
-                        "env": [
-                            {"name": "WEICHE_WORKERS", "value": settings.workers.to_string()},
-                            {"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
-                        ],
-                        "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
-                        "readinessProbe": {
-                            "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
-                            "periodSeconds": 2,
-                            "failureThreshold": 1,
-                        },
-                        "securityContext": {
-                            "runAsNonRoot": true,
-                            "runAsUser": 65532,
-                            "allowPrivilegeEscalation": false,
-                            "capabilities": {"drop": ["ALL"]},
-                            "seccompProfile": settings.seccomp_profile,
-                        },
-                    }],
-                },
+                "metadata": pod_meta,
+                "spec": pod_spec,
             },
         }
     })
 }
 
-fn proxy_service(labels: &Value, ports: Vec<Value>, settings: &Settings) -> Value {
-    json!({
-        "spec": {
-            "type": settings.service_type,
-            "ipFamilyPolicy": "PreferDualStack",
-            "selector": labels,
-            "ports": ports,
+/// render the per-Gateway Kubernetes Service with configured IP family and address policy.
+fn proxy_service(
+    selector: &Value,
+    ports: Vec<Value>,
+    settings: &Settings,
+    requested_ips: &[IpAddr],
+) -> Value {
+    let mut spec = json!({
+        "type": settings.service.r#type,
+        "ipFamilyPolicy": settings.service.ip_family_policy,
+        "selector": selector,
+        "ports": ports,
+    });
+    if !settings.service.ip_families.is_empty() {
+        spec["ipFamilies"] = json!(settings.service.ip_families);
+    }
+    if let Some(policy) = &settings.service.external_traffic_policy {
+        spec["externalTrafficPolicy"] = json!(policy);
+    }
+    if !requested_ips.is_empty() {
+        if settings.service.r#type == "LoadBalancer" {
+            spec["loadBalancerIP"] = json!(requested_ips[0].to_string());
+        } else {
+            let ips: Vec<_> = requested_ips.iter().map(ToString::to_string).collect();
+            spec["clusterIP"] = json!(ips[0]);
+            spec["clusterIPs"] = json!(ips);
         }
-    })
+    }
+    let mut service = json!({"spec": spec});
+    if !settings.service.annotations.is_empty() {
+        service["metadata"]["annotations"] = json!(settings.service.annotations);
+    }
+    service
 }

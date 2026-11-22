@@ -14,12 +14,12 @@ plane, the `weiche` `GatewayClass` and platform-level RBAC. It does not create
 data-plane proxies or Gateway Services.
 
 - *Helm release (platform)*: deploys the controller `Deployment`
-  (`controllerReplicas: 2` by default), writes platform proxy defaults to
-  `<release>-settings` (`proxy.json`), registers `GatewayClass/weiche`
-  (`weiche.io/gateway-controller`), grants cluster read and `/status` patch
-  access (`ClusterRole/weiche-gateway-controller`), grants release-namespace
-  `Lease` election (`<release>-election`) and binds
-  `ClusterRole/weiche-gateway-provisioner` in each namespace listed in
+  (`controller.replicas: 1` by default), writes platform proxy defaults to
+  `<fullname>-settings` (`proxy.json`), registers the configured `GatewayClass`
+  (`weiche` / `weiche.io/gateway-controller` by default), grants cluster read
+  and `/status` patch access (`ClusterRole/<fullname>-gateway-controller`),
+  grants release-namespace `Lease` election (`<fullname>-election`) and binds
+  `ClusterRole/<fullname>-gateway-provisioner` in each namespace listed in
   `gatewayNamespaces`.
 - *Controller (per Gateway)*: provisions and reconciles a dedicated Service,
   proxy `Deployment`, snapshot `Secret`, acknowledgement `ConfigMap` and
@@ -51,15 +51,18 @@ kubectl create namespace edge-gateways
 helm install weiche charts/weiche \
   --namespace weiche-system --create-namespace \
   --set 'gatewayNamespaces={edge-gateways}' \
-  --set proxy.serviceType=LoadBalancer
+  --set proxy.service.type=LoadBalancer
 ```
 
 See #link(blob + "charts/weiche/values.yaml")[`values.yaml`] for the full set
-of platform defaults (`controllerReplicas`, `proxy.replicas`, `proxy.workers`,
-`proxy.bindAddress`, `proxy.serviceType`, `seccompProfile`, `imagePullSecrets`
-and `resources`). Changing chart settings updates `<release>-settings` and its
-SHA-256 annotation (`weiche.io/settings`) on the controller pod template,
-rolling controller replicas cleanly.
+of platform defaults (`gatewayClass.*`, `controller.*`, `proxy.*`,
+`proxy.service.*` and `imagePullSecrets`). Controller and proxy workloads have
+independent replicas, resources, scheduling (`nodeSelector`, `tolerations`,
+`affinity`, `topologySpreadConstraints`, `priorityClassName`), pod metadata,
+logging (`level` and `format: text|json`) and `extraEnv`. Changing chart
+settings updates `<fullname>-settings` and its SHA-256 annotation
+(`weiche.io/settings`) on the controller pod template, rolling controller
+replicas cleanly.
 
 = Namespace authorization <namespaces>
 
@@ -104,15 +107,22 @@ namespace:
 - `ServiceAccount`, `Role` and `RoleBinding`: restricts each proxy strictly to
   `get`/`list`/`watch` on its own named `Secret`, `patch` on its own named
   `ConfigMap`, and `get` on `RoleBinding/weiche-gateway-provisioner`.
-- `Deployment`: runs `weiche proxy weiche-gw-<uid>` (`proxy.replicas: 2` by
+- `Deployment`: runs `weiche proxy weiche-gw-<uid>` (`proxy.replicas: 1` by
   default) as non-root UID `65532` with all capabilities dropped,
-  `net.ipv4.ip_unprivileged_port_start=0` to bind ports such as 80 and 443,
-  `seccompProfile: Unconfined` by default for `io_uring`, an in-memory
-  `emptyDir` at `/run/weiche` and an exec readiness probe (`weiche ready`)
-  every 2 seconds.
-- `Service`: `ClusterIP` or `LoadBalancer` with
-  `ipFamilyPolicy: PreferDualStack`, selecting pods by
-  `weiche.io/gateway-uid: <uid>` and exposing deduplicated listener ports.
+  `net.ipv4.ip_unprivileged_port_start=0` to bind ports such as 80 and 443
+  (or `NET_BIND_SERVICE` with `ClusterFirstWithHostNet` when
+  `proxy.hostNetwork: true`), `proxy.seccompProfile: Unconfined` by default for
+  `io_uring`, an in-memory `emptyDir` at `/run/weiche` and an exec readiness
+  probe (`weiche ready`) every 2 seconds.
+- `Service`: `ClusterIP`, `LoadBalancer` or `NodePort` configured by
+  `proxy.service.*` (`ipFamilyPolicy`, `ipFamilies`, `externalTrafficPolicy`
+  and default annotations), selecting pods by `weiche.io/gateway-uid: <uid>`
+  and exposing deduplicated listener ports (including matching `UDP` ports for
+  accepted `HTTPS` listeners when `proxy.http3.enabled: true`). Static
+  IPv4/IPv6 requests in `Gateway.spec.addresses` map to
+  `clusterIP`/`clusterIPs` or `loadBalancerIP`, and `Gateway.spec.infrastructure`
+  labels and annotations propagate to provisioned resources while preserving
+  controller selector and ownership labels.
 
 Each proxy watches only its own `Secret`. Once all local `compio` workers bind
 every socket for a snapshot revision, the proxy atomically writes the digest to
@@ -188,7 +198,7 @@ TLS rotation happens in place without restarting proxy pods:
 Checking the `Gateway` status or hitting the `Service` VIP once can miss a
 lagging replica. After rotating a Secret, confirm that every proxy pod has
 acknowledged the same snapshot digest and inspect the certificate actually
-served by each replica (both pods under the default `proxy.replicas: 2`):
+served by each replica (for example, when running `proxy.replicas: 2`):
 
 ```sh
 GW_NS=edge-gateways

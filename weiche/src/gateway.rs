@@ -9,12 +9,14 @@ use anyhow::Context;
 use std::thread;
 use tokio::sync::{oneshot, watch};
 
+/// start the watch thread and workers under the same shutdown signal.
 pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
     let (config_tx, config_rx) = routing::channel(GatewaySnapshot::default());
     let (listener_tx, listener_rx) = watch::channel(WorkerGroupState::default());
     let (stop, stopped) = watch::channel(false);
     let control_stop = stopped.clone();
     let (done_tx, mut done_rx) = oneshot::channel();
+    let http3 = runtime.http3;
     let group = WorkerGroup::new(runtime, config_rx, listener_tx)?;
     let control = thread::Builder::new()
         .name("weiche-proxy-watch".into())
@@ -24,7 +26,13 @@ pub async fn run(name: String, runtime: RuntimeConfig) -> anyhow::Result<()> {
                     .enable_all()
                     .build()
                     .context("create control-plane Tokio runtime")?;
-                runtime.block_on(proxy::run(name, config_tx, listener_rx, control_stop))
+                runtime.block_on(proxy::run(
+                    name,
+                    http3,
+                    config_tx,
+                    listener_rx,
+                    control_stop,
+                ))
             })();
             let _ = done_tx.send(result);
         })

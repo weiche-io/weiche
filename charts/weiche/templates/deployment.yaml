@@ -1,36 +1,54 @@
+{{- $fullname := include "weiche.fullname" . -}}
+{{- $podLabels := merge (dict "app" "weiche" "app.kubernetes.io/instance" .Release.Name) (.Values.controller.podLabels | default dict) -}}
+{{- $podAnnotations := merge (dict "weiche.io/settings" (include (print $.Template.BasePath "/settings.yaml") . | sha256sum)) (.Values.controller.podAnnotations | default dict) -}}
+{{- $nodeSelector := merge (dict "kubernetes.io/os" "linux") (.Values.controller.nodeSelector | default dict) -}}
+{{- $hasRustLog := false -}}
+{{- $hasLogFormat := false -}}
+{{- range .Values.controller.extraEnv -}}
+{{- if eq .name "RUST_LOG" -}}{{- $hasRustLog = true -}}{{- end -}}
+{{- if eq .name "WEICHE_LOG_FORMAT" -}}{{- $hasLogFormat = true -}}{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name | quote }}
+  name: {{ $fullname | quote }}
   namespace: {{ .Release.Namespace | quote }}
 spec:
-  replicas: {{ .Values.controllerReplicas }}
+  replicas: {{ .Values.controller.replicas }}
   selector:
     matchLabels:
       app: weiche
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   template:
     metadata:
-      annotations:
-        weiche.io/settings: {{ include (print $.Template.BasePath "/settings.yaml") . | sha256sum }}
-      labels:
-        app: weiche
-        app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      annotations: {{- toYaml $podAnnotations | nindent 8 }}
+      labels: {{- toYaml $podLabels | nindent 8 }}
     spec:
-      serviceAccountName: {{ .Release.Name | quote }}
-      nodeSelector:
-        kubernetes.io/os: linux
-      terminationGracePeriodSeconds: 10
+      serviceAccountName: {{ $fullname | quote }}
+      nodeSelector: {{- toYaml $nodeSelector | nindent 8 }}
+      {{- with .Values.controller.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
         - name: settings
           configMap:
-            name: {{ .Release.Name }}-settings
+            name: {{ include "weiche.settingsName" . | quote }}
       containers:
         - name: weiche
-          image: {{ printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag | toString) | quote }}
+          image: {{ include "weiche.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [controller]
           volumeMounts:
@@ -42,6 +60,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            {{- if and .Values.controller.log.level (not $hasRustLog) }}
+            - name: RUST_LOG
+              value: {{ .Values.controller.log.level | quote }}
+            {{- end }}
+            {{- if and .Values.controller.log.format (not $hasLogFormat) }}
+            - name: WEICHE_LOG_FORMAT
+              value: {{ .Values.controller.log.format | quote }}
+            {{- end }}
+            {{- with .Values.controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532
@@ -50,4 +79,4 @@ spec:
               drop: [ALL]
             seccompProfile:
               type: RuntimeDefault
-          resources: {{- toYaml .Values.resources | nindent 12 }}
+          resources: {{- toYaml .Values.controller.resources | nindent 12 }}

@@ -1,20 +1,39 @@
-{{- $image := printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag | toString) -}}
+{{- $settings := dict
+    "release" .Release.Name
+    "controllerName" .Values.gatewayClass.controllerName
+    "leaseName" (include "weiche.leaseName" .)
+    "provisionerBinding" (include "weiche.provisionerRole" .)
+    "image" (include "weiche.image" .)
+    "pullPolicy" .Values.image.pullPolicy
+    "pullSecrets" .Values.imagePullSecrets
+    "seccompProfile" .Values.proxy.seccompProfile
+    "resources" .Values.proxy.resources
+    "replicas" .Values.proxy.replicas
+    "workers" .Values.proxy.workers
+    "bindAddress" .Values.proxy.bindAddress
+    "hostNetwork" .Values.proxy.hostNetwork
+    "dnsPolicy" .Values.proxy.dnsPolicy
+    "terminationGracePeriodSeconds" .Values.proxy.terminationGracePeriodSeconds
+    "nodeSelector" .Values.proxy.nodeSelector
+    "tolerations" .Values.proxy.tolerations
+    "topologySpreadConstraints" .Values.proxy.topologySpreadConstraints
+    "priorityClassName" .Values.proxy.priorityClassName
+    "podLabels" .Values.proxy.podLabels
+    "podAnnotations" .Values.proxy.podAnnotations
+    "log" .Values.proxy.log
+    "extraEnv" .Values.proxy.extraEnv
+    "service" .Values.proxy.service
+    "http3" .Values.proxy.http3
+    "namespaces" (.Values.gatewayNamespaces | default (list .Release.Namespace) | uniq)
+-}}
+{{- if .Values.proxy.affinity }}
+{{- $_ := set $settings "affinity" .Values.proxy.affinity }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Release.Name }}-settings
+  name: {{ include "weiche.settingsName" . | quote }}
   namespace: {{ .Release.Namespace | quote }}
 data:
   proxy.json: |
-    {{- dict
-        "image" $image
-        "pullPolicy" .Values.image.pullPolicy
-        "pullSecrets" .Values.imagePullSecrets
-        "seccompProfile" .Values.seccompProfile
-        "resources" .Values.resources
-        "replicas" .Values.proxy.replicas
-        "workers" .Values.proxy.workers
-        "bindAddress" .Values.proxy.bindAddress
-        "serviceType" .Values.proxy.serviceType
-        "namespaces" (.Values.gatewayNamespaces | default (list .Release.Namespace))
-        | toPrettyJson | nindent 4 }}
+    {{- $settings | toPrettyJson | nindent 4 }}

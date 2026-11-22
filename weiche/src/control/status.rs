@@ -1,5 +1,5 @@
 //! report gateway and route conditions for the applied worker revision.
-use super::{CONTROLLER_NAME, GatewayStores, compile::RouteReport, service::Plan};
+use super::{GatewayStores, compile::RouteReport, service::Plan};
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
@@ -12,6 +12,7 @@ use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
 };
 
+/// construct a condition for the observed resource generation.
 fn condition(
     kind: &str,
     status: bool,
@@ -23,7 +24,7 @@ fn condition(
         "message": message, "observedGeneration": generation.unwrap_or(1)})
 }
 
-// keep transition times stable, so reconciliation does not generate status/watch loops.
+/// keep transition times stable, so reconciliation does not generate status/watch loops.
 fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     for condition in &mut conditions {
         let previous = old.and_then(Value::as_array).and_then(|old| {
@@ -52,6 +53,7 @@ fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
     json!(conditions)
 }
 
+/// apply changed status with optimistic concurrency.
 async fn patch_status<K>(
     api: Api<K>,
     resource: &K,
@@ -78,13 +80,14 @@ where
 pub async fn update_status(
     client: &Client,
     stores: &GatewayStores,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()> {
     for class in stores
         .gateway_classes
         .state()
         .into_iter()
-        .filter(|c| c.spec.controller_name == CONTROLLER_NAME)
+        .filter(|c| c.spec.controller_name == controller_name)
     {
         let class_old = class
             .status
@@ -102,7 +105,38 @@ pub async fn update_status(
             )],
             class_old.get("conditions"),
         );
-        class_status["supportedFeatures"] = json!([{"name":"Gateway"},{"name":"HTTPRoute"},{"name":"ReferenceGrant"},{"name":"TCPRoute"},{"name":"UDPRoute"}]);
+        class_status["supportedFeatures"] = [
+            "BackendTLSPolicy",
+            "GRPCRoute",
+            "GRPCRouteNamedRouteRule",
+            "GRPCRouteRequestHeaderModifier",
+            "Gateway",
+            "GatewayRouteHostnameIntersectionPrecedence",
+            "HTTPRoute",
+            "HTTPRoute303RedirectStatusCode",
+            "HTTPRoute307RedirectStatusCode",
+            "HTTPRoute308RedirectStatusCode",
+            "HTTPRouteBackendProtocolWebSocket",
+            "HTTPRouteBackendRequestHeaderModification",
+            "HTTPRouteBackendTimeout",
+            "HTTPRouteBackendURLRewrite",
+            "HTTPRouteCORS",
+            "HTTPRouteHostRewrite",
+            "HTTPRoutePathRedirect",
+            "HTTPRoutePathRewrite",
+            "HTTPRoutePortRedirect",
+            "HTTPRouteQueryParamMatching",
+            "HTTPRouteRequestTimeout",
+            "HTTPRouteResponseHeaderModification",
+            "HTTPRouteSchemeRedirect",
+            "ReferenceGrant",
+            "TCPRoute",
+            "TLSRoute",
+            "UDPRoute",
+        ]
+        .into_iter()
+        .map(|name| json!({"name":name}))
+        .collect();
         patch_status(
             Api::<GatewayClass>::all(client.clone()),
             class.as_ref(),
@@ -114,8 +148,9 @@ pub async fn update_status(
     for plan in plans {
         update_gateway(client, plan).await?;
     }
-    update_policies(client, stores, plans).await?;
+    update_policies(client, stores, controller_name, plans).await?;
 
+    /// publish parent conditions for each supported route kind.
     macro_rules! routes {
         ($store:expr) => {
             for route in $store.state() {
@@ -127,12 +162,14 @@ pub async fn update_status(
                     client.clone(),
                     &route.namespace().unwrap_or_default(),
                 );
-                update_route(api, route.as_ref(), old, plans).await?;
+                update_route(api, route.as_ref(), old, controller_name, plans).await?;
             }
         };
     }
     routes!(stores.http_routes);
+    routes!(stores.grpc_routes);
     routes!(stores.tcp_routes);
+    routes!(stores.tls_routes);
     routes!(stores.udp_routes);
     Ok(())
 }
@@ -142,6 +179,7 @@ async fn update_route<K>(
     api: Api<K>,
     route: &K,
     old: Value,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()>
 where
@@ -155,7 +193,7 @@ where
         .get("parents")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let owned_parent = |p: &Value| p["controllerName"] == CONTROLLER_NAME;
+    let owned_parent = |p: &Value| p["controllerName"] == controller_name;
     let mut parents: Vec<_> =
         old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
     let mut reports = std::collections::BTreeMap::new();
@@ -166,8 +204,16 @@ where
         .filter(|r| r.uid == route.uid())
     {
         let key = serde_json::to_string(&report.parent)?;
-        let score =
-            |r: &RouteReport| (r.accepted, r.reason != "NoMatchingParent", !r.resolved);
+        let score = |r: &RouteReport| {
+            // report the closest eligible listener when every attachment was rejected.
+            let matched = match r.reason {
+                "NoMatchingParent" => 0,
+                "NotAllowedByListeners" => 1,
+                "NoMatchingListenerHostname" => 2,
+                _ => 3,
+            };
+            (r.accepted, matched, !r.resolved)
+        };
         let chosen = reports.entry(key).or_insert(report);
         if score(report) > score(chosen) {
             *chosen = report;
@@ -186,27 +232,34 @@ where
         } else {
             "backend reference is missing, unsupported or not permitted"
         };
-        let conditions = stamp(
-            vec![
-                condition(
-                    "Accepted",
-                    report.accepted,
-                    report.reason,
-                    &report.message,
-                    generation,
-                ),
-                condition(
-                    "ResolvedRefs",
-                    report.resolved,
-                    report.refs_reason,
-                    refs_message,
-                    generation,
-                ),
-            ],
-            previous.and_then(|p| p.get("conditions")),
-        );
+        let mut conditions = vec![
+            condition(
+                "Accepted",
+                report.accepted,
+                report.reason,
+                &report.message,
+                generation,
+            ),
+            condition(
+                "ResolvedRefs",
+                report.resolved,
+                report.refs_reason,
+                refs_message,
+                generation,
+            ),
+        ];
+        if let Some(message) = &report.partially_invalid {
+            conditions.push(condition(
+                "PartiallyInvalid",
+                true,
+                "UnsupportedValue",
+                message,
+                generation,
+            ));
+        }
+        let conditions = stamp(conditions, previous.and_then(|p| p.get("conditions")));
         parents.push(json!({
-            "controllerName": CONTROLLER_NAME,
+            "controllerName": controller_name,
             "parentRef": parent,
             "conditions": conditions,
         }));
@@ -225,7 +278,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
         .as_ref()
         .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let generation = gateway.metadata.generation;
-    let accepted = plan.listeners.iter().any(|l| l.accepted);
+    let accepted = plan.accepted();
     let all_valid = plan.listeners.iter().all(|l| l.accepted);
     let programmed = plan.programmed && accepted;
     let mut desired = old.clone();
@@ -236,6 +289,8 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 accepted,
                 if plan.denied {
                     "NamespaceNotAllowed"
+                } else if plan.invalid_parameters {
+                    "InvalidParameters"
                 } else if all_valid {
                     "Accepted"
                 } else {
@@ -243,6 +298,8 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 },
                 if plan.denied {
                     "gateway namespace is outside the configured deployment scope"
+                } else if plan.invalid_parameters {
+                    "gateway infrastructure parametersRef is not supported"
                 } else {
                     "evaluated gateway listeners"
                 },
@@ -254,7 +311,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 if programmed {
                     "Programmed"
                 } else if plan.issue.is_some() {
-                    "NoResources"
+                    plan.issue_reason.unwrap_or("NoResources")
                 } else {
                     "Pending"
                 },
@@ -288,11 +345,11 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             .map(|r| &r.uid)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let kinds = if let Some(kind) = report.supported_kind {
-            json!([{"group": "gateway.networking.k8s.io", "kind": kind}])
-        } else {
-            json!([])
-        };
+        let kinds: Vec<_> = report
+            .supported_kinds
+            .iter()
+            .map(|kind| json!({"group":"gateway.networking.k8s.io", "kind":kind}))
+            .collect();
         let conditions = stamp(
             vec![
                 condition(
@@ -350,6 +407,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
 async fn update_policies(
     client: &Client,
     stores: &GatewayStores,
+    controller_name: &str,
     plans: &[Plan],
 ) -> anyhow::Result<()> {
     let mut reports = HashMap::<_, BTreeMap<_, _>>::new();
@@ -374,7 +432,7 @@ async fn update_policies(
         let entries = old["ancestors"].as_array().map_or(&[][..], Vec::as_slice);
         let owned = |p: &Value| {
             let ancestor = &p["ancestorRef"];
-            p["controllerName"] == CONTROLLER_NAME
+            p["controllerName"] == controller_name
                 && ancestor["kind"] == "Gateway"
                 && ancestor["group"] == "gateway.networking.k8s.io"
         };
@@ -425,7 +483,7 @@ async fn update_policies(
                     "group": "gateway.networking.k8s.io", "kind": "Gateway",
                     "name": name, "namespace": namespace
                 },
-                "controllerName": CONTROLLER_NAME,
+                "controllerName": controller_name,
                 "conditions": conditions
             }));
         }

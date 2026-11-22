@@ -14,20 +14,26 @@ use std::{
 };
 
 /// worker-local HTTP transport covering plain TCP and io_uring TLS connections.
-pub enum Io {
+pub struct Io(send_wrapper::SendWrapper<Transport>);
+
+/// hyper erases upgraded transports behind a Send bound. all polling and destruction
+/// stays on the owning compio worker, enforced by the wrapper's thread check.
+enum Transport {
+    /// cleartext socket adapter.
     Plain(PlainIo),
+    /// encrypted socket adapter.
     Tls(Box<TlsIo>),
 }
 
 impl Io {
     /// build an uninitialized, readiness-cached plain HTTP socket.
     pub fn plain(stream: TcpStream) -> io::Result<Self> {
-        Ok(Self::Plain(PlainIo::new(stream)?))
+        Ok(Self(send_wrapper::SendWrapper::new(Transport::Plain(PlainIo::new(stream)?))))
     }
 
     /// wrap a completed io_uring TLS transport.
     pub fn tls(stream: TlsIo) -> Self {
-        Self::Tls(Box::new(stream))
+        Self(send_wrapper::SendWrapper::new(Transport::Tls(Box::new(stream))))
     }
 }
 
@@ -37,9 +43,9 @@ impl Read for Io {
         cx: &mut Context<'_>,
         buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+        match &mut *self.get_mut().0 {
+            Transport::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Transport::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
         }
     }
 }
@@ -50,9 +56,9 @@ impl Write for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+        match &mut *self.get_mut().0 {
+            Transport::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Transport::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
         }
     }
 
@@ -61,30 +67,32 @@ impl Write for Io {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
+        match &mut *self.get_mut().0 {
+            Transport::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Transport::Tls(stream) => {
+                Pin::new(&mut **stream).poll_write_vectored(cx, bufs)
+            }
         }
     }
 
     fn is_write_vectored(&self) -> bool {
-        match self {
-            Self::Plain(stream) => stream.is_write_vectored(),
-            Self::Tls(stream) => stream.is_write_vectored(),
+        match &*self.0 {
+            Transport::Plain(stream) => stream.is_write_vectored(),
+            Transport::Tls(stream) => stream.is_write_vectored(),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        match &mut *self.get_mut().0 {
+            Transport::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Transport::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        match &mut *self.get_mut().0 {
+            Transport::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Transport::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
         }
     }
 }

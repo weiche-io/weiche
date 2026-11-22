@@ -2,7 +2,7 @@
 use super::{
     super::{
         super::{
-            ir::{Binding, ServerTls, StreamRoute, Transport},
+            ir::{Binding, ServerTls, StreamRoute, TlsSocket, Transport},
             routing,
             rtconf::RuntimeConfig,
         },
@@ -11,6 +11,7 @@ use super::{
     },
     ListenerGroup, WorkerStatus, bind_socket,
     http::Server,
+    quic,
 };
 use compio::{
     net::TcpListener,
@@ -48,6 +49,9 @@ pub async fn run(
         (Transport, SocketAddr),
         (String, watch::Sender<Arc<StreamRoute>>),
     >::new();
+    let mut quic = BTreeMap::<SocketAddr, quic::Listener>::new();
+    let mut revision = None;
+    let mut tls = BTreeMap::<SocketAddr, watch::Sender<Arc<TlsSocket>>>::new();
     let mut serving = FuturesUnordered::new();
     let stopping = stopped(stop.subscribe());
     tokio::pin!(stopping);
@@ -95,6 +99,63 @@ pub async fn run(
                 Err(error) => tracing::warn!(%address,%error,"listener bind failed"),
             }
         }
+        let changed = revision.replace(snapshot.revision) != Some(snapshot.revision);
+        let mut retry_quic = false;
+        if runtime.http3 {
+            quic.retain(|addr, listener| {
+                sockets.get(addr).is_some_and(|(b, _)| b == &listener.binding)
+                    && !snapshot.gateway.streams.contains_key(&(Transport::Udp, *addr))
+            });
+            for (&address, (binding, certs)) in &sockets {
+                if !binding.tls {
+                    continue;
+                }
+                if snapshot.gateway.streams.contains_key(&(Transport::Udp, address)) {
+                    if changed && id == 0 {
+                        tracing::warn!(%address, "explicit udp listener takes precedence over http/3");
+                    }
+                    continue;
+                }
+                if let Some(listener) = quic.get(&address) {
+                    if changed {
+                        listener.update(&certs.borrow());
+                    }
+                    continue;
+                }
+                let endpoint = listeners
+                    .datagrams
+                    .acquire(address, id, runtime.workers.get(), true)
+                    .and_then(|(socket, reader)| {
+                        let (listener, endpoint) = quic::Listener::bind(
+                            socket,
+                            server.service.clone(),
+                            binding.clone(),
+                            &certs.borrow(),
+                            id,
+                            &runtime,
+                        )?;
+                        let task = listener.serve(
+                            endpoint,
+                            admission.clone(),
+                            runtime.clone(),
+                            reader,
+                        );
+                        Ok((listener, task))
+                    });
+                match endpoint {
+                    Ok((listener, task)) => {
+                        serving.push(task.boxed_local());
+                        quic.insert(address, listener);
+                    }
+                    Err(error) => {
+                        retry_quic = true;
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            tracing::warn!(%address, %error, "http/3 listener bind failed");
+                        }
+                    }
+                }
+            }
+        }
         streams.retain(|key, (uid, _)| {
             snapshot
                 .gateway
@@ -102,16 +163,41 @@ pub async fn run(
                 .get(key)
                 .is_some_and(|l| &l.gateway_uid == uid)
         });
+        tls.retain(|addr, tx| {
+            snapshot
+                .gateway
+                .tls
+                .get(addr)
+                .is_some_and(|s| s.gateway_uid == tx.borrow().gateway_uid)
+        });
+        for (address, socket) in &snapshot.gateway.tls {
+            if let Some(tx) = tls.get(address) {
+                update(tx, socket);
+                continue;
+            }
+            match listen(*address) {
+                Ok(listener) => {
+                    let (tx, rx) = watch::channel(socket.clone());
+                    serving.push(
+                        super::relay::serve(
+                            listener,
+                            rx,
+                            admission.clone(),
+                            runtime.clone(),
+                            super::passthrough::forward,
+                        )
+                        .boxed_local(),
+                    );
+                    tls.insert(*address, tx);
+                }
+                Err(error) => {
+                    tracing::warn!(%address, %error, "tls listener bind failed")
+                }
+            }
+        }
         for (&key, listener) in &snapshot.gateway.streams {
             if let Some((_, tx)) = streams.get(&key) {
-                tx.send_if_modified(|current| {
-                    if *current == listener.route {
-                        false
-                    } else {
-                        *current = listener.route.clone();
-                        true
-                    }
-                });
+                update(tx, &listener.route);
                 continue;
             }
             let (tx, rx) = watch::channel(listener.route.clone());
@@ -122,26 +208,48 @@ pub async fn run(
                         s,
                         rx,
                         admission.clone(),
-                        runtime.tcp_connect_timeout,
-                        runtime.connection_drain_timeout,
+                        runtime.clone(),
+                        super::relay::tcp,
                     )
                     .boxed_local()
                 }),
-                Transport::Udp => super::udp::listen(address).map(|s| {
-                    super::udp::serve(
-                        s,
-                        rx,
-                        admission.clone(),
-                        runtime.upstream_idle_timeout,
-                    )
-                    .boxed_local()
-                }),
+                Transport::Udp => {
+                    let socket = if runtime.http3 {
+                        listeners
+                            .datagrams
+                            .acquire(address, id, runtime.workers.get(), false)
+                            .map(|(socket, reader)| (socket, Some(reader)))
+                    } else {
+                        super::udp::listen(address).map(|s| (s, None))
+                    };
+                    socket.map(|(socket, reader)| {
+                        let admission = admission.clone();
+                        let idle = runtime.upstream_idle_timeout;
+                        async move {
+                            if let Some(_reader) = reader {
+                                let result = super::udp::serve(
+                                    socket.clone(),
+                                    rx,
+                                    admission,
+                                    idle,
+                                )
+                                .await;
+                                socket.close().await?;
+                                result
+                            } else {
+                                super::udp::serve(socket, rx, admission, idle).await
+                            }
+                        }
+                        .boxed_local()
+                    })
+                }
             };
             match task {
                 Ok(task) => {
                     serving.push(task);
                     streams.insert(key, (listener.gateway_uid.clone(), tx));
                 }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => {
                     tracing::warn!(%address,?transport,%error,"transport listener bind failed")
                 }
@@ -153,12 +261,16 @@ pub async fn run(
                 revision: snapshot.revision,
                 bound: sockets
                     .keys()
+                    .chain(tls.keys())
                     .map(|a| (Transport::Tcp, *a))
+                    .chain(quic.keys().map(|a| (Transport::Udp, *a)))
                     .chain(streams.keys().copied())
                     .collect(),
             },
         );
-        let retry = sockets.len() != snapshot.gateway.sockets.len()
+        let retry = retry_quic
+            || sockets.len() != snapshot.gateway.sockets.len()
+            || tls.len() != snapshot.gateway.tls.len()
             || streams.len() != snapshot.gateway.streams.len();
         tokio::select! {
             biased;
@@ -168,12 +280,25 @@ pub async fn run(
             _=sleep(runtime.listener_retry_interval),if retry=>{}
         }
     }
+    drop(quic);
     drop(sockets);
     drop(streams);
+    drop(tls);
     while serving.next().await.is_some() {}
     listeners.report(id, WorkerStatus::default());
     server.service.close();
     Ok(())
+}
+
+/// notify an existing socket only when its forwarding table changes.
+fn update<T: PartialEq>(tx: &watch::Sender<Arc<T>>, desired: &Arc<T>) {
+    tx.send_if_modified(|current| {
+        if current == desired {
+            return false;
+        }
+        *current = desired.clone();
+        true
+    });
 }
 
 /// own the accept future and drain only the connections belonging to this binding.
