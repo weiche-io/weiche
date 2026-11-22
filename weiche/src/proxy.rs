@@ -55,7 +55,11 @@ struct Desired {
 
 impl Desired {
     /// decode the snapshot and publish its listener configuration to the workers.
-    fn apply(secret: &Secret, tx: &mut routing::Writer) -> anyhow::Result<Self> {
+    fn apply(
+        secret: &Secret,
+        tx: &mut routing::Writer,
+        http3: bool,
+    ) -> anyhow::Result<Self> {
         ensure!(
             secret.type_.as_deref() == Some("weiche.io/snapshot"),
             "unexpected snapshot Secret type"
@@ -77,6 +81,13 @@ impl Desired {
                     .keys()
                     .chain(snapshot.tls.keys())
                     .map(|addr| (Transport::Tcp, *addr)),
+            )
+            .chain(
+                snapshot
+                    .sockets
+                    .iter()
+                    .filter(|(_, s)| http3 && !s.listener.tls.is_empty())
+                    .map(|(addr, _)| (Transport::Udp, *addr)),
             )
             .collect();
         Ok(Self {
@@ -116,6 +127,7 @@ async fn authorized(
 /// watch only the named Secret; transient API errors leave the last valid snapshot serving.
 pub async fn run(
     name: String,
+    http3: bool,
     mut tx: routing::Writer,
     mut workers: watch::Receiver<WorkerGroupState>,
     stop: watch::Receiver<bool>,
@@ -196,7 +208,7 @@ pub async fn run(
                     | watcher::Event::Delete(_)
                     | watcher::Event::InitDone,
                 ) => match store.get(&secret_ref) {
-                    Some(secret) => match Desired::apply(&secret, &mut tx) {
+                    Some(secret) => match Desired::apply(&secret, &mut tx, http3) {
                         Ok(next) => desired = Some(next),
                         Err(e) => {
                             tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot");

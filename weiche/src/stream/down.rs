@@ -1,7 +1,6 @@
 //! downstream listener transports and per-worker application reports.
 mod http;
 mod passthrough;
-#[cfg(feature = "quic")]
 pub mod quic;
 mod relay;
 pub mod tcp;
@@ -42,6 +41,8 @@ impl WorkerGroupState {
 }
 /// publish consistent binding reports for the worker group.
 pub struct ListenerGroup {
+    /// ordered UDP bindings when HTTP/3 shares a worker group with raw UDP.
+    datagrams: quic::Groups,
     /// latest report at each worker index.
     workers: Mutex<Vec<WorkerStatus>>,
     /// channel carrying combined reports to the readiness monitor.
@@ -51,6 +52,7 @@ impl ListenerGroup {
     /// allocate a status slot for each configured worker.
     pub fn new(count: usize, state: watch::Sender<WorkerGroupState>) -> Self {
         Self {
+            datagrams: quic::Groups::default(),
             workers: Mutex::new(vec![WorkerStatus::default(); count]),
             state,
         }
@@ -76,6 +78,9 @@ fn bind_socket(
         kind,
         Some(protocol),
     )?;
+    if address.is_ipv6() && address.ip().is_unspecified() {
+        socket.set_only_v6(false)?;
+    }
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
     socket.bind(&address.into())?;
