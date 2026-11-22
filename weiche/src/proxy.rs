@@ -4,7 +4,7 @@ pub mod config;
 pub mod down;
 pub mod http;
 mod io;
-pub mod up;
+mod up;
 mod watch;
 
 use super::ir::GatewaySnapshot;

@@ -1,5 +1,5 @@
 //! validate HTTP/1 upgrade negotiation and relay the switched protocol locally.
-use super::pool::Lease;
+use super::http1::Lease;
 use http::{HeaderMap, HeaderValue, Request, Response, Version, header};
 use hyper::{
     body::Incoming,

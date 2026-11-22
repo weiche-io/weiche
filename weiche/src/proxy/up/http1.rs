@@ -1,7 +1,9 @@
 //! exclusive HTTP/1 leases and idle connection reuse.
 use super::{
-    super::{super::http::Body, connector::Connected, deadline::TimedBody},
-    ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
+    super::http::Body,
+    connector::Connected,
+    deadline::TimedBody,
+    pool::{ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot},
 };
 use compio::runtime;
 use hyper::{body::Incoming, client::conn::http1::SendRequest};

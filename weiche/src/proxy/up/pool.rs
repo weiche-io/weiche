@@ -1,16 +1,15 @@
 //! worker-local connection capacity, endpoint generations and response leases.
-mod http1;
-mod http2;
 
 use super::{
     super::{super::ir::Protocol, admission::EndpointKey, config::RuntimeConfig},
     connector::Connector,
 };
+use super::{
+    http1::{Idle, Lease},
+    http2::{Http2Connection, Http2Lease},
+};
 use bytes::Bytes;
 use compio::runtime;
-use http1::Idle;
-pub use http1::Lease;
-use http2::{Http2Connection, Http2Lease};
 use hyper::body::Incoming;
 use std::{
     cell::{Cell, RefCell},
@@ -24,17 +23,17 @@ use tokio::sync::{Notify, futures::Notified};
 
 /// worker-wide connection slot counter and admission notifications.
 #[derive(Default)]
-struct Budget {
+pub struct Budget {
     /// number of slots currently reserved.
     live: Cell<usize>,
     /// wake admissions when capacity or stream availability changes.
-    changed: Notify,
+    pub changed: Notify,
 }
 
 /// exclusive reservation released when the transport is dropped.
-struct Slot {
+pub struct Slot {
     /// shared socket capacity on this worker.
-    budget: Rc<Budget>,
+    pub budget: Rc<Budget>,
 }
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -48,17 +47,17 @@ pub struct Endpoint {
     /// immutable address, protocol and TLS identity.
     pub key: EndpointKey,
     /// whether new requests may use this generation.
-    enabled: Cell<bool>,
+    pub enabled: Cell<bool>,
     /// wake waiters when the endpoint is retired.
-    closed: Notify,
+    pub closed: Notify,
     /// idle reusable HTTP/1 connections.
-    idle: RefCell<Vec<Idle>>,
+    pub idle: RefCell<Vec<Idle>>,
     /// multiplexed HTTP/2 transports.
-    http2: RefCell<Vec<Rc<Http2Connection>>>,
+    pub http2: RefCell<Vec<Rc<Http2Connection>>>,
     /// whether an HTTP/2 handshake is already in progress.
-    connecting: Cell<bool>,
+    pub connecting: Cell<bool>,
     /// shared socket capacity on this worker.
-    budget: Rc<Budget>,
+    pub budget: Rc<Budget>,
 }
 
 impl Endpoint {
@@ -71,7 +70,7 @@ impl Endpoint {
     }
 
     /// evict closed and expired idle transports.
-    fn prune(&self, timeout: Duration) {
+    pub fn prune(&self, timeout: Duration) {
         self.idle.borrow_mut().retain(|idle| idle.reusable(timeout));
         self.http2
             .borrow_mut()
@@ -114,11 +113,11 @@ pub struct ConnectionPool {
     /// maximum simultaneous socket reservations.
     limit: usize,
     /// maximum active streams per HTTP/2 connection.
-    max_streams: usize,
+    pub max_streams: usize,
     /// maximum idle age before a connection expires.
-    idle_timeout: Duration,
+    pub idle_timeout: Duration,
     /// handshake limits used for fresh transports.
-    connector: Connector,
+    pub connector: Connector,
     /// shared socket capacity on this worker.
     budget: Rc<Budget>,
     /// whether the worker has stopped accepting new connections.
@@ -217,7 +216,7 @@ impl ConnectionPool {
     }
 
     /// subscribe to capacity changes while the endpoint is still usable.
-    fn watch_capacity(&self, endpoint: &Endpoint) -> anyhow::Result<Notified<'_>> {
+    pub fn watch_capacity(&self, endpoint: &Endpoint) -> anyhow::Result<Notified<'_>> {
         anyhow::ensure!(
             !self.closed.get() && endpoint.enabled.get(),
             "backend was removed or pool closed"
@@ -227,7 +226,7 @@ impl ConnectionPool {
     }
 
     /// reserve a free slot after evicting an idle socket if necessary.
-    fn try_reserve(&self) -> Option<Slot> {
+    pub fn try_reserve(&self) -> Option<Slot> {
         if self.budget.live.get() == self.limit {
             self.evict_idle();
         }
@@ -240,7 +239,7 @@ impl ConnectionPool {
     }
 
     /// cancel a handshake if its endpoint is removed.
-    async fn dial<T>(
+    pub async fn dial<T>(
         &self,
         endpoint: &Endpoint,
         handshake: impl Future<Output = anyhow::Result<T>>,
@@ -264,7 +263,7 @@ impl Drop for ConnectionPool {
 }
 
 /// transport-specific ownership retained by an ordinary response.
-enum ResponseLease {
+pub enum ResponseLease {
     /// exclusive HTTP/1 transport.
     Http1(Lease),
     /// one stream on a shared HTTP/2 transport.
@@ -286,7 +285,7 @@ impl PooledBody {
     }
 
     /// attach the lease and release it immediately for empty bodies.
-    fn new(body: Incoming, lease: ResponseLease) -> Self {
+    pub fn new(body: Incoming, lease: ResponseLease) -> Self {
         let mut body = Self { body, lease: Some(lease) };
         // responses to HEAD, status 204 and empty bodies may never be polled by the downstream.
         if hyper::body::Body::is_end_stream(&body.body) {

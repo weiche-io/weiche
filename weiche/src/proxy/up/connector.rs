@@ -1,11 +1,16 @@
 //! upstream HTTP client handshakes and connections on the owning compio runtime.
 use super::{
-    super::{admission::EndpointKey, http::Body, io::Io},
+    super::{
+        super::ir::Protocol,
+        admission::EndpointKey,
+        http::Body,
+        io::{Io, TlsIo},
+    },
     deadline::TimedBody,
-    tls,
 };
+use anyhow::{Context, ensure};
 use bytes::Bytes;
-use compio::{net::TcpStream, runtime};
+use compio::{net::TcpStream, runtime, tls::rustls::pki_types::ServerName};
 use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::{
     body::Body as HttpBody,
@@ -68,9 +73,15 @@ impl Connector {
     /// open TCP and negotiate backend TLS when configured.
     async fn open(&self, endpoint: &EndpointKey) -> anyhow::Result<Io> {
         let stream = TcpStream::connect(endpoint.address).await?;
-        match &endpoint.tls {
-            Some(settings) => tls::connect(stream, settings, endpoint.protocol).await,
-            None => Ok(Io::plain(stream)?),
-        }
+        let Some(tls) = &endpoint.tls else { return Ok(Io::plain(stream)?) };
+        let name = ServerName::try_from(tls.hostname.clone())
+            .context("invalid backend TLS hostname")?;
+        let stream = TlsIo::connect(stream, name, tls.config()).await?;
+        ensure!(
+            endpoint.protocol != Protocol::Http2
+                || stream.negotiated_alpn() == Some(b"h2"),
+            "backend did not negotiate h2"
+        );
+        Ok(Io::tls(stream))
     }
 }
