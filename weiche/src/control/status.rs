@@ -1,5 +1,8 @@
 //! report gateway and route conditions for the applied worker revision.
-use super::{GatewayStores, compile::RouteReport, service::Plan, tls::TlsError};
+use super::{
+    super::ir::RefError, GatewayStores, compile::RouteReport, service::Plan,
+    tls::TlsError,
+};
 use k8s_openapi::NamespaceResourceScope;
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -215,7 +218,7 @@ fn route_status(
                 "NoMatchingListenerHostname" => 2,
                 _ => 3,
             };
-            (r.accepted, matched, !r.resolved)
+            (r.accepted, matched, r.refs_error.is_some())
         };
         let chosen = reports.entry(key).or_insert(report);
         if score(report) > score(chosen) {
@@ -227,16 +230,17 @@ fn route_status(
         let previous = old_parents
             .iter()
             .find(|p| owned_parent(p) && &p["parentRef"] == parent);
-        let refs_message = if report.resolved {
-            "backend references resolved"
-        } else if report.refs_reason == "InvalidBackendTLSPolicy" {
-            "the referenced Service has an invalid BackendTLSPolicy"
-        } else {
-            "backend reference is missing, unsupported or not permitted"
+        let refs_message = match report.refs_error {
+            None => "backend references resolved",
+            Some(RefError::InvalidTlsPolicy) => {
+                "the referenced Service has an invalid BackendTLSPolicy"
+            }
+            Some(_) => "backend reference is missing, unsupported or not permitted",
         };
+        let refs_reason = report.refs_error.map_or("ResolvedRefs", RefError::reason);
         let mut conditions: Vec<Cond> = vec![
             ("Accepted", report.accepted, report.reason, report.message.as_str()),
-            ("ResolvedRefs", report.resolved, report.refs_reason, refs_message),
+            ("ResolvedRefs", report.refs_error.is_none(), refs_reason, refs_message),
         ];
         if let Some(message) = &report.partially_invalid {
             conditions.push(("PartiallyInvalid", true, "UnsupportedValue", message));

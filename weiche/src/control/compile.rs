@@ -12,11 +12,8 @@ use super::{
 };
 use kube::{Resource, ResourceExt, runtime::reflector::ObjectRef};
 use serde::Serialize;
-use weiche_gtwapi::v1::{
-    gateways::{
-        Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From,
-    },
-    tlsroutes::TlsRoute,
+use weiche_gtwapi::v1::gateways::{
+    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From,
 };
 
 /// gateway class controller owned by this process.
@@ -33,10 +30,8 @@ pub struct RouteReport {
     pub accepted: bool,
     /// gateway API reason for the condition.
     pub reason: &'static str,
-    /// whether all backend references resolved.
-    pub resolved: bool,
-    /// reason for the ResolvedRefs condition.
-    pub refs_reason: &'static str,
+    /// backend reference failure reported on this parent.
+    pub refs_error: Option<RefError>,
     /// explanation required when valid rules survive alongside invalid rules.
     pub partially_invalid: Option<String>,
     /// description published with the condition.
@@ -95,30 +90,22 @@ pub fn compile(
         "UDP" => &["UDPRoute"],
         _ => &[],
     };
+    let mut result = Compiled { transport, reason: "Invalid", ..Default::default() };
     let mut invalid_kinds = false;
-    let supported_kinds = if kinds.is_empty() {
-        protocol_kinds.to_vec()
-    } else {
-        let mut supported = Vec::new();
-        for k in kinds {
-            if k.group.as_deref().is_none_or(|g| g == "gateway.networking.k8s.io")
-                && let Some(&kind) = protocol_kinds.iter().find(|kind| **kind == k.kind)
-            {
-                if !supported.contains(&kind) {
-                    supported.push(kind);
-                }
-            } else {
-                invalid_kinds = true;
+    if kinds.is_empty() {
+        result.supported_kinds.extend_from_slice(protocol_kinds);
+    }
+    for k in kinds {
+        if k.group.as_deref().is_none_or(|g| g == "gateway.networking.k8s.io")
+            && let Some(&kind) = protocol_kinds.iter().find(|kind| **kind == k.kind)
+        {
+            if !result.supported_kinds.contains(&kind) {
+                result.supported_kinds.push(kind);
             }
+        } else {
+            invalid_kinds = true;
         }
-        supported
-    };
-    let mut result = Compiled {
-        supported_kinds,
-        transport,
-        reason: "Invalid",
-        ..Default::default()
-    };
+    }
     let mut peers = gateway.spec.listeners.iter().filter(|other| {
         other.name != l.name
             && other.port == l.port
@@ -148,20 +135,13 @@ pub fn compile(
             "listeners have conflicting protocols or hostnames on this port".into();
     } else if gateway.spec.tls.is_some() {
         result.message = "unsupported gateway-wide TLS options".into();
-    } else if raw {
-        if l.tls.is_none() && l.hostname.as_deref().unwrap_or("").is_empty() {
-            result.accepted = true;
-            result.reason = "Accepted";
-            result.message = format!("{} listener is valid", l.protocol);
-        } else {
-            result.message = "raw transport listeners require an empty hostname and no TLS configuration".into();
-        }
     } else {
         match listener_tls(stores, &namespace, l) {
             Ok(tls) => {
                 result.accepted = true;
                 result.reason = "Accepted";
-                result.message = format!("selected {} listener is valid", l.protocol);
+                let prefix = if raw { "" } else { "selected " };
+                result.message = format!("{prefix}{} listener is valid", l.protocol);
                 result.tls = tls;
             }
             Err(error) => {
@@ -181,12 +161,7 @@ pub fn compile(
         });
     }
     let host = l.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
-    let binding = Binding {
-        stores,
-        listener: l,
-        namespace: &namespace,
-        host: &host,
-    };
+    let binding = Binding { stores, listener: l, namespace: &namespace };
     let name = gateway.name_any();
     /// bridge the common parent fields of the five generated route schemas.
     macro_rules! collect {
@@ -242,17 +217,20 @@ pub fn compile(
     http!(grpc_routes, resolve_grpc);
     collect!(
         tcp_routes,
-        |r, out, report| out.bind_stream(stores.resolve_tcp(&r)?, report),
+        |r, out, report| out.bind_stream(None, report, || stores.resolve_tcp(&r)),
         None
     );
     collect!(
         tls_routes,
-        |r, out, report| binding.bind_tls(&r, out, report),
+        |r, out, report| {
+            let hosts = intersecting_hosts(&host, &r.spec.hostnames, report);
+            out.bind_stream(Some(hosts), report, || stores.resolve_tls(&r))
+        },
         stores.tls_ref_error(&r)
     );
     collect!(
         udp_routes,
-        |r, out, report| out.bind_stream(stores.resolve_udp(&r)?, report),
+        |r, out, report| out.bind_stream(None, report, || stores.resolve_udp(&r)),
         None
     );
     result
@@ -264,8 +242,6 @@ struct Binding<'a> {
     stores: &'a GatewayStores,
     /// namespace of the selected gateway.
     namespace: &'a str,
-    /// normalized listener hostname.
-    host: &'a str,
     /// listener receiving routes from permitted namespaces.
     listener: &'a GatewayListeners,
 }
@@ -280,8 +256,7 @@ impl RouteReport {
     /// record the first unresolved backend reference.
     fn references(&mut self, error: Option<&RefError>) {
         if let Some(error) = error {
-            self.resolved = false;
-            self.refs_reason = error.reason();
+            self.refs_error = Some(*error);
         }
     }
 }
@@ -367,38 +342,31 @@ fn bind_rules<R>(
 }
 
 impl Compiled {
-    /// retain the oldest stream route and report all eligible attachments.
+    /// retain the oldest stream route per socket or intersecting TLS hostname.
     fn bind_stream(
         &mut self,
-        backend: StreamRoute,
+        hosts: Option<Vec<(String, String)>>,
         report: &mut RouteReport,
+        resolve: impl FnOnce() -> Result<StreamRoute, ResolveError>,
     ) -> Result<(), ResolveError> {
+        if hosts.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(());
+        }
+        let backend = resolve()?;
         report.references(backend.backends.iter().find_map(|(_, b)| b.as_ref().err()));
-        self.stream.get_or_insert(backend);
+        if let Some(hosts) = hosts {
+            let backend = Arc::new(backend);
+            for (_, original) in hosts {
+                self.sni_routes.entry(original).or_insert_with(|| backend.clone());
+            }
+        } else {
+            self.stream.get_or_insert(backend);
+        }
         Ok(())
     }
 }
 
 impl Binding<'_> {
-    /// keep the oldest backend per original hostname within this listener.
-    fn bind_tls(
-        &self,
-        route: &TlsRoute,
-        result: &mut Compiled,
-        report: &mut RouteReport,
-    ) -> Result<(), ResolveError> {
-        let hosts = intersecting_hosts(self.host, &route.spec.hostnames, report);
-        if hosts.is_empty() {
-            return Ok(());
-        }
-        let backend = Arc::new(self.stores.resolve_tls(route)?);
-        report.references(backend.backends.iter().find_map(|(_, b)| b.as_ref().err()));
-        for (_, original) in hosts {
-            result.sni_routes.entry(original).or_insert_with(|| backend.clone());
-        }
-        Ok(())
-    }
-
     /// evaluate a gateway parent against this listener and bind an eligible route.
     fn attach<R: Resource<DynamicType = ()>>(
         &self,
@@ -416,8 +384,7 @@ impl Binding<'_> {
             accepted: true,
             reason: "Accepted",
             message: "route attached to listener".into(),
-            resolved: true,
-            refs_reason: "ResolvedRefs",
+            refs_error: None,
             partially_invalid: None,
         };
         if !matches {
