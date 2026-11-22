@@ -31,6 +31,7 @@ jobs:
         with:
           name: weiche.io
           path: |
+            weiche.io/wrangler.jsonc
             weiche.io/build/
             !weiche.io/build/**/*.typ
             !weiche.io/build/**/*.bib
@@ -43,7 +44,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: weiche.io
-          path: build/
+          path: weiche.io/
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
@@ -51,4 +52,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy build --project-name weiche --branch master --commit-hash ${{ github.sha }}
+          workingDirectory: weiche.io
+          wranglerVersion: '4.166.0'
+          command: deploy
