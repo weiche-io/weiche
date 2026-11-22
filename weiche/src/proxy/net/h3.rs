@@ -19,7 +19,7 @@ use compio::{
     runtime::time::{timeout, timeout_at},
 };
 use futures::{
-    StreamExt, TryStreamExt,
+    StreamExt, TryFutureExt, TryStreamExt,
     stream::{FuturesUnordered, try_unfold},
 };
 use http::{HeaderMap, Method, Response, StatusCode, header};
@@ -37,8 +37,7 @@ pub async fn serve(
     _permit: Permit,
     shutdown: watch::Receiver<bool>,
 ) {
-    let stopping = stopped(shutdown);
-    tokio::pin!(stopping);
+    let mut stopping = std::pin::pin!(stopped(shutdown));
     let handshake = async {
         let transport = incoming.await?;
         let conn = h3::server::builder()
@@ -65,11 +64,9 @@ pub async fn serve(
             result = conn.accept() => match result {
                 Ok(Some(resolver)) => {
                     let peer = transport.remote_address();
-                    requests.push(async move {
-                        if let Err(error) = request(resolver, service, binding, peer).await {
-                            tracing::debug!(%peer, %error, "http/3 stream ended");
-                        }
-                    });
+                    requests.push(request(resolver, service, binding, peer).unwrap_or_else(move |error| {
+                        tracing::debug!(%peer, %error, "http/3 stream ended");
+                    }));
                 }
                 Ok(None) => return,
                 Err(error) => { tracing::debug!(%error, "http/3 connection ended"); return; }
@@ -107,12 +104,8 @@ fn request_length(headers: &HeaderMap) -> Result<Option<u64>, Code> {
     if values.next().is_some() || !value.as_bytes().iter().all(u8::is_ascii_digit) {
         return Err(Code::H3_MESSAGE_ERROR);
     }
-    value
-        .to_str()
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Some)
-        .ok_or(Code::H3_MESSAGE_ERROR)
+    let decimal = value.to_str().map_err(|_| Code::H3_MESSAGE_ERROR)?;
+    decimal.parse().map(Some).map_err(|_| Code::H3_MESSAGE_ERROR)
 }
 
 /// stream data and trailers on demand so upstream flow control reaches the QUIC peer.
@@ -121,28 +114,21 @@ fn upload<S: h3::quic::RecvStream>(
     length: Option<u64>,
     malformed: Rc<Notify>,
 ) -> impl hyper::body::Body<Data = Bytes, Error = io::Error> {
-    let frames = try_unfold(Some((stream, length)), |state| async move {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let frames = try_unfold(Some((stream, length)), move |state| async move {
         let Some((mut stream, mut remaining)) = state else { return Ok(None) };
         if let Some(mut data) = stream.recv_data().await.map_err(io::Error::other)? {
             let size = data.remaining();
             if let Some(left) = &mut remaining {
-                *left = left.checked_sub(size as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "excess HTTP/3 request data",
-                    )
-                })?;
+                *left = left
+                    .checked_sub(size as u64)
+                    .ok_or_else(|| invalid("excess HTTP/3 request data"))?;
             }
-            return Ok(Some((
-                Frame::data(data.copy_to_bytes(size)),
-                Some((stream, remaining)),
-            )));
+            let frame = Frame::data(data.copy_to_bytes(size));
+            return Ok(Some((frame, Some((stream, remaining)))));
         }
         if remaining.is_some_and(|left| left != 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "incomplete HTTP/3 request body",
-            ));
+            return Err(invalid("incomplete HTTP/3 request body"));
         }
         let trailers = stream.recv_trailers().await.map_err(io::Error::other)?;
         if trailers.as_ref().is_some_and(|h| {
@@ -150,10 +136,7 @@ fn upload<S: h3::quic::RecvStream>(
                 || h.contains_key(header::CONTENT_LENGTH)
                 || h.contains_key(header::HOST)
         }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid HTTP/3 trailers",
-            ));
+            return Err(invalid("invalid HTTP/3 trailers"));
         }
         Ok(trailers.map(|h| (Frame::trailers(h), None)))
     });
@@ -222,19 +205,16 @@ async fn respond<S: h3::quic::SendStream<Bytes>>(
         && !parts.status.is_informational()
         && !matches!(parts.status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
     send.send_response(Response::from_parts(parts, ())).await?;
-    if has_body {
-        while let Some(frame) = body.frame().await {
-            match frame?.into_data() {
-                Ok(data) if data.is_empty() => continue,
-                Ok(data) => send.send_data(data).await?,
-                Err(frame) => {
-                    if let Ok(mut trailers) = frame.into_trailers() {
-                        strip_hop_headers(&mut trailers);
-                        send.send_trailers(trailers).await?;
-                        break;
-                    }
-                }
+    while has_body && let Some(frame) = body.frame().await {
+        match frame?.into_data() {
+            Ok(data) if !data.is_empty() => send.send_data(data).await?,
+            Err(frame) => {
+                let Ok(mut trailers) = frame.into_trailers() else { continue };
+                strip_hop_headers(&mut trailers);
+                send.send_trailers(trailers).await?;
+                break;
             }
+            _ => {}
         }
     }
     send.finish().await?;

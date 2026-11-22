@@ -7,7 +7,7 @@ use super::{
     },
     bind_socket,
 };
-use compio::{net::UdpSocket, runtime::time::timeout};
+use compio::{BufResult, net::UdpSocket, runtime::time::timeout};
 use futures::{
     FutureExt, StreamExt,
     future::{AbortHandle, abortable},
@@ -17,7 +17,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -74,18 +74,14 @@ impl Flow {
     /// bind in the backend address family and connect the flow.
     async fn connect(target: SocketAddr, permit: Permit) -> io::Result<Self> {
         let ip = if target.is_ipv4() {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            Ipv4Addr::UNSPECIFIED.into()
         } else {
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            Ipv6Addr::UNSPECIFIED.into()
         };
         let upstream = UdpSocket::bind(SocketAddr::new(ip, 0)).await?;
         upstream.connect(target).await?;
-        Ok(Self {
-            target,
-            upstream,
-            active: Cell::new(Instant::now()),
-            _permit: permit,
-        })
+        let active = Cell::new(Instant::now());
+        Ok(Self { target, upstream, active, _permit: permit })
     }
     /// receive independently of the client's next packet, including multi-datagram replies.
     async fn replies(
@@ -102,14 +98,14 @@ impl Flow {
                 break;
             }
             // the pending compio operation owns its buffer across idle checks.
-            let Ok(compio::BufResult(received, mut packet)) =
+            let Ok(BufResult(received, mut packet)) =
                 timeout(remaining, &mut receiving).await
             else {
                 continue;
             };
             let Ok(len) = received else { break };
             packet.truncate(len);
-            let compio::BufResult(sent, mut packet) = socket.send_to(packet, peer).await;
+            let BufResult(sent, mut packet) = socket.send_to(packet, peer).await;
             if sent.is_err() {
                 break;
             }
@@ -132,19 +128,16 @@ pub async fn serve(
     let mut replies = FuturesUnordered::new();
     let mut receiving = std::pin::pin!(socket.recv_from(Vec::with_capacity(MAX_PACKET)));
     loop {
-        let (received, mut packet) = tokio::select! {
+        let BufResult(received, mut packet) = tokio::select! {
             biased;
             changed = routes.changed() => {
                 if changed.is_err() { return Ok(()) }
                 // a new route may revoke a backend or its ReferenceGrant.
                 let targets: HashSet<_> = routes.borrow_and_update().targets().collect();
                 flows.retain(|_, (flow, abort)| {
-                    if targets.contains(&flow.target) {
-                        true
-                    } else {
-                        abort.abort();
-                        false
-                    }
+                    let keep = targets.contains(&flow.target);
+                    if !keep { abort.abort(); }
+                    keep
                 });
                 continue;
             }
@@ -154,7 +147,7 @@ pub async fn serve(
                 }
                 continue;
             }
-            compio::BufResult(received, packet) = &mut receiving => (received, packet),
+            packet = &mut receiving => packet,
         };
         let (len, peer) = received?;
         packet.truncate(len);
@@ -181,7 +174,7 @@ pub async fn serve(
                     Err(_) => false,
                 }
             {
-                let compio::BufResult(sent, buf) = flow.upstream.send(packet).await;
+                let BufResult(sent, buf) = flow.upstream.send(packet).await;
                 if sent.is_ok() {
                     flow.active.set(Instant::now());
                 }
