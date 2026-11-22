@@ -4,6 +4,7 @@ use super::{
     config::{IpFamily, IpFamilyPolicy, ServiceSettings, ServiceType, Settings},
     service::{GATEWAY_NAME, OWNER},
 };
+use anyhow::{Context, ensure};
 use k8s_openapi::{
     ByteString,
     api::{
@@ -28,9 +29,21 @@ use weiche_gtwapi::v1::gateways::{Gateway, GatewayInfrastructure};
 /// Kubernetes labels or annotations keyed by their qualified names.
 type Tags = BTreeMap<String, String>;
 
+/// omit optional Kubernetes lists when the installation supplies no entries.
+fn nonempty<T>(values: impl ExactSizeIterator<Item = T>) -> Option<Vec<T>> {
+    (values.len() != 0).then(|| values.collect())
+}
+
 /// build Kubernetes string lists from static names and target identifiers.
 fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.map(str::to_owned).into()
+}
+
+/// fill selected optional Kubernetes fields and leave the rest absent from SSA.
+macro_rules! options {
+    ($kind:ident, $($field:ident = $value:expr),+ $(,)?) => {
+        Some($kind { $($field: Some($value),)+ ..Default::default() })
+    };
 }
 
 /// common identity and metadata shared by all resources owned by one Gateway.
@@ -160,7 +173,8 @@ impl Target<'_> {
         let options = &settings.installation;
         let mut node_selector = options.node_selector.clone();
         node_selector.insert("kubernetes.io/os".into(), "linux".into());
-        let mut spec = PodSpec {
+        let host = options.host_network;
+        PodSpec {
             service_account_name: Some(self.name.into()),
             node_selector: Some(node_selector),
             image_pull_secrets: Some(settings.pull_secrets.clone()),
@@ -169,39 +183,31 @@ impl Target<'_> {
             ),
             volumes: Some(vec![Volume {
                 name: "run".into(),
-                empty_dir: Some(EmptyDirVolumeSource {
-                    medium: Some("Memory".into()),
-                    ..Default::default()
-                }),
+                empty_dir: options!(EmptyDirVolumeSource, medium = "Memory".into()),
                 ..Default::default()
             }]),
             containers: vec![self.container(settings)],
-            dns_policy: options.dns_policy.clone(),
-            tolerations: (!options.tolerations.is_empty())
-                .then(|| options.tolerations.clone()),
-            affinity: options.affinity.clone(),
-            topology_spread_constraints: (!options
-                .topology_spread_constraints
-                .is_empty())
-            .then(|| options.topology_spread_constraints.clone()),
-            priority_class_name: options.priority_class_name.clone(),
-            ..Default::default()
-        };
-        if options.host_network {
-            spec.host_network = Some(true);
-            spec.dns_policy
-                .get_or_insert_with(|| "ClusterFirstWithHostNet".into());
-        } else {
-            // the unprivileged port sysctl requires a private network namespace.
-            spec.security_context = Some(PodSecurityContext {
+            host_network: host.then_some(true),
+            dns_policy: options
+                .dns_policy
+                .clone()
+                .or_else(|| host.then(|| "ClusterFirstWithHostNet".into())),
+            // the port sysctl requires a private network namespace.
+            security_context: (!host).then(|| PodSecurityContext {
                 sysctls: Some(vec![Sysctl {
                     name: "net.ipv4.ip_unprivileged_port_start".into(),
                     value: "0".into(),
                 }]),
                 ..Default::default()
-            });
+            }),
+            tolerations: nonempty(options.tolerations.iter().cloned()),
+            affinity: options.affinity.clone(),
+            topology_spread_constraints: nonempty(
+                options.topology_spread_constraints.iter().cloned(),
+            ),
+            priority_class_name: options.priority_class_name.clone(),
+            ..Default::default()
         }
-        spec
     }
 
     /// configure the proxy process, readiness command and container privileges.
@@ -211,7 +217,7 @@ impl Target<'_> {
             name: "proxy".into(),
             image: Some(settings.image.clone()),
             image_pull_policy: Some(settings.pull_policy.clone()),
-            args: Some(vec!["proxy".into(), self.name.into()]),
+            args: Some(strings(["proxy", self.name])),
             resources: Some(settings.resources.clone()),
             env: Some(proxy_env(settings)),
             volume_mounts: Some(vec![VolumeMount {
@@ -219,25 +225,25 @@ impl Target<'_> {
                 mount_path: "/run/weiche".into(),
                 ..Default::default()
             }]),
-            readiness_probe: Some(Probe {
-                exec: Some(ExecAction {
-                    command: Some(vec!["/usr/local/bin/weiche".into(), "ready".into()]),
-                }),
-                period_seconds: Some(1),
-                failure_threshold: Some(1),
-                ..Default::default()
-            }),
-            security_context: Some(SecurityContext {
-                run_as_non_root: Some(true),
-                run_as_user: Some(65532),
-                allow_privilege_escalation: Some(false),
-                capabilities: Some(Capabilities {
-                    drop: Some(vec!["ALL".into()]),
-                    add: options.host_network.then(|| vec!["NET_BIND_SERVICE".into()]),
-                }),
-                seccomp_profile: Some(settings.seccomp_profile.clone()),
-                ..Default::default()
-            }),
+            readiness_probe: options!(
+                Probe,
+                exec = ExecAction {
+                    command: Some(strings(["/usr/local/bin/weiche", "ready"]))
+                },
+                period_seconds = 1,
+                failure_threshold = 1
+            ),
+            security_context: options!(
+                SecurityContext,
+                run_as_non_root = true,
+                run_as_user = 65532,
+                allow_privilege_escalation = false,
+                capabilities = Capabilities {
+                    drop: Some(strings(["ALL"])),
+                    add: options.host_network.then(|| strings(["NET_BIND_SERVICE"])),
+                },
+                seccomp_profile = settings.seccomp_profile.clone()
+            ),
             ..Default::default()
         }
     }
@@ -265,9 +271,7 @@ impl Target<'_> {
         let mut spec = ServiceSpec {
             type_: Some(settings.r#type.as_str().into()),
             ip_family_policy: Some(settings.ip_family_policy.as_str().into()),
-            ip_families: (!settings.ip_families.is_empty()).then(|| {
-                settings.ip_families.iter().map(|f| f.as_str().into()).collect()
-            }),
+            ip_families: nonempty(settings.ip_families.iter().map(|f| f.as_str().into())),
             external_traffic_policy: settings
                 .external_traffic_policy
                 .map(|p| p.as_str().into()),
@@ -295,6 +299,7 @@ impl Target<'_> {
 /// assemble the proxy environment with platform-supplied overrides in declaration order.
 fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
     let options = &settings.installation;
+    let binding = &options.provisioner_binding;
     let literal = |name: &str, value: String| EnvVar {
         name: name.into(),
         value: Some(value),
@@ -302,16 +307,16 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
     };
     let mut env = vec![
         literal("WEICHE_WORKERS", settings.workers.to_string()),
-        literal("WEICHE_PROVISIONER_BINDING", options.provisioner_binding.clone()),
+        literal("WEICHE_PROVISIONER_BINDING", binding.clone()),
         EnvVar {
             name: "POD_UID".into(),
-            value_from: Some(EnvVarSource {
-                field_ref: Some(ObjectFieldSelector {
+            value_from: options!(
+                EnvVarSource,
+                field_ref = ObjectFieldSelector {
                     field_path: "metadata.uid".into(),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }),
+                }
+            ),
             ..Default::default()
         },
     ];
@@ -321,13 +326,13 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
             env.push(literal("WEICHE_HTTP3_PORT", port.to_string()));
         }
     }
-    if !options.log.level.is_empty()
-        && !options.extra_env.iter().any(|var| var.name == "RUST_LOG")
-    {
-        env.push(literal("RUST_LOG", options.log.level.clone()));
-    }
-    if !options.extra_env.iter().any(|var| var.name == "WEICHE_LOG_FORMAT") {
-        env.push(literal("WEICHE_LOG_FORMAT", options.log.format.as_str().into()));
+    for (name, value) in [
+        ("RUST_LOG", options.log.level.as_str()),
+        ("WEICHE_LOG_FORMAT", options.log.format.as_str()),
+    ] {
+        if !value.is_empty() && !options.extra_env.iter().any(|var| var.name == name) {
+            env.push(literal(name, value.into()));
+        }
     }
     env.extend_from_slice(&options.extra_env);
     env
@@ -342,58 +347,53 @@ fn ip_family(ip: IpAddr) -> IpFamily {
 pub fn requested_addresses(
     gateway: &Gateway,
     service: &ServiceSettings,
-) -> Result<Vec<IpAddr>, String> {
+) -> anyhow::Result<Vec<IpAddr>> {
     let mut ips = Vec::new();
-    for addr in gateway.spec.addresses.as_deref().unwrap_or_default() {
-        let kind = addr.r#type.as_deref().unwrap_or("IPAddress");
-        if kind != "IPAddress" {
-            return Err("only IPAddress gateway addresses are supported".into());
-        }
-        let Some(raw) = addr.value.as_deref().filter(|v| !v.is_empty()) else {
-            return Err("requested gateway address value is required".into());
-        };
+    for addr in gateway.spec.addresses.iter().flatten() {
+        ensure!(
+            addr.r#type.as_deref().unwrap_or("IPAddress") == "IPAddress",
+            "only IPAddress gateway addresses are supported"
+        );
+        let raw = addr
+            .value
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .context("requested gateway address value is required")?;
         let ip: IpAddr = raw
             .parse()
-            .map_err(|_| format!("invalid gateway IP address: {raw}"))?;
-        if ips.contains(&ip) {
-            return Err(format!("duplicate gateway IP address: {ip}"));
-        }
+            .with_context(|| format!("invalid gateway IP address: {raw}"))?;
+        ensure!(!ips.contains(&ip), "duplicate gateway IP address: {ip}");
         ips.push(ip);
     }
-    if ips.is_empty() {
-        return Ok(ips);
-    }
+    let configured = &service.ip_families;
     if service.r#type == ServiceType::LoadBalancer {
-        if ips.len() > 1 {
-            return Err(
-                "LoadBalancer Service supports at most one requested IP address".into()
-            );
-        }
-        if !service.ip_families.is_empty()
-            && !service.ip_families.contains(&ip_family(ips[0]))
-        {
-            return Err("requested IP family does not match service ipFamilies".into());
-        }
-        return Ok(ips);
-    }
-    if ips.len() > 2
-        || (service.ip_family_policy == IpFamilyPolicy::SingleStack && ips.len() > 1)
-        || (ips.len() == 2 && ips[0].is_ipv4() == ips[1].is_ipv4())
-    {
-        return Err(
-            "requested gateway addresses are incompatible with Service IP families"
-                .into(),
+        ensure!(
+            ips.len() <= 1,
+            "LoadBalancer Service supports at most one requested IP address"
         );
-    }
-    if !service.ip_families.is_empty()
-        && (ips.len() > service.ip_families.len()
-            || ips
-                .iter()
-                .zip(&service.ip_families)
-                .any(|(ip, family)| ip_family(*ip) != *family))
-    {
-        return Err(
-            "requested IP families do not match configured service ipFamilies".into()
+        ensure!(
+            configured.is_empty()
+                || ips.first().is_none_or(|ip| configured.contains(&ip_family(*ip))),
+            "requested IP family does not match service ipFamilies"
+        );
+    } else {
+        let compatible = match ips.as_slice() {
+            [] | [_] => true,
+            [a, b] => {
+                service.ip_family_policy != IpFamilyPolicy::SingleStack
+                    && a.is_ipv4() != b.is_ipv4()
+            }
+            _ => false,
+        };
+        ensure!(
+            compatible,
+            "requested gateway addresses are incompatible with Service IP families"
+        );
+        let families = ips.iter().copied().map(ip_family);
+        ensure!(
+            configured.is_empty()
+                || configured.iter().copied().take(ips.len()).eq(families),
+            "requested IP families do not match configured service ipFamilies"
         );
     }
     Ok(ips)

@@ -126,7 +126,7 @@ pub async fn reconcile(
         Ok(ips) => Some(ips),
         Err(message) => {
             plan.issue_reason = Some("AddressNotAssigned");
-            plan.issue = Some(message);
+            plan.issue = Some(message.to_string());
             None
         }
     };
