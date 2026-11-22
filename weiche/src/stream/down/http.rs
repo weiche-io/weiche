@@ -5,7 +5,7 @@ use super::super::{
         rtconf::RuntimeConfig,
     },
     core::{http::ProxyService, tcp::Permit},
-    io::{Io, socket},
+    io::Io,
 };
 use super::tls;
 use compio::{net::TcpStream, runtime::time::timeout};
@@ -57,13 +57,6 @@ impl Server {
             return;
         }
         let (stream, builder) = if listener.tls {
-            let stream = match socket(stream) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
-                    return;
-                }
-            };
             let handshake = tokio::select! {
                 _ = shutdown.changed() => return,
                 result = timeout(self.handshake_timeout, tls::accept(stream, &certs)) => result,
@@ -79,13 +72,13 @@ impl Server {
                     return;
                 }
             };
-            let h2 = stream.negotiated_alpn().as_deref() == Some(b"h2");
+            let h2 = stream.negotiated_alpn() == Some(b"h2");
             let builder = if h2 {
                 self.builder.clone().http2_only()
             } else {
                 self.builder.clone().http1_only()
             };
-            (stream, builder)
+            (Io::tls(stream), builder)
         } else {
             let stream = match Io::plain(stream) {
                 Ok(stream) => stream,

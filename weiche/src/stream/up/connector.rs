@@ -1,9 +1,6 @@
 //! upstream HTTP client handshakes and connections on the owning compio runtime.
 use super::{
-    super::{
-        core::EndpointKey,
-        io::{Io, socket},
-    },
+    super::{core::EndpointKey, io::Io},
     tls,
 };
 use bytes::Bytes;
@@ -64,9 +61,7 @@ impl Connector {
     async fn open(&self, endpoint: &EndpointKey) -> anyhow::Result<Io> {
         let stream = TcpStream::connect(endpoint.address).await?;
         match &endpoint.tls {
-            Some(settings) => {
-                tls::connect(socket(stream)?, settings, endpoint.protocol).await
-            }
+            Some(settings) => tls::connect(stream, settings, endpoint.protocol).await,
             None => Ok(Io::plain(stream)?),
         }
     }

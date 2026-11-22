@@ -1,25 +1,22 @@
 //! adapt compio sockets for worker-local HTTP and TLS connections.
 mod plain;
+mod tls;
 
 pub use plain::PlainIo;
+pub use tls::{AcceptedTls, TlsIo};
 
-use compio::{net::TcpStream, runtime::fd::PollFd};
-use cyper_core::HyperStream;
+use compio::net::TcpStream;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use std::{
-    borrow::Cow,
     io::{self, IoSlice},
     pin::Pin,
     task::{Context, Poll},
 };
 
-/// nonblocking readiness socket used by the TLS driver.
-pub type Socket = PollFd<socket2::Socket>;
-
-/// worker-local HTTP transport covering plain TCP and TLS connections.
+/// worker-local HTTP transport covering plain TCP and io_uring TLS connections.
 pub enum Io {
     Plain(PlainIo),
-    Tls(Box<HyperStream<Socket>>),
+    Tls(Box<TlsIo>),
 }
 
 impl Io {
@@ -28,19 +25,10 @@ impl Io {
         Ok(Self::Plain(PlainIo::new(stream)?))
     }
 
-    /// return the negotiated ALPN protocol when running over TLS.
-    pub fn negotiated_alpn(&self) -> Option<Cow<'_, [u8]>> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Tls(stream) => stream.negotiated_alpn(),
-        }
+    /// wrap a completed io_uring TLS transport.
+    pub fn tls(stream: TlsIo) -> Self {
+        Self::Tls(Box::new(stream))
     }
-}
-
-/// prepare a nonblocking PollFd socket for TLS handshakes.
-pub fn socket(stream: TcpStream) -> io::Result<Socket> {
-    stream.set_nodelay(true)?;
-    stream.into_poll_fd()
 }
 
 impl Read for Io {
