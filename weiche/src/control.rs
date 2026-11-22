@@ -1,6 +1,7 @@
 //! maintain Kubernetes watches and their live resource caches.
 mod compile;
 mod config;
+mod manifest;
 mod provision;
 mod reconcile;
 mod resolve;

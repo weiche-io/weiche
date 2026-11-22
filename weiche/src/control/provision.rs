@@ -5,7 +5,8 @@ use super::{
         wire::{self, SNAPSHOT_KEY},
     },
     GatewayStores,
-    config::{ServiceSettings, Settings},
+    config::Settings,
+    manifest::{Target, requested_addresses},
     service::{GATEWAY_NAME, OWNER, Plan, controlled_by},
 };
 use anyhow::{Context, ensure};
@@ -16,7 +17,6 @@ use k8s_openapi::{
         core::v1::{ConfigMap, Secret, Service, ServiceAccount},
         rbac::v1::{Role, RoleBinding},
     },
-    apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -26,29 +26,12 @@ use kube::{
     },
     runtime::reflector::ObjectRef,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
     time::{Duration, Instant},
 };
-use weiche_gtwapi::v1::gateways::{Gateway, GatewayInfrastructure};
-
-/// common identity and metadata shared by all resources owned by one Gateway.
-struct Target<'a> {
-    /// gateway namespace hosting the provisioned resources.
-    namespace: &'a str,
-    /// deterministic resource name (`weiche-gw-<uid>`).
-    name: &'a str,
-    /// gateway name used in the standard infrastructure label.
-    gateway_name: &'a str,
-    /// release instance label isolating multi-release ownership.
-    instance: &'a str,
-    /// controller ownerReference pointing back to the Gateway.
-    owner: &'a OwnerReference,
-    /// optional Gateway-level labels and annotations to propagate.
-    infra: Option<&'a GatewayInfrastructure>,
-}
 
 /// cache manifest digests until the next drift check.
 #[derive(Default)]
@@ -74,9 +57,10 @@ impl Applied {
         &mut self,
         client: &Client,
         target: &Target<'_>,
-        mut fields: Value,
+        manifest: impl Serialize,
     ) -> anyhow::Result<()> {
         let kind = ApiResource::erase::<K>(&());
+        let mut fields = serde_json::to_value(manifest)?;
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
         if let Some(infra) = target.infra {
@@ -216,7 +200,7 @@ pub async fn reconcile(
         .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
         .await?;
     let replicas = if active { settings.replicas } else { 0 };
-    let selector = json!({(OWNER):uid});
+    let selector = json!(target.selector());
     applied
         .ensure::<Deployment>(
             client,
@@ -231,7 +215,7 @@ pub async fn reconcile(
             .ensure::<Service>(
                 client,
                 &target,
-                proxy_service(&selector, ports, settings, &ips),
+                target.service(ports, &settings.service, &ips),
             )
             .await?;
     }
@@ -351,72 +335,6 @@ fn proxy_role_binding(name: &str, namespace: &str) -> Value {
             "namespace": namespace,
         }],
     })
-}
-
-/// return the Kubernetes IP family name for an IP address.
-fn ip_family(ip: IpAddr) -> &'static str {
-    if ip.is_ipv4() { "IPv4" } else { "IPv6" }
-}
-
-/// validate and parse optional static IP addresses requested in `Gateway.spec.addresses`.
-fn requested_addresses(
-    gateway: &Gateway,
-    service: &ServiceSettings,
-) -> Result<Vec<IpAddr>, String> {
-    let mut ips = Vec::new();
-    for addr in gateway.spec.addresses.as_deref().unwrap_or_default() {
-        let kind = addr.r#type.as_deref().unwrap_or("IPAddress");
-        if kind != "IPAddress" {
-            return Err("only IPAddress gateway addresses are supported".into());
-        }
-        let Some(raw) = addr.value.as_deref().filter(|v| !v.is_empty()) else {
-            return Err("requested gateway address value is required".into());
-        };
-        let ip: IpAddr = raw
-            .parse()
-            .map_err(|_| format!("invalid gateway IP address: {raw}"))?;
-        if ips.contains(&ip) {
-            return Err(format!("duplicate gateway IP address: {ip}"));
-        }
-        ips.push(ip);
-    }
-    if ips.is_empty() {
-        return Ok(ips);
-    }
-    if service.r#type == "LoadBalancer" {
-        if ips.len() > 1 {
-            return Err(
-                "LoadBalancer Service supports at most one requested IP address".into()
-            );
-        }
-        if !service.ip_families.is_empty()
-            && !service.ip_families.iter().any(|f| f == ip_family(ips[0]))
-        {
-            return Err("requested IP family does not match service ipFamilies".into());
-        }
-        return Ok(ips);
-    }
-    if ips.len() > 2
-        || (service.ip_family_policy == "SingleStack" && ips.len() > 1)
-        || (ips.len() == 2 && ips[0].is_ipv4() == ips[1].is_ipv4())
-    {
-        return Err(
-            "requested gateway addresses are incompatible with Service IP families"
-                .into(),
-        );
-    }
-    if !service.ip_families.is_empty()
-        && (ips.len() > service.ip_families.len()
-            || ips
-                .iter()
-                .zip(&service.ip_families)
-                .any(|(ip, family)| ip_family(*ip) != family))
-    {
-        return Err(
-            "requested IP families do not match configured service ipFamilies".into()
-        );
-    }
-    Ok(ips)
 }
 
 /// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
@@ -545,41 +463,6 @@ fn proxy_deployment(
             },
         }
     })
-}
-
-/// render the per-Gateway Kubernetes Service with configured IP family and address policy.
-fn proxy_service(
-    selector: &Value,
-    ports: Vec<Value>,
-    settings: &Settings,
-    requested_ips: &[IpAddr],
-) -> Value {
-    let mut spec = json!({
-        "type": settings.service.r#type,
-        "ipFamilyPolicy": settings.service.ip_family_policy,
-        "selector": selector,
-        "ports": ports,
-    });
-    if !settings.service.ip_families.is_empty() {
-        spec["ipFamilies"] = json!(settings.service.ip_families);
-    }
-    if let Some(policy) = &settings.service.external_traffic_policy {
-        spec["externalTrafficPolicy"] = json!(policy);
-    }
-    if !requested_ips.is_empty() {
-        if settings.service.r#type == "LoadBalancer" {
-            spec["loadBalancerIP"] = json!(requested_ips[0].to_string());
-        } else {
-            let ips: Vec<_> = requested_ips.iter().map(ToString::to_string).collect();
-            spec["clusterIP"] = json!(ips[0]);
-            spec["clusterIPs"] = json!(ips);
-        }
-    }
-    let mut service = json!({"spec": spec});
-    if !settings.service.annotations.is_empty() {
-        service["metadata"]["annotations"] = json!(settings.service.annotations);
-    }
-    service
 }
 
 /// delete the observed resource only while its gateway ownership still matches.

@@ -131,7 +131,7 @@ impl Plan {
     }
 
     /// expose each accepted port once across virtual hosts sharing a transport.
-    pub fn ports(&self, http3: bool) -> Vec<serde_json::Value> {
+    pub fn ports(&self, http3: bool) -> Vec<(Transport, u16)> {
         let mut ports = BTreeSet::new();
         for (listener, result) in self
             .gateway
@@ -146,12 +146,6 @@ impl Plan {
                 ports.insert((Transport::Udp, listener.port));
             }
         }
-        ports.into_iter().map(|(transport, port)| {
-            let protocol = transport.protocol();
-            serde_json::json!({
-                "name": format!("{}-{port}", protocol.to_ascii_lowercase()), "port":port,
-                "protocol":protocol, "targetPort":port,
-            })
-        }).collect()
+        ports.into_iter().collect()
     }
 }
