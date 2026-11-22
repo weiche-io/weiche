@@ -29,8 +29,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     time::{Duration, Instant},
 };
+use weiche_gtwapi::v1::gateways::{Gateway, GatewayInfrastructure};
 
 /// default Helm release instance label for generated workloads.
 fn default_release() -> String {
@@ -67,6 +69,11 @@ fn default_log_format() -> String {
     "text".into()
 }
 
+/// default Kubernetes IP family policy for Gateway Services.
+fn default_ip_family_policy() -> String {
+    "PreferDualStack".into()
+}
+
 /// platform logging defaults for provisioned proxy containers.
 #[derive(Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -82,6 +89,34 @@ impl Default for LogSettings {
         Self {
             level: default_log_level(),
             format: default_log_format(),
+        }
+    }
+}
+
+/// platform networking defaults for provisioned Gateway Services.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ServiceSettings {
+    /// Kubernetes Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
+    pub r#type: String,
+    /// Kubernetes IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
+    pub ip_family_policy: String,
+    /// optional ordered IP families (`IPv4`, `IPv6`).
+    pub ip_families: Vec<String>,
+    /// optional external traffic policy (`Cluster` or `Local`) for LoadBalancer or NodePort.
+    pub external_traffic_policy: Option<String>,
+    /// default annotations merged onto every Gateway Service.
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for ServiceSettings {
+    fn default() -> Self {
+        Self {
+            r#type: String::new(),
+            ip_family_policy: default_ip_family_policy(),
+            ip_families: Vec::new(),
+            external_traffic_policy: None,
+            annotations: BTreeMap::new(),
         }
     }
 }
@@ -103,7 +138,7 @@ pub struct Settings {
     #[serde(default = "default_provisioner_binding")]
     pub provisioner_binding: String,
     /// local IP address bound by proxy listeners.
-    pub bind_address: std::net::IpAddr,
+    pub bind_address: IpAddr,
     /// namespaces authorized to host Gateway proxy workloads.
     pub namespaces: BTreeSet<String>,
     /// container image rendered into per-Gateway proxy Deployments.
@@ -156,14 +191,25 @@ pub struct Settings {
     /// extra environment variables appended to proxy containers.
     #[serde(default)]
     extra_env: Vec<EnvVar>,
-    /// Kubernetes Service type provisioned for each Gateway.
-    service_type: String,
+    /// Service networking defaults for every Gateway.
+    #[serde(default)]
+    service: ServiceSettings,
+    /// legacy flat serviceType field retained for backward compatibility.
+    #[serde(default)]
+    service_type: Option<String>,
 }
 impl Settings {
     /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
         let mut settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
+        if settings.service.r#type.is_empty() {
+            settings.service.r#type =
+                settings.service_type.take().unwrap_or_else(|| "ClusterIP".into());
+        }
+        if settings.service.external_traffic_policy.as_deref() == Some("") {
+            settings.service.external_traffic_policy = None;
+        }
         if settings.dns_policy.as_deref() == Some("") {
             settings.dns_policy = None;
         }
@@ -186,9 +232,44 @@ impl Settings {
             "unsupported proxy log format"
         );
         ensure!(
-            matches!(settings.service_type.as_str(), "ClusterIP" | "LoadBalancer"),
+            matches!(
+                settings.service.r#type.as_str(),
+                "ClusterIP" | "LoadBalancer" | "NodePort"
+            ),
             "unsupported gateway service type"
         );
+        ensure!(
+            matches!(
+                settings.service.ip_family_policy.as_str(),
+                "SingleStack" | "PreferDualStack" | "RequireDualStack"
+            ),
+            "unsupported gateway service ipFamilyPolicy"
+        );
+        let mut seen = BTreeSet::new();
+        for family in &settings.service.ip_families {
+            ensure!(
+                matches!(family.as_str(), "IPv4" | "IPv6")
+                    && seen.insert(family.as_str()),
+                "invalid gateway service ipFamilies"
+            );
+        }
+        ensure!(
+            !(settings.service.ip_family_policy == "SingleStack"
+                && settings.service.ip_families.len() > 1)
+                && !(settings.service.ip_family_policy == "RequireDualStack"
+                    && settings.service.ip_families.len() == 1),
+            "gateway service ipFamilies conflicts with ipFamilyPolicy"
+        );
+        if let Some(policy) = settings.service.external_traffic_policy.as_deref() {
+            ensure!(
+                matches!(policy, "Cluster" | "Local")
+                    && matches!(
+                        settings.service.r#type.as_str(),
+                        "LoadBalancer" | "NodePort"
+                    ),
+                "invalid gateway service externalTrafficPolicy"
+            );
+        }
         ensure!(
             !settings.extra_env.iter().any(|var| matches!(
                 var.name.as_str(),
@@ -198,6 +279,20 @@ impl Settings {
         );
         Ok(settings)
     }
+}
+
+/// common identity and metadata shared by all resources owned by one Gateway.
+struct Target<'a> {
+    /// gateway namespace hosting the provisioned resources.
+    namespace: &'a str,
+    /// deterministic resource name (`weiche-gw-<uid>`).
+    name: &'a str,
+    /// Helm release instance label isolating multi-release ownership.
+    instance: &'a str,
+    /// controller ownerReference pointing back to the Gateway.
+    owner: &'a Value,
+    /// optional Gateway-level labels and annotations to propagate.
+    infra: Option<&'a GatewayInfrastructure>,
 }
 
 /// cache successful applies; periodically recheck for external drift.
@@ -212,39 +307,61 @@ impl Applied {
     async fn ensure<K: Resource<DynamicType = ()>>(
         &mut self,
         client: &Client,
-        namespace: &str,
-        name: &str,
-        instance: &str,
-        owner: &Value,
+        target: &Target<'_>,
         mut fields: Value,
     ) -> anyhow::Result<()> {
         let kind = ApiResource::erase::<K>(&());
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
+        if let Some(infra) = target.infra {
+            if let Some(labels) = &infra.labels {
+                for (k, v) in labels {
+                    fields["metadata"]["labels"][k] = json!(v);
+                }
+            }
+            if let Some(annotations) = &infra.annotations {
+                for (k, v) in annotations {
+                    fields["metadata"]["annotations"][k] = json!(v);
+                }
+            }
+        }
         fields["metadata"]["labels"]["app.kubernetes.io/managed-by"] = json!("weiche");
-        fields["metadata"]["labels"]["app.kubernetes.io/instance"] = json!(instance);
-        fields["metadata"]["name"] = json!(name);
-        fields["metadata"]["namespace"] = json!(namespace);
-        fields["metadata"]["ownerReferences"] = json!([owner]);
-        let key = (namespace.to_owned(), name.to_owned(), kind.kind.clone());
+        fields["metadata"]["labels"]["app.kubernetes.io/instance"] =
+            json!(target.instance);
+        fields["metadata"]["name"] = json!(target.name);
+        fields["metadata"]["namespace"] = json!(target.namespace);
+        fields["metadata"]["ownerReferences"] = json!([target.owner]);
+        let key =
+            (target.namespace.to_owned(), target.name.to_owned(), kind.kind.clone());
         let digest = wire::version(&serde_json::to_vec(&fields)?);
         if self.0.get(&key).is_some_and(|(old, _)| old == &digest) {
             return Ok(());
         }
-        let api = Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &kind);
-        if let Some(old) = api.get_opt(name).await? {
+        let api = Api::<DynamicObject>::namespaced_with(
+            client.clone(),
+            target.namespace,
+            &kind,
+        );
+        if let Some(old) = api.get_opt(target.name).await? {
             ensure!(
                 old.owner_references()
                     .iter()
-                    .any(|r| r.controller == Some(true) && json!(r.uid) == owner["uid"]),
-                "{} {namespace}/{name} has another owner",
-                kind.kind
+                    .any(|r| r.controller == Some(true)
+                        && json!(r.uid) == target.owner["uid"]),
+                "{} {}/{} has another owner",
+                kind.kind,
+                target.namespace,
+                target.name
             );
             // pin the checked object across replacement while allowing other field managers
             // to update their own fields, including the proxy's ConfigMap acknowledgements.
             fields["metadata"]["uid"] = json!(old.uid().context("missing workload uid")?);
-            api.patch(name, &PatchParams::apply("weiche").force(), &Patch::Apply(fields))
-                .await?;
+            api.patch(
+                target.name,
+                &PatchParams::apply("weiche").force(),
+                &Patch::Apply(fields),
+            )
+            .await?;
         } else {
             let params = PostParams {
                 field_manager: Some("weiche".into()),
@@ -281,69 +398,51 @@ pub async fn reconcile(
         GatewaySnapshot::default().encode()
     })?;
     let revision = wire::version(&payload);
-    applied
-        .ensure::<ConfigMap>(client, &ns, &name, &settings.release, &owner, json!({}))
-        .await?;
+    let infra = g.spec.infrastructure.as_ref();
+    let requested_ips = match requested_addresses(g, &settings.service) {
+        Ok(ips) => ips,
+        Err(message) => {
+            plan.issue_reason = Some("AddressNotAssigned");
+            plan.issue = Some(message);
+            return Ok(());
+        }
+    };
+    let target = Target {
+        namespace: &ns,
+        name: &name,
+        instance: &settings.release,
+        owner: &owner,
+        infra,
+    };
+    applied.ensure::<ConfigMap>(client, &target, json!({})).await?;
     applied
         .ensure::<Secret>(
             client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
+            &target,
             json!({
                 "type":"weiche.io/snapshot", "data":{(SNAPSHOT_KEY):ByteString(payload)}
             }),
         )
         .await?;
+    applied.ensure::<ServiceAccount>(client, &target, json!({})).await?;
     applied
-        .ensure::<ServiceAccount>(
-            client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
-            json!({}),
-        )
+        .ensure::<Role>(client, &target, proxy_role(&name, &settings.provisioner_binding))
         .await?;
     applied
-        .ensure::<Role>(
-            client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
-            proxy_role(&name, &settings.provisioner_binding),
-        )
-        .await?;
-    applied
-        .ensure::<RoleBinding>(
-            client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
-            proxy_role_binding(&name, &ns),
-        )
+        .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
         .await?;
     applied
         .ensure::<Deployment>(
             client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
-            proxy_deployment(&name, &uid, &labels, settings),
+            &target,
+            proxy_deployment(&name, &uid, &labels, settings, infra),
         )
         .await?;
     applied
         .ensure::<Service>(
             client,
-            &ns,
-            &name,
-            &settings.release,
-            &owner,
-            proxy_service(&labels, plan.ports(), settings),
+            &target,
+            proxy_service(&labels, plan.ports(), settings, &requested_ips),
         )
         .await?;
     let Some(service) = stores.services.get(&ObjectRef::new(&name).within(&ns)) else {
@@ -356,7 +455,7 @@ pub async fn reconcile(
     {
         return Ok(());
     }
-    plan.addresses = if settings.service_type == "LoadBalancer" {
+    plan.addresses = if settings.service.r#type == "LoadBalancer" {
         service
             .status
             .as_ref()
@@ -471,17 +570,92 @@ fn proxy_role_binding(name: &str, namespace: &str) -> Value {
     })
 }
 
-/// render the per-Gateway proxy Deployment using platform scheduling and runtime settings.
+/// return the Kubernetes IP family name for an IP address.
+fn ip_family(ip: IpAddr) -> &'static str {
+    if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+}
+
+/// validate and parse optional static IP addresses requested in `Gateway.spec.addresses`.
+fn requested_addresses(
+    gateway: &Gateway,
+    service: &ServiceSettings,
+) -> Result<Vec<IpAddr>, String> {
+    let mut ips = Vec::new();
+    for addr in gateway.spec.addresses.as_deref().unwrap_or_default() {
+        let kind = addr.r#type.as_deref().unwrap_or("IPAddress");
+        if kind != "IPAddress" {
+            return Err("only IPAddress gateway addresses are supported".into());
+        }
+        let Some(raw) = addr.value.as_deref().filter(|v| !v.is_empty()) else {
+            return Err("requested gateway address value is required".into());
+        };
+        let ip: IpAddr = raw
+            .parse()
+            .map_err(|_| format!("invalid gateway IP address: {raw}"))?;
+        if ips.contains(&ip) {
+            return Err(format!("duplicate gateway IP address: {ip}"));
+        }
+        ips.push(ip);
+    }
+    if ips.is_empty() {
+        return Ok(ips);
+    }
+    if service.r#type == "LoadBalancer" {
+        if ips.len() > 1 {
+            return Err(
+                "LoadBalancer Service supports at most one requested IP address".into()
+            );
+        }
+        if !service.ip_families.is_empty()
+            && !service.ip_families.iter().any(|f| f == ip_family(ips[0]))
+        {
+            return Err("requested IP family does not match service ipFamilies".into());
+        }
+        return Ok(ips);
+    }
+    if ips.len() > 2
+        || (service.ip_family_policy == "SingleStack" && ips.len() > 1)
+        || (ips.len() == 2 && ips[0].is_ipv4() == ips[1].is_ipv4())
+    {
+        return Err(
+            "requested gateway addresses are incompatible with Service IP families"
+                .into(),
+        );
+    }
+    if !service.ip_families.is_empty()
+        && (ips.len() > service.ip_families.len()
+            || ips
+                .iter()
+                .zip(&service.ip_families)
+                .any(|(ip, family)| ip_family(*ip) != family))
+    {
+        return Err(
+            "requested IP families do not match configured service ipFamilies".into()
+        );
+    }
+    Ok(ips)
+}
+
+/// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
 fn proxy_deployment(
     name: &str,
     uid: &str,
     selector: &Value,
     settings: &Settings,
+    infra: Option<&GatewayInfrastructure>,
 ) -> Value {
     let mut pod_labels = settings.pod_labels.clone();
+    if let Some(labels) = infra.and_then(|i| i.labels.as_ref()) {
+        pod_labels.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
     pod_labels.insert(OWNER.into(), uid.into());
     pod_labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
     pod_labels.insert("app.kubernetes.io/instance".into(), settings.release.clone());
+
+    let mut pod_annotations = settings.pod_annotations.clone();
+    if let Some(annotations) = infra.and_then(|i| i.annotations.as_ref()) {
+        pod_annotations.extend(annotations.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
 
     let mut node_selector = settings.node_selector.clone();
     node_selector.insert("kubernetes.io/os".into(), "linux".into());
@@ -567,8 +741,8 @@ fn proxy_deployment(
     }
 
     let mut pod_meta = json!({"labels": pod_labels});
-    if !settings.pod_annotations.is_empty() {
-        pod_meta["annotations"] = json!(settings.pod_annotations);
+    if !pod_annotations.is_empty() {
+        pod_meta["annotations"] = json!(pod_annotations);
     }
     json!({
         "spec": {
@@ -582,13 +756,37 @@ fn proxy_deployment(
     })
 }
 
-fn proxy_service(labels: &Value, ports: Vec<Value>, settings: &Settings) -> Value {
-    json!({
-        "spec": {
-            "type": settings.service_type,
-            "ipFamilyPolicy": "PreferDualStack",
-            "selector": labels,
-            "ports": ports,
+/// render the per-Gateway Kubernetes Service with configured IP family and address policy.
+fn proxy_service(
+    selector: &Value,
+    ports: Vec<Value>,
+    settings: &Settings,
+    requested_ips: &[IpAddr],
+) -> Value {
+    let mut spec = json!({
+        "type": settings.service.r#type,
+        "ipFamilyPolicy": settings.service.ip_family_policy,
+        "selector": selector,
+        "ports": ports,
+    });
+    if !settings.service.ip_families.is_empty() {
+        spec["ipFamilies"] = json!(settings.service.ip_families);
+    }
+    if let Some(policy) = &settings.service.external_traffic_policy {
+        spec["externalTrafficPolicy"] = json!(policy);
+    }
+    if !requested_ips.is_empty() {
+        if settings.service.r#type == "LoadBalancer" {
+            spec["loadBalancerIP"] = json!(requested_ips[0].to_string());
+        } else {
+            let ips: Vec<_> = requested_ips.iter().map(ToString::to_string).collect();
+            spec["clusterIP"] = json!(ips[0]);
+            spec["clusterIPs"] = json!(ips);
         }
-    })
+    }
+    let mut service = json!({"spec": spec});
+    if !settings.service.annotations.is_empty() {
+        service["metadata"]["annotations"] = json!(settings.service.annotations);
+    }
+    service
 }

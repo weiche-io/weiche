@@ -289,6 +289,8 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 accepted,
                 if plan.denied {
                     "NamespaceNotAllowed"
+                } else if plan.invalid_parameters {
+                    "InvalidParameters"
                 } else if all_valid {
                     "Accepted"
                 } else {
@@ -296,6 +298,8 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 },
                 if plan.denied {
                     "gateway namespace is outside the configured deployment scope"
+                } else if plan.invalid_parameters {
+                    "gateway infrastructure parametersRef is not supported"
                 } else {
                     "evaluated gateway listeners"
                 },
@@ -307,7 +311,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
                 if programmed {
                     "Programmed"
                 } else if plan.issue.is_some() {
-                    "NoResources"
+                    plan.issue_reason.unwrap_or("NoResources")
                 } else {
                     "Pending"
                 },

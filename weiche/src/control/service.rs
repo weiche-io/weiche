@@ -24,6 +24,10 @@ pub struct Plan {
     pub programmed: bool,
     /// whether the gateway is outside the deployment scope.
     pub denied: bool,
+    /// whether the gateway requested unsupported infrastructure parameters.
+    pub invalid_parameters: bool,
+    /// gateway API reason paired with an observed provisioning failure.
+    pub issue_reason: Option<&'static str>,
     /// provisioning failure to report on the gateway.
     pub issue: Option<String>,
     /// attachment and reference results for each listener.
@@ -38,6 +42,8 @@ impl Plan {
             addresses: vec![],
             programmed: false,
             denied: false,
+            invalid_parameters: false,
+            issue_reason: None,
             issue: None,
             listeners: vec![],
         }

@@ -102,6 +102,18 @@ async fn lead(
                 plans.push(plan);
                 continue;
             }
+            if gateway
+                .spec
+                .infrastructure
+                .as_ref()
+                .and_then(|infra| infra.parameters_ref.as_ref())
+                .is_some()
+            {
+                let mut plan = Plan::new(gateway);
+                plan.invalid_parameters = true;
+                plans.push(plan);
+                continue;
+            }
             let (mut plan, snapshot) =
                 Plan::compile(stores, gateway, settings.bind_address);
             if let Err(error) = workload::reconcile(
