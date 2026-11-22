@@ -375,11 +375,17 @@ pub async fn run(
     stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let retry_interval = runtime.listener_retry_interval;
-    let mut listeners = Listeners::new(id, config.snapshot(), runtime, admission, group)?;
+    let mut listeners = Listeners::new(
+        id,
+        config.borrow_and_update().clone(),
+        runtime,
+        admission,
+        group,
+    )?;
     let stopping = stopped(stop);
     tokio::pin!(stopping);
     loop {
-        let retry = listeners.reconcile(config.snapshot())?;
+        let retry = listeners.reconcile(config.borrow_and_update().clone())?;
         tokio::select! {
             biased;
             _ = &mut stopping => break,

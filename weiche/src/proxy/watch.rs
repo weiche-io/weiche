@@ -9,7 +9,7 @@ use super::{
     stopped,
 };
 use anyhow::{Context, ensure};
-use futures::{StreamExt, pin_mut};
+use futures::StreamExt;
 use k8s_openapi::api::{
     core::v1::{ConfigMap, Secret},
     rbac::v1::RoleBinding,
@@ -21,6 +21,7 @@ use kube::{
         WatchStreamExt,
         reflector::{self, ObjectRef},
         watcher,
+        watcher::Event,
     },
 };
 use serde_json::json;
@@ -75,25 +76,14 @@ impl Desired {
             .0;
         let snapshot = GatewaySnapshot::decode(bytes)?;
         let listeners = snapshot.listener_version()?;
-        let sockets = snapshot
-            .streams
-            .keys()
-            .copied()
-            .chain(
-                snapshot
-                    .sockets
-                    .keys()
-                    .chain(snapshot.tls.keys())
-                    .map(|addr| (Transport::Tcp, *addr)),
-            )
-            .chain(
-                snapshot
-                    .sockets
-                    .iter()
-                    .filter(|(_, s)| http3 && !s.listener.tls.is_empty())
-                    .map(|(addr, _)| (Transport::Udp, *addr)),
-            )
-            .collect::<BTreeSet<_>>();
+        let mut sockets: BTreeSet<_> = snapshot.streams.keys().copied().collect();
+        sockets.extend(snapshot.tls.keys().map(|&addr| (Transport::Tcp, addr)));
+        for (&addr, routes) in &snapshot.sockets {
+            sockets.insert((Transport::Tcp, addr));
+            if http3 && !routes.listener.tls.is_empty() {
+                sockets.insert((Transport::Udp, addr));
+            }
+        }
         if sockets.is_empty() {
             tracing::info!(secret = %secret.name_any(), "snapshot has no active listeners; proxy readiness withdrawn");
         }
@@ -156,18 +146,12 @@ pub async fn run(
     let reports = Api::<ConfigMap>::namespaced(client.clone(), ns);
     let secrets = Api::<Secret>::namespaced(client.clone(), ns);
     let (store, writer) = reflector::store();
-    let stream = reflector::reflector(
-        writer,
-        watcher(
-            secrets,
-            watcher::Config::default().fields(&format!("metadata.name={name}")),
-        ),
-    )
-    .default_backoff();
-    pin_mut!(stream);
+    let filter = watcher::Config::default().fields(&format!("metadata.name={name}"));
+    let stream = reflector::reflector(writer, watcher(secrets, filter)).default_backoff();
+    tokio::pin!(stream);
     let secret_ref = ObjectRef::new(&name).within(ns);
     let mut desired: Option<Desired> = None;
-    let mut serving: Option<(String, String)> = None;
+    let mut serving = None;
     let mut local = None;
     let mut reported = None;
     let mut refresh_due = false;
@@ -176,16 +160,16 @@ pub async fn run(
     let stop = stopped(stop);
     tokio::pin!(stop, shutdown);
     loop {
-        let group = workers.borrow().clone();
-        match &desired {
-            None => serving = None,
-            Some(next) if next.sockets.is_empty() => serving = None,
-            Some(next) if next.applied(&group) => {
-                serving = Some((next.version.clone(), next.listeners.clone()));
+        {
+            let group = workers.borrow();
+            match &desired {
+                Some(next) if next.applied(&group) => {
+                    serving = Some((next.version.clone(), next.listeners.clone()));
+                }
+                // keep the last acknowledgement while workers converge on a nonempty snapshot.
+                Some(next) if !next.sockets.is_empty() && group.serving() => {}
+                _ => serving = None,
             }
-            Some(_) if !group.serving() => serving = None,
-            // keep serving readiness and acknowledgement intact while workers converge.
-            Some(_) => {}
         }
         let next_local = serving.as_ref().map(|(version, _)| version.clone());
         if local != next_local {
@@ -221,25 +205,17 @@ pub async fn run(
                 }
             }
             event = stream.next() => match event.context("snapshot watch stopped")? {
-                Ok(
-                    watcher::Event::Apply(_)
-                    | watcher::Event::Delete(_)
-                    | watcher::Event::InitDone,
-                ) => match store.get(&secret_ref) {
-                    Some(secret) => match Desired::apply(&secret, &mut tx, http3) {
-                        Ok(next) => desired = Some(next),
-                        Err(e) => {
-                            tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot");
-                            desired = None;
-                            tx.publish(GatewaySnapshot::default());
-                        }
-                    },
-                    None => {
-                        desired = None;
+                Ok(Event::Apply(_) | Event::Delete(_) | Event::InitDone) => {
+                    desired = store.get(&secret_ref).and_then(|secret| {
+                        Desired::apply(&secret, &mut tx, http3)
+                            .inspect_err(|e| tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot"))
+                            .ok()
+                    });
+                    if desired.is_none() {
                         tx.publish(GatewaySnapshot::default());
                     }
-                },
-                Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
+                }
+                Ok(Event::Init | Event::InitApply(_)) => {}
                 Err(e) => tracing::warn!(error = %e, "snapshot watch interrupted"),
             }
         }
