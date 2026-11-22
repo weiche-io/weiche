@@ -158,6 +158,11 @@ pub async fn update_status(
     }
     update_policies(client, stores, controller_name, plans).await?;
 
+    let mut reports_by_uid = HashMap::<_, Vec<_>>::new();
+    for report in plans.iter().flat_map(|p| &p.listeners).flat_map(|l| &l.reports) {
+        reports_by_uid.entry(report.uid.as_deref()).or_default().push(report);
+    }
+
     /// publish parent conditions for each supported route kind.
     macro_rules! routes {
         ($store:expr) => {
@@ -170,7 +175,10 @@ pub async fn update_status(
                     client.clone(),
                     &route.namespace().unwrap_or_default(),
                 );
-                update_route(api, route.as_ref(), old, controller_name, plans).await?;
+                let reports = reports_by_uid
+                    .get(&route.metadata.uid.as_deref())
+                    .map_or(&[][..], Vec::as_slice);
+                update_route(api, route.as_ref(), old, controller_name, reports).await?;
             }
         };
     }
@@ -188,7 +196,7 @@ async fn update_route<K>(
     route: &K,
     old: Value,
     controller_name: &str,
-    plans: &[Plan],
+    route_reports: &[&RouteReport],
 ) -> anyhow::Result<()>
 where
     K: Resource<DynamicType = ()>
@@ -204,13 +212,8 @@ where
     let owned_parent = |p: &Value| p["controllerName"] == controller_name;
     let mut parents: Vec<_> =
         old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
-    let mut reports = std::collections::BTreeMap::new();
-    for report in plans
-        .iter()
-        .flat_map(|p| &p.listeners)
-        .flat_map(|l| &l.reports)
-        .filter(|r| r.uid == route.uid())
-    {
+    let mut reports = BTreeMap::new();
+    for &report in route_reports {
         let key = serde_json::to_string(&report.parent)?;
         let score = |r: &RouteReport| {
             // report the closest eligible listener when every attachment was rejected.
