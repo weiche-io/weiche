@@ -1,9 +1,10 @@
 //! hold the Kubernetes writer lease while compiling and reconciling gateway workloads.
 use super::{
     GatewayController, GatewayStores,
+    config::Settings,
     service::Plan,
     status::update_status,
-    workload::{self, Applied, Settings},
+    workload::{self, Applied},
 };
 use anyhow::Context;
 use kube::{Client, ResourceExt};

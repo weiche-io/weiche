@@ -1,8 +1,9 @@
 //! retire only resources whose recorded owner and identity still match the observed Gateway.
 use super::{
     GatewayStores,
+    config::Settings,
     service::{Plan, controlled_by},
-    workload::{Applied, Settings},
+    workload::Applied,
 };
 use k8s_openapi::api::{
     apps::v1::Deployment,
