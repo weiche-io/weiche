@@ -45,8 +45,10 @@ fn pending() -> io::Result<()> {
 
 /// snapshot identity and exact set of sockets that every worker must bind.
 struct Desired {
-    /// digest used to acknowledge this snapshot to the controller.
+    /// full snapshot digest written to the local readiness marker for diagnostics.
     version: String,
+    /// gateway-owned listener digest acknowledged back to the controller.
+    listeners: String,
     /// local publication sequence reported by workers.
     revision: usize,
     /// expected transport and address pairs.
@@ -71,6 +73,7 @@ impl Desired {
             .context("missing snapshot payload")?
             .0;
         let snapshot = GatewaySnapshot::decode(bytes)?;
+        let listeners = snapshot.listener_version()?;
         let sockets = snapshot
             .streams
             .keys()
@@ -95,6 +98,7 @@ impl Desired {
         }
         Ok(Self {
             version: wire::version(bytes),
+            listeners,
             revision: tx.publish(snapshot),
             sockets,
         })
@@ -162,6 +166,7 @@ pub async fn run(
     pin_mut!(stream);
     let secret_ref = ObjectRef::new(&name).within(ns);
     let mut desired: Option<Desired> = None;
+    let mut serving: Option<(String, String)> = None;
     let mut local = None;
     let mut reported = None;
     let mut refresh_due = false;
@@ -170,27 +175,36 @@ pub async fn run(
     let stop = stopped(stop);
     tokio::pin!(stop, shutdown);
     loop {
-        let applied = desired
-            .as_ref()
-            .filter(|d| d.applied(&workers.borrow()))
-            .map(|d| d.version.clone());
-        if local != applied {
-            if let Some(version) = &applied {
+        let group = workers.borrow().clone();
+        match &desired {
+            None => serving = None,
+            Some(next) if next.sockets.is_empty() => serving = None,
+            Some(next) if next.applied(&group) => {
+                serving = Some((next.version.clone(), next.listeners.clone()));
+            }
+            Some(_) if !group.serving() => serving = None,
+            // keep serving readiness and acknowledgement intact while workers converge.
+            Some(_) => {}
+        }
+        let next_local = serving.as_ref().map(|(version, _)| version.clone());
+        if local != next_local {
+            if let Some(version) = &next_local {
                 fs::write("/run/weiche/ready.tmp", version)?;
                 fs::rename("/run/weiche/ready.tmp", READY)?;
             } else {
                 pending()?;
             }
-            local.clone_from(&applied);
+            local = next_local;
         }
-        if reported != applied || (refresh_due && applied.is_some()) {
+        let next_ack = serving.as_ref().map(|(_, listeners)| listeners.clone());
+        if reported != next_ack || (refresh_due && next_ack.is_some()) {
             refresh_due = false;
-            let patch = json!({"data":{(&pod):applied}});
+            let patch = json!({"data":{(&pod):next_ack}});
             match reports
                 .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
                 .await
             {
-                Ok(_) => reported = applied,
+                Ok(_) => reported = next_ack,
                 Err(e) => tracing::warn!(error=%e, "could not acknowledge snapshot"),
             }
         }

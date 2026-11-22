@@ -448,13 +448,15 @@ pub async fn reconcile(
         None
     };
     let active = payload.is_some();
-    let payload = match payload {
-        Some(payload) => payload,
+    let (payload, listener_revision) = match payload {
+        Some(payload) => (payload, snapshot.listener_version()?),
         None if existing_service.is_none() && existing_report.is_none() => return Ok(()),
         // withdraw routes and private keys when a provisioned gateway cannot serve.
-        None => GatewaySnapshot::default().encode()?,
+        None => {
+            let empty = GatewaySnapshot::default();
+            (empty.encode()?, empty.listener_version()?)
+        }
     };
-    let revision = wire::version(&payload);
     let mut owner = g.controller_owner_ref(&()).context("missing gateway owner")?;
     owner.block_owner_deletion = None;
     let target = Target {
@@ -548,7 +550,7 @@ pub async fn reconcile(
                 .conditions
                 .as_ref()
                 .is_some_and(|c| c.ready == Some(true) && c.terminating != Some(true))
-                && acknowledgements.and_then(|a| a.get(pod)) == Some(&revision)
+                && acknowledgements.and_then(|a| a.get(pod)) == Some(&listener_revision)
             {
                 acknowledged = true;
             }
@@ -756,7 +758,7 @@ fn proxy_deployment(
             "volumeMounts": [{"name": "run", "mountPath": "/run/weiche"}],
             "readinessProbe": {
                 "exec": {"command": ["/usr/local/bin/weiche", "ready"]},
-                "periodSeconds": 2,
+                "periodSeconds": 1,
                 "failureThreshold": 1,
             },
             "securityContext": {

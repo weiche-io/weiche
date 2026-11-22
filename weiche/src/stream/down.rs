@@ -38,6 +38,11 @@ impl WorkerGroupState {
                 .iter()
                 .all(|w| w.revision == revision && w.bound.contains(&address))
     }
+
+    /// check that every worker is currently serving at least one bound listener.
+    pub fn serving(&self) -> bool {
+        !self.workers.is_empty() && self.workers.iter().all(|w| !w.bound.is_empty())
+    }
 }
 /// publish consistent binding reports for the worker group.
 pub struct ListenerGroup {

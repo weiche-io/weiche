@@ -38,6 +38,30 @@ impl GatewaySnapshot {
         snapshot.order_certificates();
         Ok(snapshot)
     }
+
+    /// hash only gateway-owned listener bindings, certificates and reserved hostnames.
+    pub fn listener_version(&self) -> anyhow::Result<String> {
+        let sockets: Vec<_> = self
+            .sockets
+            .iter()
+            .map(|(addr, s)| (addr, &s.listener, s.hostnames.as_slice()))
+            .collect();
+        let streams: Vec<_> = self
+            .streams
+            .iter()
+            .map(|(key, s)| (key, s.gateway_uid.as_str()))
+            .collect();
+        let tls: Vec<_> = self
+            .tls
+            .iter()
+            .map(|(addr, t)| {
+                let hosts: Vec<_> = t.hosts.keys().map(String::as_str).collect();
+                (addr, t.gateway_uid.as_str(), hosts)
+            })
+            .collect();
+        let bytes = rmp_serde::to_vec(&(&sockets, &streams, &tls, &self.forwarding))?;
+        Ok(version(&bytes))
+    }
 }
 
 /// a content digest survives controller restarts and is comparable across pods.
