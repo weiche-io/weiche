@@ -1,12 +1,14 @@
 //! select HTTP routes by hostname, path, method, headers and query parameters.
 use super::super::{
     super::ir::{
-        Backend, GrpcMethod, Http, PathMatch, Route, RouteAction, ValueMatch,
+        Filters, GrpcMethod, Http, PathMatch, Route, RouteAction, ValueMatch,
         hostname_matches, weighted_by,
     },
     admission::Cluster,
+    up::Deadlines,
 };
-use ::http::{HeaderMap, Method, Uri};
+use super::cors;
+use ::http::{HeaderMap, Request, Uri};
 use regex::Regex;
 use std::{
     borrow::Cow,
@@ -14,6 +16,8 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap},
     rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 /// compiled route owned by one worker.
@@ -24,8 +28,19 @@ pub struct WorkerRoute {
     pub action: RouteAction<Rc<Cluster>>,
 }
 
-/// route action and the single weighted backend selected for this request.
-type Selected<'a> = (&'a WorkerRoute, Option<&'a Backend<Rc<Cluster>>>);
+/// routing decisions retained across asynchronous admission and forwarding.
+pub struct Selection {
+    /// whether the selected route uses native gRPC forwarding and errors.
+    pub grpc: bool,
+    /// listener rule and its response filters.
+    pub rule: Arc<Filters>,
+    /// selected target and backend-specific filters.
+    pub backend: Option<(Rc<Cluster>, Arc<Filters>)>,
+    /// cross-origin decision made before request filters or upstream forwarding.
+    pub cors: Option<cors::Decision>,
+    /// request and attempt deadlines.
+    pub budget: Deadlines,
+}
 
 /// decoded first values, borrowing from the URI when no unescaping is necessary.
 type Query<'a> = HashMap<Cow<'a, str>, Cow<'a, str>>;
@@ -271,15 +286,17 @@ impl Router {
 
     /// select a route and backend, allowing its CORS policy to handle a preflight
     /// for the requested method while preserving ordinary OPTIONS routing.
-    pub fn find(
+    pub fn find<B>(
         &self,
         hostname: &str,
-        uri: &Uri,
-        method: &Method,
-        headers: &HeaderMap,
+        request: &Request<B>,
         grpc: bool,
-    ) -> Option<Selected<'_>> {
-        let requested = super::cors::requested_method(method, headers);
+        start: Instant,
+        header_timeout: Duration,
+    ) -> Option<Selection> {
+        let method = request.method();
+        let headers = request.headers();
+        let requested = cors::requested_method(method, headers);
         let query = OnceCell::new();
         // once a hostname has a gRPC route, unmatched RPCs receive UNIMPLEMENTED.
         let table = if grpc && self.grpc.matching(hostname).next().is_some() {
@@ -287,12 +304,12 @@ impl Router {
         } else {
             &self.http
         };
-        table.matching(hostname).flatten().find_map(|route| {
+        let (route, backend) = table.matching(hostname).flatten().find_map(|route| {
             let action = &route.action;
             let expected = route.http.method.as_deref();
             let direct = expected.is_none_or(|m| m == method.as_str());
             if (!direct && requested != expected)
-                || !route.http.matches(uri, headers, &query)
+                || !route.http.matches(request.uri(), headers, &query)
             {
                 return None;
             }
@@ -301,6 +318,20 @@ impl Router {
                 || action.filters.cors.is_some()
                 || backend.is_some_and(|b| b.filters.cors.is_some()))
             .then_some((route, backend))
+        })?;
+        let action = &route.action;
+        let cors = backend
+            .and_then(|b| b.filters.cors.as_ref())
+            .or(action.filters.cors.as_ref())
+            .map(|policy| cors::Decision::new(policy, method, headers));
+        let backend = backend
+            .and_then(|b| Some((b.cluster.as_ref().ok()?.clone(), b.filters.clone())));
+        Some(Selection {
+            grpc: matches!(route.http.path, PathMatch::Grpc { .. }),
+            rule: action.filters.clone(),
+            backend,
+            cors,
+            budget: Deadlines::new(start, action.timeouts, header_timeout),
         })
     }
 

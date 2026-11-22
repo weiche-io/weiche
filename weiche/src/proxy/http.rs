@@ -7,17 +7,15 @@ pub mod server;
 pub mod wire;
 
 use super::{
-    super::ir::{
-        Backend, Binding, Filters, PathMatch, PublishedSnapshot, Revision, RouteAction,
-    },
+    super::ir::{Backend, Binding, PublishedSnapshot, Revision, RouteAction},
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
-    up::{ConnectionPool, Deadlines, Exchange, UpstreamClient},
+    up::{ConnectionPool, Exchange, UpstreamClient},
 };
 pub use body::{RequestBody, ResponseBody};
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, Version, header, uri::Authority};
-use router::{Hosts, Router};
+use router::{Hosts, Router, Selection};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
@@ -208,25 +206,9 @@ impl ProxyService {
             .and_then(|r| r.find(listener))
             .and_then(|hosts| hosts.matching(&hostname).next())
             .ok_or(ProxyError::NoRoute)?;
-        let (route, backend) = router
-            .find(&hostname, request.uri(), request.method(), request.headers(), grpc)
-            .ok_or(ProxyError::NoRoute)?;
-        let action = &route.action;
-        let cors = backend
-            .and_then(|b| b.filters.cors.as_ref())
-            .or(action.filters.cors.as_ref())
-            .map(|policy| {
-                cors::Decision::new(policy, request.method(), request.headers())
-            });
-        let backend = backend
-            .and_then(|b| Some((b.cluster.as_ref().ok()?.clone(), b.filters.clone())));
-        Ok(Selection {
-            grpc: matches!(route.http.path, PathMatch::Grpc { .. }),
-            rule: action.filters.clone(),
-            backend,
-            cors,
-            budget: Deadlines::new(start, action.timeouts, view.deadline),
-        })
+        router
+            .find(&hostname, request, grpc, start, view.deadline)
+            .ok_or(ProxyError::NoRoute)
     }
 
     /// route the original request and apply response filters to the selected response.
@@ -377,18 +359,4 @@ impl ProxyService {
         strip_hop_headers(exchange.response.headers_mut());
         Ok(exchange)
     }
-}
-
-/// routing decisions retained across asynchronous admission and forwarding.
-struct Selection {
-    /// whether the selected route uses native gRPC forwarding and errors.
-    grpc: bool,
-    /// listener rule and its response filters.
-    rule: Arc<Filters>,
-    /// selected target and backend-specific filters.
-    backend: Option<(Rc<Cluster>, Arc<Filters>)>,
-    /// cross-origin decision made before request filters or upstream forwarding.
-    cors: Option<cors::Decision>,
-    /// request and attempt deadlines.
-    budget: Deadlines,
 }
