@@ -8,7 +8,7 @@ use super::super::ir::{
 use super::{
     GatewayStores, ResolveError,
     resolve::HttpRule,
-    tls::{Policies, listener_tls, passthrough},
+    tls::{Policies, TlsError, listener_tls, passthrough},
 };
 use kube::{Resource, ResourceExt};
 use serde::Serialize;
@@ -47,21 +47,12 @@ pub struct RouteReport {
     pub message: String,
 }
 
-/// listener ResolvedRefs failure reason and status message.
-#[derive(Clone, Debug)]
-pub struct RefsError {
-    /// gateway API reason for the condition.
-    pub reason: &'static str,
-    /// description published with the condition.
-    pub message: String,
-}
-
 /// data plane snapshot and corresponding control plane status.
 pub struct Compiled {
     /// backend TLS policy results referenced by this listener.
     pub policies: Policies,
     /// listener reference validation failure.
-    pub refs_error: Option<RefsError>,
+    pub refs_error: Option<TlsError>,
     /// local listening address.
     pub address: SocketAddr,
     /// terminating TLS configuration when configured.
@@ -193,8 +184,7 @@ pub fn compile(
             Err(error) => {
                 result.message = error.message.clone();
                 if matches!(error.reason, "InvalidCertificateRef" | "RefNotPermitted") {
-                    result.refs_error =
-                        Some(RefsError { reason: error.reason, message: error.message });
+                    result.refs_error = Some(error);
                 } else {
                     result.reason = error.reason;
                 }
@@ -202,7 +192,7 @@ pub fn compile(
         }
     }
     if result.refs_error.is_none() && !protocol_kinds.is_empty() && invalid_kinds {
-        result.refs_error = Some(RefsError {
+        result.refs_error = Some(TlsError {
             reason: "InvalidRouteKinds",
             message: "listener contains unsupported Route kinds".into(),
         });

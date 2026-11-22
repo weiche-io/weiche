@@ -1,5 +1,5 @@
 //! report gateway and route conditions for the applied worker revision.
-use super::{GatewayStores, compile::RouteReport, service::Plan};
+use super::{GatewayStores, compile::RouteReport, service::Plan, tls::TlsError};
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
@@ -7,32 +7,40 @@ use kube::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use weiche_gtwapi::v1::{
     backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
 };
 
-/// construct a condition for the observed resource generation.
-fn condition(
-    kind: &str,
-    status: bool,
-    reason: &str,
-    message: &str,
-    generation: Option<i64>,
-) -> Value {
-    json!({"type": kind, "status": if status {"True"} else {"False"}, "reason": reason,
-        "message": message, "observedGeneration": generation.unwrap_or(1)})
+/// condition type, truth value, reason and user-facing message.
+type Cond<'a> = (&'a str, bool, &'a str, &'a str);
+
+/// report a reference failure or the corresponding success message.
+fn resolved<'a>(error: Option<&'a TlsError>, message: &'a str) -> Cond<'a> {
+    match error {
+        Some(e) => ("ResolvedRefs", false, e.reason, &e.message),
+        None => ("ResolvedRefs", true, "ResolvedRefs", message),
+    }
 }
 
-/// keep transition times stable, so reconciliation does not generate status/watch loops.
-fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
-    for condition in &mut conditions {
-        let previous = old.and_then(Value::as_array).and_then(|old| {
-            old.iter().find(|c| {
-                c["type"] == condition["type"] && c["status"] == condition["status"]
-            })
-        });
-        condition["lastTransitionTime"] = previous
+/// borrow status entries, treating a missing list as empty.
+fn entries<'a>(status: &'a Value, key: &str) -> &'a [Value] {
+    status[key].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// retain transition times for unchanged truth values and preserve foreign conditions.
+fn stamp_conditions<'a>(
+    previous: Option<&Value>,
+    generation: Option<i64>,
+    desired: impl IntoIterator<Item = Cond<'a>>,
+) -> Value {
+    let old = entries(previous.unwrap_or(&Value::Null), "conditions");
+    let mut conditions = Vec::new();
+    for (kind, truth, reason, message) in desired {
+        let status = if truth { "True" } else { "False" };
+        let time = old
+            .iter()
+            .find(|c| c["type"] == kind && c["status"] == status)
             .and_then(|c| c.get("lastTransitionTime"))
             .cloned()
             .unwrap_or_else(|| {
@@ -40,17 +48,19 @@ fn stamp(mut conditions: Vec<Value>, old: Option<&Value>) -> Value {
                     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 )
             });
+        conditions.push(json!({
+            "type": kind, "status": status, "reason": reason, "message": message,
+            "observedGeneration": generation.unwrap_or(1), "lastTransitionTime": time,
+        }));
     }
-    if let Some(old) = old.and_then(Value::as_array) {
-        for previous in old {
-            if previous["type"].as_str().is_some_and(|t| {
-                t.contains('/') && !conditions.iter().any(|c| c["type"] == t)
-            }) {
-                conditions.push(previous.clone());
-            }
+    for previous in old {
+        if previous["type"].as_str().is_some_and(|t| {
+            t.contains('/') && !conditions.iter().any(|c| c["type"] == t)
+        }) {
+            conditions.push(previous.clone());
         }
     }
-    json!(conditions)
+    Value::Array(conditions)
 }
 
 /// apply changed status with optimistic concurrency.
@@ -95,15 +105,11 @@ pub async fn update_status(
             .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
         let class_accepted = class.spec.parameters_ref.is_none();
         let mut class_status = class_old.clone();
-        class_status["conditions"] = stamp(
-            vec![condition(
-                "Accepted",
-                class_accepted,
-                if class_accepted { "Accepted" } else { "InvalidParameters" },
-                "Weiche gateway controller",
-                class.metadata.generation,
-            )],
-            class_old.get("conditions"),
+        let reason = if class_accepted { "Accepted" } else { "InvalidParameters" };
+        class_status["conditions"] = stamp_conditions(
+            Some(&class_old),
+            class.metadata.generation,
+            [("Accepted", class_accepted, reason, "Weiche gateway controller")],
         );
         class_status["supportedFeatures"] = [
             "BackendTLSPolicy",
@@ -243,32 +249,14 @@ where
         } else {
             "backend reference is missing, unsupported or not permitted"
         };
-        let mut conditions = vec![
-            condition(
-                "Accepted",
-                report.accepted,
-                report.reason,
-                &report.message,
-                generation,
-            ),
-            condition(
-                "ResolvedRefs",
-                report.resolved,
-                report.refs_reason,
-                refs_message,
-                generation,
-            ),
+        let mut conditions: Vec<Cond> = vec![
+            ("Accepted", report.accepted, report.reason, report.message.as_str()),
+            ("ResolvedRefs", report.resolved, report.refs_reason, refs_message),
         ];
         if let Some(message) = &report.partially_invalid {
-            conditions.push(condition(
-                "PartiallyInvalid",
-                true,
-                "UnsupportedValue",
-                message,
-                generation,
-            ));
+            conditions.push(("PartiallyInvalid", true, "UnsupportedValue", message));
         }
-        let conditions = stamp(conditions, previous.and_then(|p| p.get("conditions")));
+        let conditions = stamp_conditions(previous, generation, conditions);
         parents.push(json!({
             "controllerName": controller_name,
             "parentRef": parent,
@@ -281,6 +269,9 @@ where
     patch_status(api, route, &old, json!({"parents":parents})).await
 }
 
+/// default programming condition message for gateways and their listeners.
+const READINESS: &str = "proxy snapshot and listener readiness";
+
 /// publish independent listener status and the address actually assigned by Kubernetes.
 async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
     let gateway = &plan.gateway;
@@ -292,61 +283,44 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
     let accepted = plan.accepted();
     let all_valid = plan.listeners.iter().all(|l| l.accepted);
     let programmed = plan.programmed && accepted;
+    let (reason, message) = if plan.denied {
+        (
+            "NamespaceNotAllowed",
+            "gateway namespace is outside the configured deployment scope",
+        )
+    } else if plan.invalid_parameters {
+        ("InvalidParameters", "gateway infrastructure parametersRef is not supported")
+    } else {
+        (
+            if all_valid { "Accepted" } else { "ListenersNotValid" },
+            "evaluated gateway listeners",
+        )
+    };
+    let ready_reason = if programmed {
+        "Programmed"
+    } else if plan.issue.is_some() {
+        plan.issue_reason.unwrap_or("NoResources")
+    } else {
+        "Pending"
+    };
     let mut desired = old.clone();
-    desired["conditions"] = stamp(
-        vec![
-            condition(
-                "Accepted",
-                accepted,
-                if plan.denied {
-                    "NamespaceNotAllowed"
-                } else if plan.invalid_parameters {
-                    "InvalidParameters"
-                } else if all_valid {
-                    "Accepted"
-                } else {
-                    "ListenersNotValid"
-                },
-                if plan.denied {
-                    "gateway namespace is outside the configured deployment scope"
-                } else if plan.invalid_parameters {
-                    "gateway infrastructure parametersRef is not supported"
-                } else {
-                    "evaluated gateway listeners"
-                },
-                generation,
-            ),
-            condition(
-                "Programmed",
-                programmed,
-                if programmed {
-                    "Programmed"
-                } else if plan.issue.is_some() {
-                    plan.issue_reason.unwrap_or("NoResources")
-                } else {
-                    "Pending"
-                },
-                plan.issue
-                    .as_deref()
-                    .unwrap_or("proxy snapshot and listener readiness"),
-                generation,
-            ),
+    let ready_message = plan.issue.as_deref().unwrap_or(READINESS);
+    desired["conditions"] = stamp_conditions(
+        Some(&old),
+        generation,
+        [
+            ("Accepted", accepted, reason, message),
+            ("Programmed", programmed, ready_reason, ready_message),
         ],
-        old.get("conditions"),
     );
-    desired["addresses"] = json!(
-        plan.addresses
-            .iter()
-            .map(|(kind, value)| json!({"type":kind,"value":value}))
-            .collect::<Vec<_>>()
-    );
+    desired["addresses"] = plan
+        .addresses
+        .iter()
+        .map(|(kind, value)| json!({"type":kind,"value":value}))
+        .collect();
     let mut statuses = Vec::new();
     for (l, report) in gateway.spec.listeners.iter().zip(&plan.listeners) {
-        let previous = old["listeners"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|v| v["name"] == l.name);
+        let previous = entries(&old, "listeners").iter().find(|v| v["name"] == l.name);
         let bound = plan.programmed && report.accepted;
         let error = report.refs_error.as_ref();
         let attached = report
@@ -354,45 +328,29 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             .iter()
             .filter(|r| r.accepted)
             .map(|r| &r.uid)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .len();
         let kinds: Vec<_> = report
             .supported_kinds
             .iter()
             .map(|kind| json!({"group":"gateway.networking.k8s.io", "kind":kind}))
             .collect();
-        let conditions = stamp(
-            vec![
-                condition(
-                    "Accepted",
-                    report.accepted,
-                    report.reason,
-                    &report.message,
-                    generation,
-                ),
-                condition(
-                    "Programmed",
-                    bound,
-                    if bound { "Programmed" } else { "Pending" },
-                    "proxy snapshot and listener readiness",
-                    generation,
-                ),
-                condition(
-                    "ResolvedRefs",
-                    error.is_none(),
-                    error.map_or("ResolvedRefs", |e| e.reason),
-                    error.map_or("listener references resolved", |e| &e.message),
-                    generation,
-                ),
-                condition(
+        let conflict = report.conflict.unwrap_or("NoConflicts");
+        let ready = if bound { "Programmed" } else { "Pending" };
+        let conditions = stamp_conditions(
+            previous,
+            generation,
+            [
+                ("Accepted", report.accepted, report.reason, report.message.as_str()),
+                ("Programmed", bound, ready, READINESS),
+                resolved(error, "listener references resolved"),
+                (
                     "Conflicted",
                     report.conflict.is_some(),
-                    report.conflict.unwrap_or("NoConflicts"),
+                    conflict,
                     "listener distinctness",
-                    generation,
                 ),
             ],
-            previous.and_then(|v| v.get("conditions")),
         );
         statuses.push(json!({
             "name": l.name,
@@ -401,7 +359,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
             "conditions": conditions,
         }));
     }
-    desired["listeners"] = json!(statuses);
+    desired["listeners"] = Value::Array(statuses);
     patch_status(
         Api::<Gateway>::namespaced(
             client.clone(),
@@ -475,19 +433,13 @@ async fn update_policies(
             let message =
                 error.map_or("backend TLS policy applied", |e| e.message.as_str());
             let generation = policy.metadata.generation;
-            let conditions = stamp(
-                vec![
-                    condition("Accepted", error.is_none(), reason, message, generation),
-                    condition(
-                        "ResolvedRefs",
-                        refs_error.is_none(),
-                        refs_error.map_or("ResolvedRefs", |e| e.reason),
-                        refs_error
-                            .map_or("policy references resolved", |e| e.message.as_str()),
-                        generation,
-                    ),
+            let conditions = stamp_conditions(
+                previous,
+                generation,
+                [
+                    ("Accepted", error.is_none(), reason, message),
+                    resolved(refs_error, "policy references resolved"),
                 ],
-                previous.and_then(|entry| entry.get("conditions")),
             );
             ancestors.push(json!({
                 "ancestorRef": {
