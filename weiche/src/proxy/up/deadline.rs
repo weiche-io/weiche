@@ -59,19 +59,18 @@ impl Deadlines {
 }
 
 /// an HTTP body with optional cancellation independent of transport flow control.
-pub struct TimedBody<B>(
-    /// body state and optional deadline task.
-    Storage<B>,
-);
-
-/// unconfigured routes and empty bodies use the direct path without a timer task.
-enum Storage<B> {
-    /// original body without an active deadline.
-    Direct(B),
+pub enum TimedBody<B, G = ()> {
+    /// original body and its lifetime guard without an active deadline.
+    Direct(
+        /// directly polled transport body.
+        B,
+        /// reservation released with the body.
+        G,
+    ),
     /// allow the worker to release a stalled upload or pool lease at its deadline.
     Limited {
         /// transport body, taken by the timer even if hyper has stopped polling.
-        body: Rc<RefCell<Option<B>>>,
+        body: Rc<RefCell<Option<(B, G)>>>,
         /// absolute limit used when a frame and its timer become ready together.
         end: Instant,
         /// cancellable task that wakes the consumer on expiry.
@@ -84,31 +83,40 @@ enum Storage<B> {
 impl<B: Body + 'static> TimedBody<B> {
     /// arm the worker timer only for live bodies with a finite budget.
     pub fn new(body: B, deadline: Option<Instant>) -> Self {
+        Self::guarded(body, (), deadline)
+    }
+}
+
+impl<B: Body + 'static, G: 'static> TimedBody<B, G> {
+    /// keep the guard with the body through completion, cancellation or an undispatched retry.
+    pub fn guarded(body: B, guard: G, deadline: Option<Instant>) -> Self {
         let Some(end) = deadline.filter(|_| !body.is_end_stream()) else {
-            return Self(Storage::Direct(body));
+            return Self::Direct(body, guard);
         };
-        let body = Rc::new(RefCell::new(Some(body)));
+        let body = Rc::new(RefCell::new(Some((body, guard))));
         let pending = body.clone();
         let alarm = runtime::spawn(async move {
             sleep_until(end).await;
             pending.borrow_mut().take();
         });
-        Self(Storage::Limited { body, end, alarm })
+        Self::Limited { body, end, alarm }
     }
 
     /// recover an undispatched upload unless its original attempt has already expired.
     pub fn into_inner(self) -> io::Result<B> {
-        match self.0 {
-            Storage::Direct(body) => Ok(body),
-            Storage::Limited { body, .. } => {
-                body.borrow_mut().take().ok_or(io::ErrorKind::TimedOut.into())
-            }
-            Storage::Done => Err(io::ErrorKind::UnexpectedEof.into()),
+        match self {
+            Self::Direct(body, _) => Ok(body),
+            Self::Limited { body, .. } => body
+                .borrow_mut()
+                .take()
+                .map(|(body, _)| body)
+                .ok_or(io::ErrorKind::TimedOut.into()),
+            Self::Done => Err(io::ErrorKind::UnexpectedEof.into()),
         }
     }
 }
 
-impl<B> Body for TimedBody<B>
+impl<B, G: Unpin> Body for TimedBody<B, G>
 where
     B: Body + Unpin,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -121,16 +129,17 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<B::Data>, io::Error>>> {
-        let frame = match &mut self.0 {
-            Storage::Done => return Poll::Ready(None),
-            Storage::Direct(body) => Pin::new(body).poll_frame(cx),
-            Storage::Limited { body, end, alarm } => {
+        let frame = match &mut *self {
+            Self::Done => return Poll::Ready(None),
+            Self::Direct(body, _) => Pin::new(body).poll_frame(cx),
+            Self::Limited { body, end, alarm } => {
                 if Instant::now() >= *end || Pin::new(alarm).poll(cx).is_ready() {
-                    self.0 = Storage::Done;
+                    *self = Self::Done;
                     return Poll::Ready(Some(Err(io::ErrorKind::TimedOut.into())));
                 }
                 let mut active = body.borrow_mut();
-                let inner = active.as_mut().expect("timer is pending on this worker");
+                let (inner, _) =
+                    active.as_mut().expect("timer is pending on this worker");
                 let frame = Pin::new(&mut *inner).poll_frame(cx);
                 let finished = match &frame {
                     Poll::Ready(Some(Ok(f))) => f.is_trailers() || inner.is_end_stream(),
@@ -139,7 +148,7 @@ where
                 };
                 drop(active);
                 if finished {
-                    self.0 = Storage::Done;
+                    *self = Self::Done;
                 }
                 frame
             }
@@ -149,23 +158,25 @@ where
 
     /// report completion from the current storage state.
     fn is_end_stream(&self) -> bool {
-        match &self.0 {
-            Storage::Done => true,
-            Storage::Direct(body) => body.is_end_stream(),
-            Storage::Limited { body, .. } => {
-                body.borrow().as_ref().is_some_and(Body::is_end_stream)
+        match self {
+            Self::Done => true,
+            Self::Direct(body, _) => body.is_end_stream(),
+            Self::Limited { body, .. } => {
+                body.borrow().as_ref().is_some_and(|(body, _)| body.is_end_stream())
             }
         }
     }
 
     /// forward the available body's size estimate.
     fn size_hint(&self) -> SizeHint {
-        match &self.0 {
-            Storage::Done => SizeHint::with_exact(0),
-            Storage::Direct(body) => body.size_hint(),
-            Storage::Limited { body, .. } => {
-                body.borrow().as_ref().map(Body::size_hint).unwrap_or_default()
-            }
+        match self {
+            Self::Done => SizeHint::with_exact(0),
+            Self::Direct(body, _) => body.size_hint(),
+            Self::Limited { body, .. } => body
+                .borrow()
+                .as_ref()
+                .map(|(body, _)| body.size_hint())
+                .unwrap_or_default(),
         }
     }
 }

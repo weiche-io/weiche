@@ -5,14 +5,11 @@ use super::{
     deadline::TimedBody,
     pool::{ConnectionPool, Endpoint, Slot},
 };
-use bytes::Bytes;
 use hyper::client::conn::http2;
 use std::{
     cell::Cell,
     mem::DropGuard,
-    pin::Pin,
     rc::{Rc, Weak},
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -72,7 +69,7 @@ impl ConnectionPool {
 /// shared HTTP/2 upstream connection and its active stream counter.
 pub struct Http2Connection {
     /// multiplexed sender and its worker driver.
-    transport: Connected<http2::SendRequest<TimedBody<Upload>>>,
+    transport: Connected<http2::SendRequest<Upload>>,
     /// reservation for the underlying connection.
     slot: Slot,
     /// streams with either upload or response still active.
@@ -104,7 +101,7 @@ impl Http2Connection {
 }
 
 /// upload and response share this guard. the upload must not keep its driver alive.
-struct Stream(
+pub struct Stream(
     /// weak reference used to return stream capacity on completion.
     Weak<Http2Connection>,
 );
@@ -133,49 +130,15 @@ pub struct Http2Lease {
 
 impl Http2Lease {
     /// clone the request sender for this stream.
-    pub fn sender(&self) -> http2::SendRequest<TimedBody<Upload>> {
+    pub fn sender(&self) -> http2::SendRequest<Upload> {
         self.connection.transport.sender.clone()
     }
 
-    /// attach stream accounting before arming the upload deadline.
-    pub fn upload(&self, body: RequestBody) -> Upload {
-        Upload { body, _stream: self.stream.clone() }
+    /// retain stream capacity with the upload until it finishes or its deadline expires.
+    pub fn upload(&self, body: RequestBody, end: Option<Instant>) -> Upload {
+        TimedBody::guarded(body, self.stream.clone(), end)
     }
 }
 
-/// request body retaining stream capacity until upload completion.
-pub struct Upload {
-    /// original streaming upload from the downstream request.
-    body: RequestBody,
-    /// shared stream accounting guard.
-    _stream: Rc<Stream>,
-}
-
-impl Upload {
-    /// recover a body returned before dispatch for a fresh attempt.
-    pub fn into_inner(self) -> RequestBody {
-        self.body
-    }
-}
-
-impl hyper::body::Body for Upload {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    /// deliver upload frames while retaining the HTTP/2 stream reservation.
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
-    }
-
-    /// report whether the original upload has finished.
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-    /// forward the original upload's size estimate.
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.body.size_hint()
-    }
-}
+/// the upload holds its share of the stream reservation independently of the response.
+type Upload = TimedBody<RequestBody, Rc<Stream>>;

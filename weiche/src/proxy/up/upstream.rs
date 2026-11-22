@@ -122,7 +122,7 @@ impl ConnectionPool {
         let lease = self.acquire_http2(endpoint).await?;
         match lease
             .sender()
-            .try_send_request(request.map(|body| TimedBody::new(lease.upload(body), end)))
+            .try_send_request(request.map(|body| lease.upload(body, end)))
             .await
         {
             Ok(response) => Ok(Attempt::Complete(Exchange::upstream(
@@ -136,10 +136,7 @@ impl ConnectionPool {
                 };
                 endpoint.retire_http2(&lease);
                 let (parts, body) = request.into_parts();
-                Ok(Attempt::Retry(Request::from_parts(
-                    parts,
-                    body.into_inner()?.into_inner(),
-                )))
+                Ok(Attempt::Retry(Request::from_parts(parts, body.into_inner()?)))
             }
         }
     }
