@@ -1,5 +1,5 @@
 //! compile attached routes independently for each listener.
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use super::super::ir::{
     RefError, Route, RouteHost, ServerTls, SniRoutes, StreamRoute, Transport,
@@ -48,13 +48,12 @@ pub struct RouteReport {
 }
 
 /// data plane snapshot and corresponding control plane status.
+#[derive(Default)]
 pub struct Compiled {
     /// backend TLS policy results referenced by this listener.
     pub policies: Policies,
     /// listener reference validation failure.
     pub refs_error: Option<TlsError>,
-    /// local listening address.
-    pub address: SocketAddr,
     /// terminating TLS configuration when configured.
     pub tls: Option<Arc<ServerTls>>,
     /// protocol or hostname collision on the listener port.
@@ -84,7 +83,6 @@ pub fn compile(
     stores: &GatewayStores,
     gateway: &Gateway,
     l: &GatewayListeners,
-    address: SocketAddr,
 ) -> Compiled {
     let namespace = gateway.namespace().unwrap_or_default();
     let kinds = l
@@ -107,8 +105,7 @@ pub fn compile(
     } else {
         let mut supported = Vec::new();
         for k in kinds {
-            if k.group.as_deref().unwrap_or("gateway.networking.k8s.io")
-                == "gateway.networking.k8s.io"
+            if k.group.as_deref().is_none_or(|g| g == "gateway.networking.k8s.io")
                 && let Some(&kind) = protocol_kinds.iter().find(|kind| **kind == k.kind)
             {
                 if !supported.contains(&kind) {
@@ -121,20 +118,10 @@ pub fn compile(
         supported
     };
     let mut result = Compiled {
-        policies: Policies::default(),
-        refs_error: None,
-        address,
-        tls: None,
-        conflict: None,
         supported_kinds,
         transport,
-        stream: None,
-        sni_routes: SniRoutes::new(),
-        routes: vec![],
-        reports: vec![],
-        accepted: false,
         reason: "Invalid",
-        message: "selected Gateway or listener is unavailable".into(),
+        ..Default::default()
     };
     let mut peers = gateway.spec.listeners.iter().filter(|other| {
         other.name != l.name

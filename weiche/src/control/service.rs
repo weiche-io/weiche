@@ -73,7 +73,7 @@ impl Plan {
         let mut listeners = Vec::new();
         for listener in &gateway.spec.listeners {
             let address = SocketAddr::new(bind, listener.port);
-            let mut result = compile(stores, &gateway, listener, address);
+            let mut result = compile(stores, &gateway, listener);
             if result.accepted {
                 if matches!(listener.protocol.as_str(), "TCP" | "UDP") {
                     snapshot.streams.insert(

@@ -8,6 +8,7 @@ use std::{net::SocketAddr, sync::Arc};
     Clone,
     Copy,
     Debug,
+    Default,
     Hash,
     PartialEq,
     Eq,
@@ -18,6 +19,7 @@ use std::{net::SocketAddr, sync::Arc};
 )]
 pub enum Transport {
     /// connection-oriented TCP sockets.
+    #[default]
     Tcp,
     /// datagram-oriented UDP sockets.
     Udp,
@@ -32,13 +34,6 @@ impl Transport {
         match self {
             Self::Tcp => "TCP",
             Self::Udp => "UDP",
-        }
-    }
-    /// name the route kind accepted for this transport.
-    pub fn route_kind(self) -> &'static str {
-        match self {
-            Self::Tcp => "TCPRoute",
-            Self::Udp => "UDPRoute",
         }
     }
 }
