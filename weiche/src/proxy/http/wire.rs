@@ -1,8 +1,9 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
+use super::super::{super::ir::Protocol, admission::EndpointKey, up::Upgrade};
 use super::Body;
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderValue, Request, Response, StatusCode, Version, header,
+    HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
     uri::Authority,
 };
 use http_body_util::{BodyExt, Full};
@@ -135,7 +136,7 @@ pub fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
 }
 
 /// expose :authority to header matches and reject conflicting downstream identities.
-pub fn normalize_authority(request: &mut Request<Body>) -> Result<Authority, ProxyError> {
+pub fn normalize_authority<B>(request: &mut Request<B>) -> Result<Authority, ProxyError> {
     if !request.headers().contains_key(header::HOST)
         && let Some(authority) = request.uri().authority()
     {
@@ -148,6 +149,90 @@ pub fn normalize_authority(request: &mut Request<Body>) -> Result<Authority, Pro
         return Err(ProxyError::InvalidHost);
     }
     Ok(host)
+}
+
+/// take the downstream upgrade before its handshake fields are stripped.
+pub fn take_upgrade<B>(
+    request: &mut Request<B>,
+    protocol: Protocol,
+) -> Result<Option<Upgrade>, ProxyError> {
+    if !request.headers().contains_key(header::UPGRADE) {
+        return Ok(None);
+    }
+    if protocol != Protocol::Http1 {
+        return Err(ProxyError::UnsupportedUpgrade);
+    }
+    Upgrade::request(request)
+        .map(Some)
+        .ok_or(ProxyError::UnsupportedUpgrade)
+}
+
+/// encode the filtered authority and path for the selected upstream protocol.
+pub fn prepare_request<B>(
+    request: &mut Request<B>,
+    authority: Authority,
+    endpoint: &EndpointKey,
+    downstream_tls: bool,
+    grpc: bool,
+    trailers: bool,
+    path: Option<http::uri::PathAndQuery>,
+) -> Result<(), ProxyError> {
+    if trailers || grpc {
+        request
+            .headers_mut()
+            .insert(header::TE, HeaderValue::from_static("trailers"));
+    }
+    let mut uri = request.uri().clone().into_parts();
+    if path.is_some() {
+        uri.path_and_query = path;
+    }
+    uri.path_and_query
+        .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
+    match endpoint.protocol {
+        Protocol::Http1 => {
+            // an HTTP/3 upload can carry data or trailers without declaring its length.
+            // keep polling through FIN even after the advertised length has arrived.
+            let streaming = request.version() == Version::HTTP_3;
+            *request.version_mut() = Version::HTTP_11;
+            if !request.headers().contains_key(header::HOST) {
+                request.headers_mut().insert(
+                    header::HOST,
+                    HeaderValue::from_str(authority.as_str())
+                        .map_err(|_| ProxyError::InvalidHost)?,
+                );
+            }
+            uri.scheme = None;
+            uri.authority = None;
+            if trailers {
+                request
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("TE"));
+            }
+            if streaming || request.headers().contains_key(header::TRAILER) {
+                request.headers_mut().remove(header::CONTENT_LENGTH);
+                request.headers_mut().insert(
+                    header::TRANSFER_ENCODING,
+                    HeaderValue::from_static("chunked"),
+                );
+            }
+        }
+        Protocol::Http2 => {
+            *request.version_mut() = Version::HTTP_2;
+            // encode authority once; some HTTP/2 servers reject a duplicate Host field.
+            request.headers_mut().remove(header::HOST);
+            if grpc || uri.scheme.is_none() {
+                let tls = if grpc { endpoint.tls.is_some() } else { downstream_tls };
+                uri.scheme = Some(if tls {
+                    http::uri::Scheme::HTTPS
+                } else {
+                    http::uri::Scheme::HTTP
+                });
+            }
+            uri.authority = Some(authority);
+        }
+    }
+    *request.uri_mut() = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
+    Ok(())
 }
 
 /// remove connection-specific fields and fields nominated by this hop.

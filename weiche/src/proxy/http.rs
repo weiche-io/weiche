@@ -7,17 +7,14 @@ pub mod wire;
 
 use super::{
     super::ir::{
-        Backend, Binding, Filters, PathMatch, Protocol, PublishedSnapshot, Revision,
-        RouteAction,
+        Backend, Binding, Filters, PathMatch, PublishedSnapshot, Revision, RouteAction,
     },
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
-    up::{ConnectionPool, Deadlines, Tunnel, Upgrade, UpstreamClient},
+    up::{ConnectionPool, Deadlines, Tunnel, UpstreamClient},
 };
 use bytes::Bytes;
-use http::{
-    HeaderValue, Request, Response, StatusCode, Uri, Version, header, uri::Authority,
-};
+use http::{HeaderValue, Request, Response, StatusCode, Version, header, uri::Authority};
 use http_body_util::BodyExt;
 use router::{Hosts, Router};
 use std::{
@@ -29,8 +26,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
-use wire::{ProxyError, full_body, is_grpc, normalize_authority, strip_hop_headers};
+use wire::{
+    ProxyError, full_body, is_grpc, normalize_authority, prepare_request,
+    strip_hop_headers,
+};
 
 /// streaming request and response bodies stay on the owning compio worker.
 pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = std::io::Error>>>;
@@ -333,14 +332,7 @@ impl ProxyService {
         let (cluster, filters) = backend.ok_or(ProxyError::InvalidBackend)?;
         let key = cluster.select().ok_or(ProxyError::NoEndpoints)?;
         let endpoint = self.pool.endpoint(key).ok_or(ProxyError::NoEndpoints)?;
-        let upgrade = if request.headers().contains_key(header::UPGRADE) {
-            if endpoint.key.protocol != Protocol::Http1 {
-                return Err(ProxyError::UnsupportedUpgrade);
-            }
-            Some(Upgrade::request(&mut request).ok_or(ProxyError::UnsupportedUpgrade)?)
-        } else {
-            None
-        };
+        let upgrade = wire::take_upgrade(&mut request, endpoint.key.protocol)?;
         if request.version() == Version::HTTP_3 {
             // http/3 can receive trailers even without an explicit TE field.
             request
@@ -408,72 +400,4 @@ struct Selection {
     cors: Option<cors::Decision>,
     /// request and attempt deadlines.
     budget: Deadlines,
-}
-
-/// encode the filtered authority and path for the selected upstream protocol.
-fn prepare_request(
-    request: &mut Request<Body>,
-    authority: Authority,
-    endpoint: &EndpointKey,
-    downstream_tls: bool,
-    grpc: bool,
-    trailers: bool,
-    path: Option<http::uri::PathAndQuery>,
-) -> Result<(), ProxyError> {
-    if trailers || grpc {
-        request
-            .headers_mut()
-            .insert(header::TE, http::HeaderValue::from_static("trailers"));
-    }
-    let mut uri = request.uri().clone().into_parts();
-    if path.is_some() {
-        uri.path_and_query = path;
-    }
-    uri.path_and_query
-        .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
-    match endpoint.protocol {
-        Protocol::Http1 => {
-            // an HTTP/3 upload can carry data or trailers without declaring its length.
-            // keep polling through FIN even after the advertised length has arrived.
-            let streaming = request.version() == Version::HTTP_3;
-            *request.version_mut() = Version::HTTP_11;
-            if !request.headers().contains_key(header::HOST) {
-                request.headers_mut().insert(
-                    header::HOST,
-                    HeaderValue::from_str(authority.as_str())
-                        .map_err(|_| ProxyError::InvalidHost)?,
-                );
-            }
-            uri.scheme = None;
-            uri.authority = None;
-            if trailers {
-                request
-                    .headers_mut()
-                    .insert(header::CONNECTION, http::HeaderValue::from_static("TE"));
-            }
-            if streaming || request.headers().contains_key(header::TRAILER) {
-                request.headers_mut().remove(header::CONTENT_LENGTH);
-                request.headers_mut().insert(
-                    header::TRANSFER_ENCODING,
-                    http::HeaderValue::from_static("chunked"),
-                );
-            }
-        }
-        Protocol::Http2 => {
-            *request.version_mut() = Version::HTTP_2;
-            // encode authority once; some HTTP/2 servers reject a duplicate Host field.
-            request.headers_mut().remove(header::HOST);
-            if grpc || uri.scheme.is_none() {
-                let tls = if grpc { endpoint.tls.is_some() } else { downstream_tls };
-                uri.scheme = Some(if tls {
-                    http::uri::Scheme::HTTPS
-                } else {
-                    http::uri::Scheme::HTTP
-                });
-            }
-            uri.authority = Some(authority);
-        }
-    }
-    *request.uri_mut() = Uri::from_parts(uri).map_err(|_| ProxyError::InvalidTarget)?;
-    Ok(())
 }
