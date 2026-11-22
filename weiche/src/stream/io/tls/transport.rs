@@ -1,7 +1,7 @@
 //! move owned ciphertext buffers between rustls and the worker's compio socket.
 use compio::{
     BufResult,
-    driver::op::SendFlags,
+    driver::op::{RecvFlags, SendFlags},
     io::{AsyncRead, AsyncWriteExt},
     net::TcpStream,
 };
@@ -17,6 +17,17 @@ use std::{
     sync::Arc,
     task::{Context, Poll, ready},
 };
+
+/// fall back to an owned socket operation when the immediate attempt makes no progress.
+fn immediate(result: io::Result<usize>) -> io::Result<Option<usize>> {
+    use io::ErrorKind::{Interrupted, WouldBlock};
+
+    match result {
+        Ok(n) => Ok(Some(n)),
+        Err(error) if matches!(error.kind(), WouldBlock | Interrupted) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// either half can drive the same send while the other is waiting on it.
 #[derive(Default)]
@@ -36,8 +47,8 @@ impl ArcWake for SendWake {
 pub struct Transport {
     pub socket: Rc<TcpStream>,
     pub input: Cursor<Vec<u8>>,
-    /// small h2 flushes may complete in the caller's poll when TCP has room.
-    pub try_small_writes: bool,
+    /// try socket I/O in the caller's poll after negotiating h2.
+    pub try_immediate_io: bool,
     output: Vec<u8>,
     recv: Option<LocalBoxFuture<'static, BufResult<usize, Vec<u8>>>>,
     send: Option<LocalBoxFuture<'static, BufResult<(), Vec<u8>>>>,
@@ -52,7 +63,7 @@ impl Transport {
         Ok(Self {
             socket: Rc::new(socket),
             input: Cursor::new(Vec::with_capacity(64 * 1024)),
-            try_small_writes: false,
+            try_immediate_io: false,
             output: Vec::new(),
             recv: None,
             send: None,
@@ -67,12 +78,29 @@ impl Transport {
             return Poll::Ready(Ok(()));
         }
         loop {
-            let recv = self.recv.get_or_insert_with(|| {
-                let mut buf = mem::take(self.input.get_mut());
-                buf.clear();
-                let socket = self.socket.clone();
-                Box::pin(async move { socket.as_ref().read(buf).await })
-            });
+            let recv = match &mut self.recv {
+                Some(recv) => recv,
+                None => {
+                    let buf = self.input.get_mut();
+                    buf.clear();
+                    if self.try_immediate_io {
+                        let socket = SockRef::from(self.socket.as_ref());
+                        let flags = RecvFlags::DONTWAIT.bits() as _;
+                        if let Some(n) = immediate(
+                            socket.recv_with_flags(buf.spare_capacity_mut(), flags),
+                        )? {
+                            // safety: recv initialized the first n bytes of the empty buffer.
+                            unsafe { buf.set_len(n) };
+                            self.input.set_position(0);
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    let buf = mem::take(buf);
+                    let socket = self.socket.clone();
+                    self.recv
+                        .insert(Box::pin(async move { socket.as_ref().read(buf).await }))
+                }
+            };
             let BufResult(result, buf) = ready!(recv.as_mut().poll(cx));
             self.recv = None;
             self.input = Cursor::new(buf);
@@ -101,20 +129,13 @@ impl Transport {
     fn try_send(&mut self) -> io::Result<()> {
         let flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         let socket = SockRef::from(self.socket.as_ref());
-        match socket.send_with_flags(&self.output, flags.bits() as _) {
-            Ok(0) => Err(self.fail_send(io::ErrorKind::WriteZero.into())),
-            Ok(n) => {
+        match immediate(socket.send_with_flags(&self.output, flags.bits() as _)) {
+            Ok(Some(0)) => Err(self.fail_send(io::ErrorKind::WriteZero.into())),
+            Ok(Some(n)) => {
                 self.output.drain(..n);
                 Ok(())
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(())
-            }
+            Ok(None) => Ok(()),
             Err(error) => Err(self.fail_send(error)),
         }
     }
@@ -135,7 +156,7 @@ impl Transport {
                     if self.output.is_empty() {
                         return Poll::Ready(Ok(()));
                     }
-                    if self.try_small_writes && self.output.len() <= 4096 {
+                    if self.try_immediate_io {
                         self.try_send()?;
                         if self.output.is_empty() {
                             continue;

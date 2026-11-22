@@ -97,8 +97,8 @@ impl TlsIo {
         let sent = poll_fn(|cx| stream.poll_output(cx, false)).await;
         result?;
         sent?;
-        // keep multiplexed h2 streams moving when a small flush can finish immediately.
-        stream.transport.try_small_writes = stream.negotiated_alpn() == Some(b"h2");
+        // let multiplexed h2 streams consume ready data and flush it in the same poll.
+        stream.transport.try_immediate_io = stream.negotiated_alpn() == Some(b"h2");
         Ok(stream)
     }
 }

@@ -24,7 +24,7 @@ fn tls_error(error: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-/// worker-local TLS stream for hyper driven by io_uring RECV and SEND completions.
+/// worker-local TLS stream with immediate h2 reads and writes and io_uring fallback.
 pub struct TlsIo {
     transport: Transport,
     conn: Connection,
