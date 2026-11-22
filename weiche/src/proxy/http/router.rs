@@ -1,8 +1,8 @@
 //! select HTTP routes by hostname, path, method, headers and query parameters.
 use super::super::{
     super::ir::{
-        Filters, GrpcMethod, Http, PathMatch, Route, RouteAction, ValueMatch,
-        hostname_matches, weighted_by,
+        Backend, ClusterSpec, Filters, GrpcMethod, Http, PathMatch, Route, RouteAction,
+        ValueMatch, hostname_matches, weighted_by,
     },
     admission::Cluster,
     up::Deadlines,
@@ -230,14 +230,6 @@ impl<T> Hosts<T> {
             )
             .chain(self.fallback.iter())
     }
-
-    /// visit every value when reusing worker-local clusters.
-    pub fn values(&self) -> impl Iterator<Item = &T> {
-        self.exact
-            .values()
-            .chain(self.wildcard.iter().map(|(_, v)| v))
-            .chain(self.fallback.iter())
-    }
 }
 
 /// independent routing tables for HTTP and native gRPC on one listener.
@@ -252,7 +244,7 @@ impl Router {
     /// preserve creation time, namespace/name, rule and match order on ties.
     pub fn compile<'a>(
         routes: impl IntoIterator<Item = &'a Route>,
-        mut prepare: impl FnMut(&RouteAction) -> RouteAction<Rc<Cluster>>,
+        mut resolve: impl FnMut(&Arc<ClusterSpec>) -> Rc<Cluster>,
     ) -> Result<Self, regex::Error> {
         let mut http = BTreeMap::<_, Vec<_>>::new();
         let mut grpc = BTreeMap::<_, Vec<_>>::new();
@@ -268,7 +260,24 @@ impl Router {
                 .or_default()
                 .push(WorkerRoute {
                     http: Http::compile(route.http.clone())?,
-                    action: prepare(&route.action),
+                    action: RouteAction {
+                        filters: route.action.filters.clone(),
+                        timeouts: route.action.timeouts,
+                        backends: route
+                            .action
+                            .backends
+                            .iter()
+                            .map(|b| Backend {
+                                weight: b.weight,
+                                filters: b.filters.clone(),
+                                cluster: b
+                                    .cluster
+                                    .as_ref()
+                                    .map(&mut resolve)
+                                    .map_err(|e| *e),
+                            })
+                            .collect(),
+                    },
                 });
         }
         let ranked = |buckets: BTreeMap<_, Vec<WorkerRoute>>| {
@@ -333,10 +342,5 @@ impl Router {
             cors,
             budget: Deadlines::new(start, action.timeouts, header_timeout),
         })
-    }
-
-    /// enumerate installed routes for cluster reuse during a snapshot change.
-    pub fn routes(&self) -> impl Iterator<Item = &WorkerRoute> {
-        self.http.values().chain(self.grpc.values()).flatten()
     }
 }

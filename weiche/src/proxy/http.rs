@@ -7,7 +7,7 @@ pub mod server;
 pub mod wire;
 
 use super::{
-    super::ir::{Backend, Binding, PublishedSnapshot, Revision, RouteAction},
+    super::ir::{Binding, ClusterSpec, PublishedSnapshot, Revision},
     admission::{Cluster, EndpointKey, Route},
     config::RuntimeConfig,
     up::{ConnectionPool, Exchange},
@@ -33,6 +33,8 @@ struct WorkerView {
     revision: Revision,
     /// gateway default for receiving backend headers.
     deadline: Duration,
+    /// round-robin state shared by every occurrence of an active backend.
+    clusters: HashMap<Arc<ClusterSpec>, Rc<Cluster>>,
     /// routers indexed by downstream listening address.
     routes: BTreeMap<SocketAddr, Route<Hosts<Router>>>,
 }
@@ -52,76 +54,45 @@ impl WorkerView {
             !gateway.forwarding.response_header_timeout.is_zero(),
             "response header timeout must be positive"
         );
-        let mut clusters: HashMap<_, _> = previous
-            .into_iter()
-            .flat_map(|view| view.routes.values())
-            .flat_map(|socket| socket.target.values())
-            .flat_map(Router::routes)
-            .flat_map(|route| &route.action.backends)
-            .filter_map(|backend| backend.cluster.as_ref().ok())
-            .map(|c| (c.spec.clone(), c.clone()))
-            .collect();
+        let mut clusters = HashMap::new();
         let mut endpoints = HashSet::new();
+        let mut resolve = |spec: &Arc<ClusterSpec>| {
+            clusters
+                .entry(spec.clone())
+                .or_insert_with(|| {
+                    let cluster = previous
+                        .and_then(|view| view.clusters.get(spec))
+                        .cloned()
+                        .unwrap_or_else(|| Rc::new(Cluster::new(spec.clone())));
+                    endpoints.extend(
+                        spec.endpoints.iter().map(|&addr| cluster.endpoint(addr)),
+                    );
+                    cluster
+                })
+                .clone()
+        };
         let mut routes = BTreeMap::new();
-        for (address, socket) in &gateway.sockets {
-            let mut prepare = |action: &RouteAction| {
-                let backends = action
-                    .backends
-                    .iter()
-                    .map(|backend| Backend {
-                        weight: backend.weight,
-                        filters: backend.filters.clone(),
-                        cluster: backend
-                            .cluster
-                            .as_ref()
-                            .map(|spec| {
-                                endpoints.extend(spec.endpoints.iter().map(|&address| {
-                                    EndpointKey {
-                                        address,
-                                        protocol: spec.protocol,
-                                        tls: spec.tls.clone(),
-                                    }
-                                }));
-                                clusters
-                                    .entry(spec.clone())
-                                    .or_insert_with(|| {
-                                        Rc::new(Cluster::new(spec.clone()))
-                                    })
-                                    .clone()
-                            })
-                            .map_err(|e| *e),
-                    })
-                    .collect();
-                RouteAction {
-                    backends,
-                    filters: action.filters.clone(),
-                    timeouts: action.timeouts,
-                }
-            };
+        for (&address, socket) in &gateway.sockets {
             let mut by_listener: BTreeMap<_, Vec<_>> =
                 socket.hostnames.iter().map(|h| (h.as_str(), Vec::new())).collect();
             for route in &socket.routes {
                 let listener = route.host.as_ref().map_or("", |h| h.listener.as_str());
                 by_listener.entry(listener).or_default().push(route);
             }
-            let mut listeners = Vec::new();
-            for (hostname, rules) in by_listener {
-                let router = Router::compile(rules, &mut prepare)?;
-                listeners.push((hostname.to_owned(), router));
-            }
-            routes.insert(
-                *address,
-                Route {
-                    binding: socket.listener.binding(),
-                    target: listeners.into_iter().collect(),
-                },
-            );
+            let target = by_listener
+                .into_iter()
+                .map(|(host, rules)| {
+                    Ok((host.to_owned(), Router::compile(rules, &mut resolve)?))
+                })
+                .collect::<Result<_, regex::Error>>()?;
+            routes.insert(address, Route { binding: socket.listener.binding(), target });
         }
         Ok((
             Self {
                 revision: snapshot.revision,
                 deadline: gateway.forwarding.response_header_timeout,
                 routes,
+                clusters,
             },
             endpoints,
         ))

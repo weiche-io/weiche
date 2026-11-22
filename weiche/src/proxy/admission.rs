@@ -42,11 +42,16 @@ impl Cluster {
         }
         let index = self.cursor.get();
         self.cursor.set(index.wrapping_add(1));
-        Some(EndpointKey {
-            address: endpoints[index % endpoints.len()],
+        Some(self.endpoint(endpoints[index % endpoints.len()]))
+    }
+
+    /// identify a member with the protocol and TLS settings used to pool its connections.
+    pub fn endpoint(&self, address: SocketAddr) -> EndpointKey {
+        EndpointKey {
+            address,
             protocol: self.spec.protocol,
             tls: self.spec.tls.clone(),
-        })
+        }
     }
 }
 
