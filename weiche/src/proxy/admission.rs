@@ -1,5 +1,5 @@
 //! select worker-local endpoints and bound downstream connection admission.
-use super::super::ir::{BackendTls, Binding, ClusterSpec, Protocol};
+use super::super::ir::{BackendTls, ClusterSpec, Protocol};
 use std::{
     cell::Cell,
     net::SocketAddr,
@@ -52,21 +52,6 @@ impl Cluster {
             protocol: self.spec.protocol,
             tls: self.spec.tls.clone(),
         }
-    }
-}
-
-/// target attached to a configured listener, before any protocol-specific matching.
-pub struct Route<T> {
-    /// listener identity that must match the accepted connection.
-    pub binding: Binding,
-    /// routing table for that listener.
-    pub target: T,
-}
-
-impl<T> Route<T> {
-    /// keep existing connections bound to their original socket and TLS identity.
-    pub fn find(&self, binding: &Binding) -> Option<&T> {
-        (&self.binding == binding).then_some(&self.target)
     }
 }
 

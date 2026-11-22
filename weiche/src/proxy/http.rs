@@ -8,7 +8,7 @@ pub mod wire;
 
 use super::{
     super::ir::{Binding, ClusterSpec, PublishedSnapshot, Revision},
-    admission::{Cluster, EndpointKey, Route},
+    admission::{Cluster, EndpointKey},
     config::RuntimeConfig,
     up::{ConnectionPool, Exchange, Upgrade},
 };
@@ -35,8 +35,8 @@ struct WorkerView {
     deadline: Duration,
     /// round-robin state shared by every occurrence of an active backend.
     clusters: HashMap<Arc<ClusterSpec>, Rc<Cluster>>,
-    /// routers indexed by downstream listening address.
-    routes: BTreeMap<SocketAddr, Route<Hosts<Router>>>,
+    /// accepted binding and hostname routers at each downstream address.
+    routes: BTreeMap<SocketAddr, (Binding, Hosts<Router>)>,
 }
 
 impl WorkerView {
@@ -50,10 +50,8 @@ impl WorkerView {
         previous: Option<&WorkerView>,
     ) -> anyhow::Result<(Self, HashSet<EndpointKey>)> {
         let gateway = &snapshot.gateway;
-        anyhow::ensure!(
-            !gateway.forwarding.response_header_timeout.is_zero(),
-            "response header timeout must be positive"
-        );
+        let deadline = gateway.forwarding.response_header_timeout;
+        anyhow::ensure!(!deadline.is_zero(), "response header timeout must be positive");
         let mut clusters = HashMap::new();
         let mut endpoints = HashSet::new();
         let mut resolve = |spec: &Arc<ClusterSpec>| {
@@ -85,17 +83,15 @@ impl WorkerView {
                     Ok((host.to_owned(), Router::compile(rules, &mut resolve)?))
                 })
                 .collect::<Result<_, regex::Error>>()?;
-            routes.insert(address, Route { binding: socket.listener.binding(), target });
+            routes.insert(address, (socket.listener.binding(), target));
         }
-        Ok((
-            Self {
-                revision: snapshot.revision,
-                deadline: gateway.forwarding.response_header_timeout,
-                routes,
-                clusters,
-            },
-            endpoints,
-        ))
+        let view = Self {
+            revision: snapshot.revision,
+            deadline,
+            routes,
+            clusters,
+        };
+        Ok((view, endpoints))
     }
 }
 
@@ -163,18 +159,20 @@ impl ProxyService {
         request: &Request<RequestBody>,
         start: Instant,
         grpc: bool,
-    ) -> Result<Selection, ProxyError> {
+    ) -> Option<Selection> {
         let view = self.view.borrow();
         let hostname = authority.host().to_ascii_lowercase();
-        let router = view
-            .routes
-            .get(&listener.address)
-            .and_then(|r| r.find(listener))
-            .and_then(|hosts| hosts.matching(&hostname).next())
-            .ok_or(ProxyError::NoRoute)?;
-        router
-            .find(&hostname, request, grpc, start, view.deadline)
-            .ok_or(ProxyError::NoRoute)
+        let (binding, hosts) = view.routes.get(&listener.address)?;
+        if binding != listener {
+            return None;
+        }
+        hosts.matching(&hostname).next()?.find(
+            &hostname,
+            request,
+            grpc,
+            start,
+            view.deadline,
+        )
     }
 
     /// route the original request and apply response filters to the selected response.
@@ -212,9 +210,9 @@ impl ProxyService {
             Err(error) => return advertise(error.response(false)),
         };
         let grpc = is_grpc(&request);
-        let selection = match self.select(listener, &authority, &request, start, grpc) {
-            Ok(s) => s,
-            Err(error) => return advertise(error.response(grpc)),
+        let Some(selection) = self.select(listener, &authority, &request, start, grpc)
+        else {
+            return advertise(ProxyError::NoRoute.response(grpc));
         };
         let exchange = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
             Exchange::local(StatusCode::NO_CONTENT, "")
