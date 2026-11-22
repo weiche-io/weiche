@@ -10,17 +10,13 @@ use super::{
     resolve::HttpRule,
     tls::{Policies, TlsError, listener_tls, passthrough},
 };
-use kube::{Resource, ResourceExt};
+use kube::{Resource, ResourceExt, runtime::reflector::ObjectRef};
 use serde::Serialize;
 use weiche_gtwapi::v1::{
     gateways::{
         Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From,
     },
-    grpcroutes::{GrpcRoute, GrpcRouteParentRefs},
-    httproutes::{HttpRoute, HttpRouteParentRefs},
-    tcproutes::{TcpRoute, TcpRouteParentRefs},
-    tlsroutes::{TlsRoute, TlsRouteParentRefs},
-    udproutes::{UdpRoute, UdpRouteParentRefs},
+    tlsroutes::TlsRoute,
 };
 
 /// gateway class controller owned by this process.
@@ -184,69 +180,96 @@ pub fn compile(
             message: "listener contains unsupported Route kinds".into(),
         });
     }
-    collect(stores.http_routes.state(), stores, gateway, l, &mut result);
-    collect(stores.grpc_routes.state(), stores, gateway, l, &mut result);
-    collect(stores.tcp_routes.state(), stores, gateway, l, &mut result);
-    collect(stores.tls_routes.state(), stores, gateway, l, &mut result);
-    collect(stores.udp_routes.state(), stores, gateway, l, &mut result);
+    let host = l.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let binding = Binding {
+        stores,
+        listener: l,
+        namespace: &namespace,
+        host: &host,
+    };
+    let name = gateway.name_any();
+    /// bridge the common parent fields of the five generated route schemas.
+    macro_rules! collect {
+        ($store:ident, |$r:ident, $out:ident, $report:ident| $bind:expr, $unattached:expr) => {
+            for $r in oldest_first(stores.$store.state()) {
+                let source = $r.metadata.namespace.as_deref().unwrap_or_default();
+                for p in $r.spec.parent_refs.iter().flatten() {
+                    if p.group
+                        .as_deref()
+                        .is_some_and(|g| g != "gateway.networking.k8s.io")
+                        || p.kind.as_deref().is_some_and(|k| k != "Gateway")
+                        || p.name != name
+                        || p.namespace.as_deref().unwrap_or(source) != namespace
+                    {
+                        continue;
+                    }
+                    let matches = p.section_name.as_deref().is_none_or(|n| n == l.name)
+                        && p.port.is_none_or(|port| port == l.port);
+                    let report = binding.attach(
+                        $r.as_ref(),
+                        p,
+                        matches,
+                        &mut result,
+                        |$out, $report| $bind,
+                        || $unattached,
+                    );
+                    result.reports.push(report);
+                }
+            }
+        };
+    }
+    /// adapt HTTP and gRPC rule lists to the same hostname and rule precedence.
+    macro_rules! http {
+        ($store:ident, $resolve:ident) => {
+            collect!(
+                $store,
+                |r, out, report| {
+                    let ns = r.metadata.namespace.as_deref().unwrap_or_default();
+                    bind_rules(
+                        &host,
+                        out,
+                        report,
+                        r.spec.hostnames.as_deref(),
+                        r.spec.rules.as_deref().unwrap_or_default(),
+                        |rule, policies| stores.$resolve(ns, rule, policies),
+                    )
+                },
+                None
+            );
+        };
+    }
+    http!(http_routes, resolve_http);
+    http!(grpc_routes, resolve_grpc);
+    collect!(
+        tcp_routes,
+        |r, out, report| out.bind_stream(stores.resolve_tcp(&r)?, report),
+        None
+    );
+    collect!(
+        tls_routes,
+        |r, out, report| binding.bind_tls(&r, out, report),
+        stores.tls_ref_error(&r)
+    );
+    collect!(
+        udp_routes,
+        |r, out, report| out.bind_stream(stores.resolve_udp(&r)?, report),
+        None
+    );
     result
 }
 
-/// expose common attachment fields without coupling generated resource types to each other.
-trait Routed: Resource<DynamicType = ()> {
-    /// generated parent reference type.
-    type Parent: Serialize;
-    /// enumerate the declared parents.
-    fn parents(&self) -> &[Self::Parent];
-    /// borrow common parent fields.
-    fn parent(p: &Self::Parent) -> Parent<'_>;
-    /// report backend reference failures when attachment was rejected before binding.
-    fn unattached_ref_error(&self, _stores: &GatewayStores) -> Option<RefError> {
-        None
-    }
-    /// attach this resource to a listener and record its status.
-    fn bind(
-        &self,
-        stores: &GatewayStores,
-        listener: &GatewayListeners,
-        compiled: &mut Compiled,
-        report: &mut RouteReport,
-    ) -> Result<(), ResolveError>;
+/// listener context shared by parent matching and route attachment.
+struct Binding<'a> {
+    /// caches used for namespace grants and backend lookups.
+    stores: &'a GatewayStores,
+    /// namespace of the selected gateway.
+    namespace: &'a str,
+    /// normalized listener hostname.
+    host: &'a str,
+    /// listener receiving routes from permitted namespaces.
+    listener: &'a GatewayListeners,
 }
-/// borrowed parent reference fields shared across route kinds.
-struct Parent<'a> {
-    /// target API group.
-    group: Option<&'a str>,
-    /// target resource kind.
-    kind: Option<&'a str>,
-    /// namespace override for the parent.
-    namespace: Option<&'a str>,
-    /// name of the referenced gateway.
-    name: &'a str,
-    /// optional listener name.
-    section: Option<&'a str>,
-    /// optional listener port.
-    port: Option<u16>,
-}
-/// adapt generated parent references into the common attachment interface.
-macro_rules! parents {
-    ($parent:ty) => {
-        type Parent = $parent;
-        fn parents(&self) -> &[Self::Parent] {
-            self.spec.parent_refs.as_deref().unwrap_or_default()
-        }
-        fn parent(p: &Self::Parent) -> Parent<'_> {
-            Parent {
-                group: p.group.as_deref(),
-                kind: p.kind.as_deref(),
-                namespace: p.namespace.as_deref(),
-                name: &p.name,
-                section: p.section_name.as_deref(),
-                port: p.port,
-            }
-        }
-    };
-}
+
 impl RouteReport {
     /// mark an attachment as unaccepted.
     fn reject(&mut self, reason: &'static str, message: &str) {
@@ -295,16 +318,14 @@ fn intersecting_hosts(
 
 /// attach HTTP and gRPC rules using their original hostnames within the selected listener.
 fn bind_rules<R>(
-    listener: &GatewayListeners,
+    listener_host: &str,
     result: &mut Compiled,
     report: &mut RouteReport,
     hostnames: Option<&[String]>,
     rules: &[R],
     mut resolve: impl FnMut(&R, &mut Policies) -> Result<HttpRule, ResolveError>,
 ) -> Result<(), ResolveError> {
-    let listener_host =
-        listener.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
-    let hosts = intersecting_hosts(&listener_host, hostnames.unwrap_or_default(), report);
+    let hosts = intersecting_hosts(listener_host, hostnames.unwrap_or_default(), report);
     if hosts.is_empty() {
         return Ok(());
     }
@@ -327,7 +348,7 @@ fn bind_rules<R>(
                 result.routes.push(Route {
                     hostname: hostname.clone(),
                     host: (!listener_host.is_empty()).then(|| RouteHost {
-                        listener: listener_host.clone(),
+                        listener: listener_host.into(),
                         route: host.clone(),
                     }),
                     http: http.clone(),
@@ -345,146 +366,85 @@ fn bind_rules<R>(
     Ok(())
 }
 
-/// adapt each generated rule type to the shared listener attachment logic.
-macro_rules! http_route {
-    ($route:ty, $parent:ty, $resolve:ident) => {
-        impl Routed for $route {
-            parents!($parent);
-            fn bind(
-                &self,
-                stores: &GatewayStores,
-                listener: &GatewayListeners,
-                result: &mut Compiled,
-                report: &mut RouteReport,
-            ) -> Result<(), ResolveError> {
-                let namespace = self.metadata.namespace.as_deref().unwrap_or_default();
-                bind_rules(
-                    listener,
-                    result,
-                    report,
-                    self.spec.hostnames.as_deref(),
-                    self.spec.rules.as_deref().unwrap_or_default(),
-                    |rule, policies| stores.$resolve(namespace, rule, policies),
-                )
-            }
-        }
-    };
-}
-http_route!(HttpRoute, HttpRouteParentRefs, resolve_http);
-http_route!(GrpcRoute, GrpcRouteParentRefs, resolve_grpc);
-
-/// bind a raw transport route to its first eligible listener target.
-macro_rules! stream_route {
-    ($route:ty,$parent:ty,$resolve:ident) => {
-        impl Routed for $route {
-            parents!($parent);
-            fn bind(
-                &self,
-                stores: &GatewayStores,
-                _: &GatewayListeners,
-                result: &mut Compiled,
-                report: &mut RouteReport,
-            ) -> Result<(), ResolveError> {
-                let backend = stores.$resolve(self)?;
-                report.references(
-                    backend.backends.iter().find_map(|(_, b)| b.as_ref().err()),
-                );
-                // routes arrive oldest first. every allowed parent receives a status entry.
-                result.stream.get_or_insert(backend);
-                Ok(())
-            }
-        }
-    };
-}
-stream_route!(TcpRoute, TcpRouteParentRefs, resolve_tcp);
-stream_route!(UdpRoute, UdpRouteParentRefs, resolve_udp);
-
-impl Routed for TlsRoute {
-    parents!(TlsRouteParentRefs);
-
-    fn unattached_ref_error(&self, stores: &GatewayStores) -> Option<RefError> {
-        stores.tls_ref_error(self)
+impl Compiled {
+    /// retain the oldest stream route and report all eligible attachments.
+    fn bind_stream(
+        &mut self,
+        backend: StreamRoute,
+        report: &mut RouteReport,
+    ) -> Result<(), ResolveError> {
+        report.references(backend.backends.iter().find_map(|(_, b)| b.as_ref().err()));
+        self.stream.get_or_insert(backend);
+        Ok(())
     }
+}
 
+impl Binding<'_> {
     /// keep the oldest backend per original hostname within this listener.
-    fn bind(
+    fn bind_tls(
         &self,
-        stores: &GatewayStores,
-        listener: &GatewayListeners,
+        route: &TlsRoute,
         result: &mut Compiled,
         report: &mut RouteReport,
     ) -> Result<(), ResolveError> {
-        let listener_host =
-            listener.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
-        let hosts = intersecting_hosts(&listener_host, &self.spec.hostnames, report);
+        let hosts = intersecting_hosts(self.host, &route.spec.hostnames, report);
         if hosts.is_empty() {
             return Ok(());
         }
-        let backend = Arc::new(stores.resolve_tls(self)?);
+        let backend = Arc::new(self.stores.resolve_tls(route)?);
         report.references(backend.backends.iter().find_map(|(_, b)| b.as_ref().err()));
         for (_, original) in hosts {
             result.sni_routes.entry(original).or_insert_with(|| backend.clone());
         }
         Ok(())
     }
+
+    /// evaluate a gateway parent against this listener and bind an eligible route.
+    fn attach<R: Resource<DynamicType = ()>>(
+        &self,
+        route: &R,
+        parent: &impl Serialize,
+        matches: bool,
+        result: &mut Compiled,
+        bind: impl FnOnce(&mut Compiled, &mut RouteReport) -> Result<(), ResolveError>,
+        unattached: impl FnOnce() -> Option<RefError>,
+    ) -> RouteReport {
+        let source = route.meta().namespace.as_deref().unwrap_or_default();
+        let mut report = RouteReport {
+            uid: route.uid(),
+            parent: serde_json::to_value(parent).expect("parent reference serializes"),
+            accepted: true,
+            reason: "Accepted",
+            message: "route attached to listener".into(),
+            resolved: true,
+            refs_reason: "ResolvedRefs",
+            partially_invalid: None,
+        };
+        if !matches {
+            report.reject("NoMatchingParent", "listener does not match parentRef");
+        } else if !result.supported_kinds.contains(&R::kind(&()).as_ref())
+            || !allows_route(self.stores, self.listener, self.namespace, source)
+        {
+            report.reject(
+                "NotAllowedByListeners",
+                "listener does not allow this route namespace or kind",
+            );
+        } else if let Err(error) = bind(result, &mut report) {
+            report.reject(error.reason(), "unsupported route rule");
+        }
+        if !report.accepted {
+            report.references(unattached().as_ref());
+        }
+        report
+    }
 }
 
-/// evaluate matching parent references in stable route precedence order.
-fn collect<R: Routed>(
-    mut routes: Vec<Arc<R>>,
-    stores: &GatewayStores,
-    gateway: &Gateway,
-    l: &GatewayListeners,
-    result: &mut Compiled,
-) {
-    let namespace = gateway.namespace().unwrap_or_default();
-    let kind = R::kind(&());
+/// resolve timestamp ties by namespace and name before attaching routes.
+fn oldest_first<R: Resource>(mut routes: Vec<Arc<R>>) -> Vec<Arc<R>> {
     routes.sort_by_key(|r| {
         (r.meta().creation_timestamp.clone(), r.namespace(), r.name_any())
     });
-    for route in routes {
-        let source = route.namespace().unwrap_or_default();
-        for reference in route.parents() {
-            let p = R::parent(reference);
-            if p.group.unwrap_or("gateway.networking.k8s.io")
-                != "gateway.networking.k8s.io"
-                || p.kind.unwrap_or("Gateway") != "Gateway"
-                || p.name != gateway.name_any()
-                || p.namespace.unwrap_or(&source) != namespace
-            {
-                continue;
-            }
-            let mut report = RouteReport {
-                uid: route.uid(),
-                parent: serde_json::to_value(reference)
-                    .expect("parent reference serializes"),
-                accepted: true,
-                reason: "Accepted",
-                message: "route attached to listener".into(),
-                resolved: true,
-                refs_reason: "ResolvedRefs",
-                partially_invalid: None,
-            };
-            if p.section.is_some_and(|n| n != l.name)
-                || p.port.is_some_and(|port| port != l.port)
-            {
-                report.reject("NoMatchingParent", "listener does not match parentRef");
-            } else if !result.supported_kinds.contains(&kind.as_ref())
-                || !allows_route(stores, l, &namespace, &source)
-            {
-                report.reject(
-                    "NotAllowedByListeners",
-                    "listener does not allow this route namespace or kind",
-                );
-            } else if let Err(error) = route.bind(stores, l, result, &mut report) {
-                report.reject(error.reason(), "unsupported route rule");
-            }
-            if !report.accepted {
-                report.references(route.unattached_ref_error(stores).as_ref());
-            }
-            result.reports.push(report);
-        }
-    }
+    routes
 }
 
 /// check listener namespace policy against the route namespace.
@@ -494,21 +454,14 @@ fn allows_route(
     namespace: &str,
     source: &str,
 ) -> bool {
-    let Some(allowed) = &l.allowed_routes else {
-        return source == namespace;
-    };
-    match allowed.namespaces.as_ref().and_then(|n| n.from.as_ref()) {
+    let policy = l.allowed_routes.as_ref().and_then(|r| r.namespaces.as_ref());
+    match policy.and_then(|n| n.from.as_ref()) {
         Some(From::All) => true,
         Some(From::Selector) => {
-            let Some(selector) =
-                allowed.namespaces.as_ref().and_then(|n| n.selector.as_ref())
-            else {
+            let Some(selector) = policy.and_then(|n| n.selector.as_ref()) else {
                 return false;
             };
-            let Some(ns) = stores
-                .namespaces
-                .get(&kube::runtime::reflector::ObjectRef::new(source))
-            else {
+            let Some(ns) = stores.namespaces.get(&ObjectRef::new(source)) else {
                 return false;
             };
             let labels = ns.labels();
