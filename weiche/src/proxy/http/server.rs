@@ -1,14 +1,17 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
-    admission::Permit,
+    admission::{Admission, Permit},
     config::RuntimeConfig,
     io::{AcceptedTls, Io, TlsIo},
     stopped,
     up::Tunnel,
 };
 use super::ProxyService;
-use compio::{net::TcpStream, runtime::time::timeout};
+use compio::{
+    net::{TcpListener, TcpStream},
+    runtime::{self, time::timeout},
+};
 use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::server::conn::auto::Builder;
@@ -54,6 +57,47 @@ impl Server {
             drain_timeout: config.connection_drain_timeout,
             handshake_timeout: config.tls_handshake_timeout,
         }
+    }
+
+    /// own the accept future and drain only the connections belonging to this binding.
+    pub async fn accept(
+        self: Rc<Self>,
+        socket: TcpListener,
+        binding: Rc<Binding>,
+        admission: Arc<Admission>,
+        mut certs: watch::Receiver<Rc<[Arc<ServerTls>]>>,
+        drain: Duration,
+    ) -> io::Result<()> {
+        let (connections, _) = watch::channel(false);
+        {
+            let mut accepting = std::pin::pin!(socket.accept());
+            loop {
+                let (stream, peer) = tokio::select! {
+                    biased;
+                    changed = certs.changed() => {
+                        if changed.is_err() { break }
+                        continue;
+                    }
+                    accepted = &mut accepting => accepted?,
+                };
+                accepting.set(socket.accept());
+                if let Some(permit) = admission.acquire() {
+                    runtime::spawn(self.clone().serve(
+                        binding.clone(),
+                        certs.borrow().clone(),
+                        stream,
+                        peer,
+                        permit,
+                        connections.subscribe(),
+                    ))
+                    .detach();
+                }
+            }
+        }
+        drop(socket);
+        connections.send_replace(true);
+        let _ = timeout(drain, connections.closed()).await;
+        Ok(())
     }
 
     /// retain admission through HTTP serving and any subsequent tunnel.

@@ -7,13 +7,7 @@ use super::{
     net::{ListenerGroup, WorkerStatus, listen_tcp, quic, tcp, udp},
     stopped,
 };
-use compio::{
-    net::TcpListener,
-    runtime::{
-        self,
-        time::{sleep, timeout},
-    },
-};
+use compio::runtime::time::sleep;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{collections::BTreeMap, io, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::watch;
@@ -72,15 +66,16 @@ pub async fn run(
                         watch::channel(Rc::from(routes.listener.tls.as_slice()));
                     sockets.insert(*address, (binding.clone(), certs));
                     serving.push(
-                        accept(
-                            socket,
-                            server.clone(),
-                            binding,
-                            admission.clone(),
-                            rx,
-                            runtime.worker_drain_timeout,
-                        )
-                        .boxed_local(),
+                        server
+                            .clone()
+                            .accept(
+                                socket,
+                                binding,
+                                admission.clone(),
+                                rx,
+                                runtime.worker_drain_timeout,
+                            )
+                            .boxed_local(),
                     );
                 }
                 Err(error) => tracing::warn!(%address,%error,"listener bind failed"),
@@ -194,31 +189,14 @@ pub async fn run(
                     tcp::serve(s, rx, admission.clone(), runtime.clone(), tcp::forward)
                         .boxed_local()
                 }),
-                Transport::Udp => {
-                    let socket = if runtime.http3 {
-                        listeners
-                            .datagrams
-                            .acquire(address, id, runtime.workers.get(), false)
-                            .map(|(socket, reader)| (socket, Some(reader)))
-                    } else {
-                        udp::listen(address).map(|s| (s, None))
-                    };
-                    socket.map(|(socket, reader)| {
-                        let admission = admission.clone();
-                        let idle = runtime.upstream_idle_timeout;
-                        async move {
-                            if let Some(_reader) = reader {
-                                let result =
-                                    udp::serve(socket.clone(), rx, admission, idle).await;
-                                socket.close().await?;
-                                result
-                            } else {
-                                udp::serve(socket, rx, admission, idle).await
-                            }
-                        }
-                        .boxed_local()
-                    })
-                }
+                Transport::Udp => udp::bind(
+                    address,
+                    id,
+                    &listeners.datagrams,
+                    &runtime,
+                    rx,
+                    admission.clone(),
+                ),
             };
             match task {
                 Ok(task) => {
@@ -275,45 +253,4 @@ fn update<T: PartialEq>(tx: &watch::Sender<Arc<T>>, desired: &Arc<T>) {
         *current = desired.clone();
         true
     });
-}
-
-/// own the accept future and drain only the connections belonging to this binding.
-async fn accept(
-    socket: TcpListener,
-    server: Rc<Server>,
-    binding: Rc<Binding>,
-    admission: Arc<Admission>,
-    mut certs: watch::Receiver<Rc<[Arc<ServerTls>]>>,
-    drain: std::time::Duration,
-) -> io::Result<()> {
-    let (connections, _) = watch::channel(false);
-    {
-        let mut accepting = std::pin::pin!(socket.accept());
-        loop {
-            let (stream, peer) = tokio::select! {
-                biased;
-                changed = certs.changed() => {
-                    if changed.is_err() { break }
-                    continue;
-                }
-                accepted = &mut accepting => accepted?,
-            };
-            accepting.set(socket.accept());
-            if let Some(permit) = admission.acquire() {
-                runtime::spawn(server.clone().serve(
-                    binding.clone(),
-                    certs.borrow().clone(),
-                    stream,
-                    peer,
-                    permit,
-                    connections.subscribe(),
-                ))
-                .detach();
-            }
-        }
-    }
-    drop(socket);
-    connections.send_replace(true);
-    let _ = timeout(drain, connections.closed()).await;
-    Ok(())
 }

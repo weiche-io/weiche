@@ -3,13 +3,15 @@ use super::{
     super::{
         super::ir::StreamRoute,
         admission::{Admission, Permit},
+        config::RuntimeConfig,
     },
     bind_socket,
+    group::Groups,
 };
 use compio::{net::UdpSocket, runtime::time::timeout};
 use futures::{
-    StreamExt,
-    future::{AbortHandle, abortable},
+    FutureExt, StreamExt,
+    future::{AbortHandle, LocalBoxFuture, abortable},
     stream::FuturesUnordered,
 };
 use std::{
@@ -29,6 +31,29 @@ const MAX_PACKET: usize = 65535;
 pub fn listen(address: SocketAddr) -> io::Result<UdpSocket> {
     let socket = bind_socket(address, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
     UdpSocket::from_std(socket.into())
+}
+
+/// bind a raw listener and reserve its group slot through socket close when sharing UDP with QUIC.
+pub fn bind(
+    address: SocketAddr,
+    id: usize,
+    groups: &Groups,
+    config: &RuntimeConfig,
+    routes: watch::Receiver<Arc<StreamRoute>>,
+    admission: Arc<Admission>,
+) -> io::Result<LocalBoxFuture<'static, io::Result<()>>> {
+    let idle = config.upstream_idle_timeout;
+    if !config.http3 {
+        return Ok(serve(listen(address)?, routes, admission, idle).boxed_local());
+    }
+    let (socket, reader) = groups.acquire(address, id, config.workers.get(), false)?;
+    Ok(async move {
+        let result = serve(socket.clone(), routes, admission, idle).await;
+        socket.close().await?;
+        drop(reader);
+        result
+    }
+    .boxed_local())
 }
 
 /// upstream socket and idle accounting for one downstream peer.
