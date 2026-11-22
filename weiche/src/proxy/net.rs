@@ -8,7 +8,7 @@ pub mod udp;
 
 use super::super::ir::{Revision, Transport};
 use compio::net::TcpListener;
-use std::{collections::BTreeSet, io, net::SocketAddr, sync::Mutex};
+use std::{collections::BTreeSet, io, net::SocketAddr};
 use tokio::sync::watch;
 
 /// sockets successfully applied at one worker revision.
@@ -19,56 +19,40 @@ pub struct WorkerStatus {
     /// transport and address pairs the worker successfully bound.
     pub bound: BTreeSet<(Transport, SocketAddr)>,
 }
-/// latest binding reports from the local workers.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WorkerGroupState {
-    /// one report per configured worker.
-    pub workers: Vec<WorkerStatus>,
-}
-impl WorkerGroupState {
-    /// check that every worker bound a socket at the requested revision.
-    pub fn programmed(
-        &self,
-        revision: Revision,
-        address: (Transport, SocketAddr),
-    ) -> bool {
-        !self.workers.is_empty()
-            && self
-                .workers
-                .iter()
-                .all(|w| w.revision == revision && w.bound.contains(&address))
-    }
+/// latest binding reports indexed by worker.
+pub type WorkerGroupState = Vec<WorkerStatus>;
 
-    /// check that every worker is currently serving at least one bound listener.
-    pub fn serving(&self) -> bool {
-        !self.workers.is_empty() && self.workers.iter().all(|w| !w.bound.is_empty())
-    }
-}
 /// publish consistent binding reports for the worker group.
 pub struct ListenerGroup {
     /// ordered UDP bindings when HTTP/3 shares a worker group with raw UDP.
     pub datagrams: group::Groups,
-    /// latest report at each worker index.
-    workers: Mutex<Vec<WorkerStatus>>,
+    /// number of slots to publish with the first changed worker report.
+    count: usize,
     /// channel carrying combined reports to the readiness monitor.
     state: watch::Sender<WorkerGroupState>,
 }
 impl ListenerGroup {
-    /// allocate a status slot for each configured worker.
-    pub fn new(count: usize, state: watch::Sender<WorkerGroupState>) -> Self {
-        Self {
-            datagrams: group::Groups::default(),
-            workers: Mutex::new(vec![WorkerStatus::default(); count]),
-            state,
-        }
+    /// start an empty watch and reserve one report index for each configured worker.
+    pub fn new(count: usize) -> (Self, watch::Receiver<WorkerGroupState>) {
+        let (state, reports) = watch::channel(Vec::new());
+        (Self { datagrams: group::Groups::default(), count, state }, reports)
     }
+
     /// publish a fresh group report when a worker changes state.
     pub fn report(&self, id: usize, status: WorkerStatus) {
-        let mut workers = self.workers.lock().unwrap();
-        if workers[id] != status {
+        self.state.send_if_modified(|workers| {
+            if workers.is_empty() {
+                if status == WorkerStatus::default() {
+                    return false;
+                }
+                workers.resize(self.count, WorkerStatus::default());
+            }
+            if workers[id] == status {
+                return false;
+            }
             workers[id] = status;
-            self.state.send_replace(WorkerGroupState { workers: workers.clone() });
-        }
+            true
+        });
     }
 }
 

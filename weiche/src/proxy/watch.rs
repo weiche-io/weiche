@@ -5,7 +5,7 @@ use super::{
         wire::{self, SNAPSHOT_KEY},
     },
     config,
-    net::WorkerGroupState,
+    net::{WorkerGroupState, WorkerStatus},
     stopped,
 };
 use anyhow::{Context, ensure};
@@ -96,12 +96,12 @@ impl Desired {
     }
 
     /// check every expected socket against its worker acknowledgements.
-    fn applied(&self, workers: &WorkerGroupState) -> bool {
+    fn applied(&self, workers: &[WorkerStatus]) -> bool {
         !self.sockets.is_empty()
-            && self
-                .sockets
-                .iter()
-                .all(|&socket| workers.programmed(self.revision, socket))
+            && !workers.is_empty()
+            && workers.iter().all(|worker| {
+                worker.revision == self.revision && self.sockets.is_subset(&worker.bound)
+            })
     }
 }
 
@@ -167,7 +167,10 @@ pub async fn run(
                     serving = Some((next.version.clone(), next.listeners.clone()));
                 }
                 // keep the last acknowledgement while workers converge on a nonempty snapshot.
-                Some(next) if !next.sockets.is_empty() && group.serving() => {}
+                Some(next)
+                    if !next.sockets.is_empty()
+                        && !group.is_empty()
+                        && group.iter().all(|w| !w.bound.is_empty()) => {}
                 _ => serving = None,
             }
         }

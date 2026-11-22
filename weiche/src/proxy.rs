@@ -13,7 +13,7 @@ use admission::Admission;
 use anyhow::Context;
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use config::RuntimeConfig;
-use net::{ListenerGroup, WorkerGroupState};
+use net::ListenerGroup;
 use std::{mem::DropGuard, sync::Arc, thread};
 use tokio::sync::{
     oneshot,
@@ -127,7 +127,7 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
     policy.validate()?;
     let policy = Arc::new(policy);
     let (writer, reader) = config::channel(GatewaySnapshot::default());
-    let (reports, state) = channel(WorkerGroupState::default());
+    let (listeners, state) = ListenerGroup::new(policy.workers.get());
     let (stop, shutdown) = channel(false);
     let mut threads = Threads { stop, handles: Vec::new() };
     let http3 = policy.http3;
@@ -140,7 +140,7 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
             .block_on(watch::run(name, http3, writer, state, watch_stop))
     })?;
 
-    let listeners = Arc::new(ListenerGroup::new(policy.workers.get(), reports));
+    let listeners = Arc::new(listeners);
     let admission = Arc::new(Admission::new(policy.downstream_connections_global.get()));
     for id in 1..policy.workers.get() {
         // construct the worker-local future on its owning runtime.
