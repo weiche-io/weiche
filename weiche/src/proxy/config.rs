@@ -96,14 +96,12 @@ impl RuntimeConfig {
                 && self.http2_max_concurrent_streams > 0,
             "invalid HTTP parser limits"
         );
-        ensure!(
-            !self.listener_retry_interval.is_zero(),
-            "listener retry interval must be positive"
-        );
-        ensure!(
-            !self.tcp_connect_timeout.is_zero(),
-            "tcp connect timeout must be positive"
-        );
+        for (timeout, message) in [
+            (self.listener_retry_interval, "listener retry interval must be positive"),
+            (self.tcp_connect_timeout, "tcp connect timeout must be positive"),
+        ] {
+            ensure!(!timeout.is_zero(), message);
+        }
         ensure!(
             self.worker_drain_timeout >= self.connection_drain_timeout,
             "worker drain must allow connection drain to finish"
