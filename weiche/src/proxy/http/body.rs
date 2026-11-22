@@ -23,40 +23,6 @@ pub enum RequestBody {
     ),
 }
 
-impl Body for RequestBody {
-    type Data = Bytes;
-    type Error = io::Error;
-
-    /// poll the transport directly, preserving data and trailer frames.
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        match self.get_mut() {
-            Self::Incoming(body) => {
-                Pin::new(body).poll_frame(cx).map_err(io::Error::other)
-            }
-            Self::Stream(body) => body.as_mut().poll_frame(cx),
-        }
-    }
-
-    /// report when the transport has finished the upload.
-    fn is_end_stream(&self) -> bool {
-        match self {
-            Self::Incoming(body) => body.is_end_stream(),
-            Self::Stream(body) => body.is_end_stream(),
-        }
-    }
-
-    /// expose the transport's size estimate for upstream framing.
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Incoming(body) => body.size_hint(),
-            Self::Stream(body) => body.size_hint(),
-        }
-    }
-}
-
 /// downstream response with either a complete local payload or a leased upstream body.
 pub enum ResponseBody {
     /// local response with a known length.
@@ -78,36 +44,44 @@ impl ResponseBody {
     }
 }
 
-impl Body for ResponseBody {
-    type Data = Bytes;
-    type Error = io::Error;
+/// forward both inline body variants and normalize the first variant's transport error.
+macro_rules! forward_body {
+    ($name:ident, $first:ident, $second:ident) => {
+        impl Body for $name {
+            type Data = Bytes;
+            type Error = io::Error;
 
-    /// deliver a local payload or poll the upstream for its next frame.
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        match self.get_mut() {
-            Self::Full(body) => {
-                Pin::new(body).poll_frame(cx).map_err(|never| match never {})
+            /// preserve data and trailer frames from the active body.
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+                match self.get_mut() {
+                    Self::$first(body) => {
+                        Pin::new(body).poll_frame(cx).map_err(io::Error::other)
+                    }
+                    Self::$second(body) => Pin::new(body).poll_frame(cx),
+                }
             }
-            Self::Upstream(body) => Pin::new(body).poll_frame(cx),
-        }
-    }
 
-    /// report when the response has no more data or trailers.
-    fn is_end_stream(&self) -> bool {
-        match self {
-            Self::Full(body) => body.is_end_stream(),
-            Self::Upstream(body) => body.is_end_stream(),
-        }
-    }
+            /// report whether the active body has finished.
+            fn is_end_stream(&self) -> bool {
+                match self {
+                    Self::$first(body) => body.is_end_stream(),
+                    Self::$second(body) => body.is_end_stream(),
+                }
+            }
 
-    /// preserve the payload size known by the selected body.
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Full(body) => body.size_hint(),
-            Self::Upstream(body) => body.size_hint(),
+            /// preserve the active body's framing estimate.
+            fn size_hint(&self) -> SizeHint {
+                match self {
+                    Self::$first(body) => body.size_hint(),
+                    Self::$second(body) => body.size_hint(),
+                }
+            }
         }
-    }
+    };
 }
+
+forward_body!(RequestBody, Incoming, Stream);
+forward_body!(ResponseBody, Full, Upstream);
