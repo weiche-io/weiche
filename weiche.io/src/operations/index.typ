@@ -117,11 +117,12 @@ namespace:
 - `Service`: `ClusterIP`, `LoadBalancer` or `NodePort` configured by
   `proxy.service.*` (`ipFamilyPolicy`, `ipFamilies`, `externalTrafficPolicy`
   and default annotations), selecting pods by `weiche.io/gateway-uid: <uid>`
-  and exposing deduplicated listener ports. Static IPv4/IPv6 requests in
-  `Gateway.spec.addresses` map to `clusterIP`/`clusterIPs` or
-  `loadBalancerIP`, and `Gateway.spec.infrastructure` labels and annotations
-  propagate to provisioned resources while preserving controller selector and
-  ownership labels.
+  and exposing deduplicated listener ports (including matching `UDP` ports for
+  accepted `HTTPS` listeners when `proxy.http3.enabled: true`). Static
+  IPv4/IPv6 requests in `Gateway.spec.addresses` map to
+  `clusterIP`/`clusterIPs` or `loadBalancerIP`, and `Gateway.spec.infrastructure`
+  labels and annotations propagate to provisioned resources while preserving
+  controller selector and ownership labels.
 
 Each proxy watches only its own `Secret`. Once all local `compio` workers bind
 every socket for a snapshot revision, the proxy atomically writes the digest to
@@ -197,7 +198,7 @@ TLS rotation happens in place without restarting proxy pods:
 Checking the `Gateway` status or hitting the `Service` VIP once can miss a
 lagging replica. After rotating a Secret, confirm that every proxy pod has
 acknowledged the same snapshot digest and inspect the certificate actually
-served by each replica (both pods under the default `proxy.replicas: 2`):
+served by each replica (for example, when running `proxy.replicas: 2`):
 
 ```sh
 GW_NS=edge-gateways
