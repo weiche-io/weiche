@@ -1,6 +1,9 @@
 //! upstream HTTP client handshakes and connections on the owning compio runtime.
 use super::{
-    super::{core::EndpointKey, io::Io},
+    super::{
+        core::{EndpointKey, http::Body},
+        io::Io,
+    },
     deadline::TimedBody,
     tls,
 };
@@ -8,12 +11,12 @@ use bytes::Bytes;
 use compio::{net::TcpStream, runtime};
 use cyper_core::{CompioExecutor, CompioTimer};
 use hyper::{
-    body::{Body, Incoming},
+    body::Body as HttpBody,
     client::conn::{http1, http2},
 };
 
 /// request sender paired with its worker-local connection driver.
-pub struct Connected<S = http1::SendRequest<TimedBody<Incoming>>> {
+pub struct Connected<S = http1::SendRequest<TimedBody<Body>>> {
     /// hyper handle for dispatching requests.
     pub sender: S,
     /// cancelling a lease also cancels its driver on the owning runtime.
@@ -48,7 +51,7 @@ impl Connector {
         endpoint: &EndpointKey,
     ) -> anyhow::Result<Connected<http2::SendRequest<B>>>
     where
-        B: Body<Data = Bytes, Error = std::io::Error> + Unpin + 'static,
+        B: HttpBody<Data = Bytes, Error = std::io::Error> + Unpin + 'static,
     {
         let (sender, connection) = http2::Builder::new(CompioExecutor)
             .timer(CompioTimer)

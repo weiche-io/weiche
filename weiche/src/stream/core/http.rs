@@ -22,7 +22,6 @@ use http::{
     uri::Authority,
 };
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use router::{Hosts, Router};
 use std::{
     cell::RefCell,
@@ -34,7 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// streaming response leases stay on the owning compio worker.
+/// streaming request and response bodies stay on the owning compio worker.
 pub type Body = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = std::io::Error>>>;
 
 /// routing state installed atomically on one worker.
@@ -146,6 +145,8 @@ pub struct ProxyService {
     pool: Rc<ConnectionPool>,
     /// client dispatching on the worker runtime.
     upstream: UpstreamClient,
+    /// alternative services for the HTTPS sockets with a bound QUIC endpoint.
+    advertised: RefCell<BTreeMap<SocketAddr, (Rc<Binding>, HeaderValue)>>,
 }
 
 impl ProxyService {
@@ -159,6 +160,7 @@ impl ProxyService {
         pool.reconcile(&endpoints);
         Ok(Self {
             view: RefCell::new(view),
+            advertised: RefCell::default(),
             upstream: UpstreamClient::new(pool.clone()),
             pool,
         })
@@ -178,6 +180,18 @@ impl ProxyService {
         Ok(snapshot.revision)
     }
 
+    /// publish or withdraw the default alternative for one bound QUIC endpoint.
+    pub fn set_http3(&self, binding: &Rc<Binding>, port: Option<u16>) {
+        let mut active = self.advertised.borrow_mut();
+        if let Some(port) = port {
+            let value =
+                format!("h3=\":{port}\"; ma=86400").parse().expect("numeric port");
+            active.insert(binding.address, (binding.clone(), value));
+        } else {
+            active.remove(&binding.address);
+        }
+    }
+
     /// close the worker pool during shutdown.
     pub fn close(&self) {
         self.pool.close();
@@ -188,7 +202,7 @@ impl ProxyService {
         &self,
         listener: &Binding,
         authority: &Authority,
-        request: &Request<Incoming>,
+        request: &Request<Body>,
         start: Instant,
         grpc: bool,
     ) -> Result<Selection, ProxyError> {
@@ -222,36 +236,59 @@ impl ProxyService {
     }
 
     /// route the original request and apply response filters to the selected response.
-    pub async fn call(
+    pub async fn call<B>(
         &self,
         listener: &Binding,
         peer: SocketAddr,
-        mut request: Request<Incoming>,
-    ) -> (Response<Body>, Option<Tunnel>) {
+        request: Request<B>,
+    ) -> (Response<Body>, Option<Tunnel>)
+    where
+        B: hyper::body::Body<Data = Bytes> + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let mut request =
+            request.map(|b| Box::pin(b.map_err(std::io::Error::other)) as Body);
         let start = Instant::now();
         let version = request.version();
-        if request.method() == http::Method::CONNECT {
-            return (ProxyError::UnsupportedUpgrade.response(), None);
+        let advertise = |mut response: Response<Body>| {
+            if listener.tls
+                && version != Version::HTTP_3
+                && let Some((active, value)) =
+                    self.advertised.borrow().get(&listener.address)
+                && **active == *listener
+            {
+                response
+                    .headers_mut()
+                    .entry(header::ALT_SVC)
+                    .or_insert_with(|| value.clone());
+            }
+            response
+        };
+        if request.method() == http::Method::CONNECT
+            || (version == Version::HTTP_3
+                && request.headers().contains_key(header::UPGRADE))
+        {
+            return (advertise(ProxyError::UnsupportedUpgrade.response()), None);
         }
         let authority = match normalize_authority(&mut request) {
             Ok(authority) => authority,
-            Err(error) => return (error.response(), None),
+            Err(error) => return (advertise(error.response()), None),
         };
         let grpc = is_grpc(&request);
         let selection = match self.select(listener, &authority, &request, start, grpc) {
             Ok(s) => s,
-            Err(error) => return (error.for_request(grpc), None),
+            Err(error) => return (advertise(error.for_request(grpc)), None),
         };
-        let (mut response, tunnel) =
-            if selection.cors.as_ref().is_some_and(|c| c.preflight) {
-                let mut response = Response::new(full_body(Bytes::new()));
-                *response.status_mut() = StatusCode::NO_CONTENT;
-                (response, None)
-            } else {
-                self.forward(listener, peer, request, &authority, &selection)
-                    .await
-                    .unwrap_or_else(|error| (error.for_request(selection.grpc), None))
-            };
+        let (response, tunnel) = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
+            let mut response = Response::new(full_body(Bytes::new()));
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            (response, None)
+        } else {
+            self.forward(listener, peer, request, &authority, &selection)
+                .await
+                .unwrap_or_else(|error| (error.for_request(selection.grpc), None))
+        };
+        let mut response = advertise(response);
         *response.version_mut() = version;
         let headers = response.headers_mut();
         let backend_changes = selection
@@ -263,7 +300,7 @@ impl ProxyService {
             filter::modify(headers, &selection.rule.response_headers);
             strip_hop_headers(headers);
         }
-        if response.version() != Version::HTTP_2
+        if !matches!(version, Version::HTTP_2 | Version::HTTP_3)
             && response.headers().contains_key(header::TRAILER)
         {
             response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -282,7 +319,7 @@ impl ProxyService {
         &self,
         listener: &Binding,
         peer: SocketAddr,
-        mut request: Request<Incoming>,
+        mut request: Request<Body>,
         original: &Authority,
         selection: &Selection,
     ) -> Result<(Response<Body>, Option<Tunnel>), ProxyError> {
@@ -305,6 +342,13 @@ impl ProxyService {
         } else {
             None
         };
+        if request.version() == Version::HTTP_3 {
+            // http/3 can receive trailers even without an explicit TE field.
+            request
+                .headers_mut()
+                .entry(header::TE)
+                .or_insert(HeaderValue::from_static("trailers"));
+        }
         let (authority, trailers) = filter::request_headers(
             request.headers_mut(),
             peer,
@@ -391,7 +435,7 @@ enum ProxyError {
 
 /// recognize native gRPC media types with an optional codec suffix and parameters.
 fn is_grpc<B>(request: &Request<B>) -> bool {
-    request.version() == Version::HTTP_2
+    matches!(request.version(), Version::HTTP_2 | Version::HTTP_3)
         && request.method() == http::Method::POST
         && request
             .headers()
@@ -490,7 +534,7 @@ fn host_authority(headers: &HeaderMap) -> Result<Authority, ProxyError> {
 }
 
 /// expose :authority to header matches and reject conflicting downstream identities.
-fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, ProxyError> {
+fn normalize_authority(request: &mut Request<Body>) -> Result<Authority, ProxyError> {
     if !request.headers().contains_key(header::HOST)
         && let Some(authority) = request.uri().authority()
     {
@@ -507,7 +551,7 @@ fn normalize_authority(request: &mut Request<Incoming>) -> Result<Authority, Pro
 
 /// encode the filtered authority and path for the selected upstream protocol.
 fn prepare_request(
-    request: &mut Request<Incoming>,
+    request: &mut Request<Body>,
     authority: Authority,
     endpoint: &EndpointKey,
     downstream_tls: bool,
@@ -528,6 +572,9 @@ fn prepare_request(
         .get_or_insert_with(|| http::uri::PathAndQuery::from_static("/"));
     match endpoint.protocol {
         Protocol::Http1 => {
+            // an HTTP/3 upload can carry data or trailers without declaring its length.
+            // keep polling through FIN even after the advertised length has arrived.
+            let streaming = request.version() == Version::HTTP_3;
             *request.version_mut() = Version::HTTP_11;
             if !request.headers().contains_key(header::HOST) {
                 request.headers_mut().insert(
@@ -543,7 +590,7 @@ fn prepare_request(
                     .headers_mut()
                     .insert(header::CONNECTION, http::HeaderValue::from_static("TE"));
             }
-            if request.headers().contains_key(header::TRAILER) {
+            if streaming || request.headers().contains_key(header::TRAILER) {
                 request.headers_mut().remove(header::CONTENT_LENGTH);
                 request.headers_mut().insert(
                     header::TRANSFER_ENCODING,

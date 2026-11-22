@@ -1,12 +1,12 @@
 //! request dispatch and conservative retry over the worker's connection pool.
+use super::super::core::http::Body;
 use super::{
     super::super::ir::Protocol,
-    deadline::{Deadlines, TimedBody},
+    deadline::{Deadlines, ResponseDeadline, TimedBody},
     pool::{ConnectionPool, Endpoint, PooledBody},
     upgrade::{Tunnel, Upgrade},
 };
 use http::{Request, Response, StatusCode};
-use hyper::body::Incoming;
 use std::{rc::Rc, time::Instant};
 
 /// a response with its streaming budget and optional upgraded transport.
@@ -22,7 +22,7 @@ enum Attempt {
     /// response headers received from the selected backend.
     Complete(Exchange),
     /// original request was never dispatched.
-    Retry(Request<Incoming>),
+    Retry(Request<Body>),
 }
 
 /// dispatch requests using the worker's bounded pool.
@@ -41,7 +41,7 @@ impl UpstreamClient {
     pub async fn send(
         &self,
         endpoint: Rc<Endpoint>,
-        mut request: Request<Incoming>,
+        mut request: Request<Body>,
         mut upgrade: Option<Upgrade>,
         budget: Deadlines,
     ) -> anyhow::Result<Exchange> {
@@ -56,7 +56,12 @@ impl UpstreamClient {
                 }
             };
             match budget.dispatch(end, attempt).await? {
-                Attempt::Complete(exchange) => return Ok(exchange),
+                Attempt::Complete(mut exchange) => {
+                    if let Some(end) = end {
+                        exchange.response.extensions_mut().insert(ResponseDeadline(end));
+                    }
+                    return Ok(exchange);
+                }
                 Attempt::Retry(untouched) => request = untouched,
             }
         }
@@ -67,7 +72,7 @@ impl UpstreamClient {
     async fn http1(
         &self,
         endpoint: Rc<Endpoint>,
-        request: Request<Incoming>,
+        request: Request<Body>,
         upgrade: Option<Upgrade>,
         first: bool,
         end: Option<Instant>,
@@ -107,7 +112,7 @@ impl UpstreamClient {
     async fn http2(
         &self,
         endpoint: &Rc<Endpoint>,
-        request: Request<Incoming>,
+        request: Request<Body>,
         end: Option<Instant>,
     ) -> anyhow::Result<Attempt> {
         let lease = self.pool.acquire_http2(endpoint).await?;

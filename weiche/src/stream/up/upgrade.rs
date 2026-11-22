@@ -44,7 +44,7 @@ fn protocols(headers: &HeaderMap) -> Option<Vec<HeaderValue>> {
 
 impl Upgrade {
     /// capture a valid client offer before the request extensions reach the upstream.
-    pub fn request(request: &mut Request<Incoming>) -> Option<Self> {
+    pub fn request<B>(request: &mut Request<B>) -> Option<Self> {
         if request.version() != Version::HTTP_11 {
             return None;
         }

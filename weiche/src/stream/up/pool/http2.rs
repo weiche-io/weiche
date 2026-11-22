@@ -1,6 +1,6 @@
 //! a shared HTTP/2 connection and its active request and response streams.
 use super::{
-    super::{connector::Connected, deadline::TimedBody},
+    super::{super::core::http::Body, connector::Connected, deadline::TimedBody},
     ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use bytes::Bytes;
@@ -132,7 +132,7 @@ impl Http2Lease {
     }
 
     /// attach stream accounting before arming the upload deadline.
-    pub fn upload(&self, body: Incoming) -> Upload {
+    pub fn upload(&self, body: Body) -> Upload {
         Upload { body, _stream: self.stream.clone() }
     }
 
@@ -145,21 +145,21 @@ impl Http2Lease {
 /// request body retaining stream capacity until upload completion.
 pub struct Upload {
     /// original streaming upload from the downstream request.
-    body: Incoming,
+    body: Body,
     /// shared stream accounting guard.
     _stream: Rc<Stream>,
 }
 
 impl Upload {
     /// recover a body returned before dispatch for a fresh attempt.
-    pub fn into_inner(self) -> Incoming {
+    pub fn into_inner(self) -> Body {
         self.body
     }
 }
 
 impl hyper::body::Body for Upload {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = std::io::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,

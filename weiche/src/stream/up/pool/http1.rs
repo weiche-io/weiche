@@ -1,6 +1,6 @@
 //! exclusive HTTP/1 leases and idle connection reuse.
 use super::{
-    super::{connector::Connected, deadline::TimedBody},
+    super::{super::core::http::Body, connector::Connected, deadline::TimedBody},
     ConnectionPool, Endpoint, PooledBody, ResponseLease, Slot,
 };
 use compio::runtime;
@@ -91,7 +91,7 @@ pub struct Lease {
 
 impl Lease {
     /// borrow the sender for dispatch.
-    pub fn sender(&mut self) -> &mut SendRequest<TimedBody<Incoming>> {
+    pub fn sender(&mut self) -> &mut SendRequest<TimedBody<Body>> {
         &mut self.connection.transport.sender
     }
     /// report whether a stale idle socket can justify a retry.

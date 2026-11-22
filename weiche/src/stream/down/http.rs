@@ -20,7 +20,7 @@ use tokio::sync::watch;
 /// downstream HTTP/1 and HTTP/2 server configured for one worker.
 pub struct Server {
     /// worker-local routes and connection pools.
-    pub service: ProxyService,
+    pub service: Rc<ProxyService>,
     /// strict HTTP/1 server for a TLS connection negotiated with ALPN.
     http1: http1::Builder,
     /// cleartext protocol detection and HTTP/2 configuration.
@@ -51,7 +51,7 @@ impl Server {
             .max_buf_size(config.http_max_buffer);
         Self {
             http1,
-            service,
+            service: Rc::new(service),
             builder,
             drain_timeout: config.connection_drain_timeout,
             handshake_timeout: config.tls_handshake_timeout,

@@ -6,7 +6,7 @@ mod tls;
 mod upgrade;
 mod upstream;
 
-pub use deadline::Deadlines;
+pub use deadline::{Deadlines, ResponseDeadline};
 pub use pool::{ConnectionPool, Endpoint};
 pub use upgrade::{Tunnel, Upgrade};
 pub use upstream::UpstreamClient;

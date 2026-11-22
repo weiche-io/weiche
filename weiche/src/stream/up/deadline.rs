@@ -11,6 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// absolute cutoff for flushing a streaming response to the downstream transport.
+#[derive(Clone, Copy)]
+pub struct ResponseDeadline(pub Instant);
+
 /// the request deadline survives retries while each attempt gets a fresh backend budget.
 #[derive(Clone, Copy)]
 pub struct Deadlines {
