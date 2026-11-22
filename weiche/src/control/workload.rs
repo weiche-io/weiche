@@ -455,11 +455,17 @@ pub async fn reconcile(
     applied
         .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
         .await?;
+    // an empty snapshot has no sockets for a proxy to serve or acknowledge.
+    let replicas = if plan.issue.is_none() && plan.listeners.iter().any(|l| l.accepted) {
+        settings.replicas
+    } else {
+        0
+    };
     applied
         .ensure::<Deployment>(
             client,
             &target,
-            proxy_deployment(&name, &uid, &labels, settings, infra),
+            proxy_deployment(&name, &uid, &labels, settings, infra, replicas),
         )
         .await?;
     applied
@@ -673,6 +679,7 @@ fn proxy_deployment(
     selector: &Value,
     settings: &Settings,
     infra: Option<&GatewayInfrastructure>,
+    replicas: i32,
 ) -> Value {
     let mut pod_labels = settings.pod_labels.clone();
     if let Some(labels) = infra.and_then(|i| i.labels.as_ref()) {
@@ -782,7 +789,7 @@ fn proxy_deployment(
     }
     json!({
         "spec": {
-            "replicas": settings.replicas,
+            "replicas": replicas,
             "selector": {"matchLabels": selector},
             "template": {
                 "metadata": pod_meta,

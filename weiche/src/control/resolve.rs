@@ -267,8 +267,15 @@ fn resolve_backend(
     source: &str,
     reference: ServiceRef<'_>,
 ) -> Result<ClusterSpec, RefError> {
-    let (service, port) = reference.resolve(stores, namespace, source, Transport::Tcp)?;
+    let (service, mut port) =
+        reference.resolve(stores, namespace, source, Transport::Tcp)?;
     let namespace = reference.namespace.unwrap_or(namespace);
+    // unprefixed appProtocol values are case-insensitive IANA service names.
+    if let Some(name) = &mut port.app_protocol
+        && !name.contains('/')
+    {
+        name.make_ascii_lowercase();
+    }
     // a gRPC route selects HTTP/2 even when the Service omits appProtocol.
     let app = port.app_protocol.as_deref();
     let protocol = match (source, app) {
