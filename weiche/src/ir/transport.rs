@@ -1,7 +1,7 @@
-//! raw transport routing shared by TCP connections and UDP flows.
+//! route raw TCP, UDP and TLS passthrough traffic to weighted backends.
 use super::RefError;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 /// socket namespace and Kubernetes Service port protocol.
 #[derive(
@@ -69,6 +69,37 @@ pub struct StreamListener {
     pub gateway_uid: String,
     /// resolved route currently serving new flows.
     pub route: Arc<StreamRoute>,
+}
+
+/// highest-precedence attached route for each original route hostname.
+pub type SniRoutes = BTreeMap<String, Arc<StreamRoute>>;
+
+/// virtual listeners sharing a TLS passthrough socket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsSocket {
+    /// owner of the binding across live updates.
+    pub gateway_uid: String,
+    /// listener hostname to its attached routes, including listeners with no routes.
+    pub hosts: BTreeMap<String, SniRoutes>,
+}
+
+impl TlsSocket {
+    /// select within the most specific listener even when it has no usable backend.
+    pub fn select(&self, hostname: &str) -> Option<SocketAddr> {
+        let hostname = hostname.to_ascii_lowercase();
+        let listener = lookup(&self.hosts, &hostname)?;
+        lookup(listener, &hostname)?.select()
+    }
+}
+
+/// try the exact name, then each wildcard suffix from longest to shortest, then catch-all.
+fn lookup<'a, T>(hosts: &'a BTreeMap<String, T>, hostname: &str) -> Option<&'a T> {
+    hosts.get(hostname).or_else(|| {
+        hostname
+            .match_indices('.')
+            .find_map(|(dot, _)| hosts.get(&format!("*{}", &hostname[dot..])))
+            .or_else(|| hosts.get(""))
+    })
 }
 
 /// sample a target with its configured weight, including targets that failed resolution.
