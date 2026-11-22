@@ -47,11 +47,11 @@ impl Applied {
     }
 
     /// create or update fields owned by this gateway.
-    async fn ensure<K: Resource<DynamicType = ()>>(
+    async fn ensure<K: Resource<DynamicType = ()> + Serialize>(
         &mut self,
         client: &Client,
         target: &Target<'_>,
-        manifest: impl Serialize,
+        manifest: K,
     ) -> anyhow::Result<()> {
         let kind = ApiResource::erase::<K>(&());
         let mut fields = serde_json::to_value(manifest)?;
@@ -157,37 +157,22 @@ pub async fn reconcile(
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
-    applied.ensure::<ConfigMap>(client, &target, target.report()).await?;
+    applied.ensure(client, &target, target.report()).await?;
+    applied.ensure(client, &target, target.snapshot(payload)).await?;
+    applied.ensure(client, &target, target.service_account()).await?;
     applied
-        .ensure::<Secret>(client, &target, target.snapshot(payload))
+        .ensure(client, &target, target.role(&settings.provisioner_binding))
         .await?;
-    applied
-        .ensure::<ServiceAccount>(client, &target, target.service_account())
-        .await?;
-    applied
-        .ensure::<Role>(client, &target, target.role(&settings.provisioner_binding))
-        .await?;
-    applied
-        .ensure::<RoleBinding>(client, &target, target.role_binding())
-        .await?;
+    applied.ensure(client, &target, target.role_binding()).await?;
     let replicas = if active { settings.replicas } else { 0 };
-    let selector = json!(target.selector());
     applied
-        .ensure::<Deployment>(
-            client,
-            &target,
-            proxy_deployment(&target, &selector, settings, replicas),
-        )
+        .ensure(client, &target, target.deployment(settings, replicas))
         .await?;
     let Some(ips) = requested_ips else { return Ok(()) };
     let ports = plan.ports(settings.http3.enabled);
     if !ports.is_empty() {
         applied
-            .ensure::<Service>(
-                client,
-                &target,
-                target.service(ports, &settings.service, &ips),
-            )
+            .ensure(client, &target, target.service(ports, &settings.service, &ips))
             .await?;
     }
     let Some(service) = existing_service else { return Ok(()) };
@@ -264,68 +249,6 @@ pub async fn reconcile(
     }
     plan.programmed = active && !plan.addresses.is_empty() && acknowledged;
     Ok(())
-}
-
-/// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
-fn proxy_deployment(
-    target: &Target<'_>,
-    selector: &Value,
-    settings: &Settings,
-    replicas: i32,
-) -> Value {
-    let name = target.name;
-    let mut node_selector = settings.node_selector.clone();
-    node_selector.insert("kubernetes.io/os".into(), "linux".into());
-
-    let mut pod_spec = json!({
-        "serviceAccountName": name,
-        "nodeSelector": node_selector,
-        "imagePullSecrets": settings.pull_secrets,
-        "terminationGracePeriodSeconds": settings.termination_grace_period_seconds,
-        "volumes": [{"name": "run", "emptyDir": {"medium": "Memory"}}],
-        "containers": [target.container(settings)],
-    });
-    if settings.host_network {
-        pod_spec["hostNetwork"] = json!(true);
-        pod_spec["dnsPolicy"] =
-            json!(settings.dns_policy.as_deref().unwrap_or("ClusterFirstWithHostNet"));
-    } else {
-        if let Some(dns_policy) = &settings.dns_policy {
-            pod_spec["dnsPolicy"] = json!(dns_policy);
-        }
-        // network-namespaced sysctls are forbidden under hostNetwork.
-        pod_spec["securityContext"] = json!({
-            "sysctls": [{
-                "name": "net.ipv4.ip_unprivileged_port_start",
-                "value": "0",
-            }]
-        });
-    }
-    if !settings.tolerations.is_empty() {
-        pod_spec["tolerations"] = json!(settings.tolerations);
-    }
-    if let Some(affinity) = &settings.affinity {
-        pod_spec["affinity"] = json!(affinity);
-    }
-    if !settings.topology_spread_constraints.is_empty() {
-        pod_spec["topologySpreadConstraints"] =
-            json!(settings.topology_spread_constraints);
-    }
-    if let Some(priority_class) = &settings.priority_class_name {
-        pod_spec["priorityClassName"] = json!(priority_class);
-    }
-
-    json!({
-        "metadata": target.metadata(BTreeMap::new()),
-        "spec": {
-            "replicas": replicas,
-            "selector": {"matchLabels": selector},
-            "template": {
-                "metadata": target.pod_metadata(settings),
-                "spec": pod_spec,
-            },
-        }
-    })
 }
 
 /// delete the observed resource only while its gateway ownership still matches.

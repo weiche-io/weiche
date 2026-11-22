@@ -7,15 +7,17 @@ use super::{
 use k8s_openapi::{
     ByteString,
     api::{
+        apps::v1::{Deployment, DeploymentSpec},
         core::v1::{
-            Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, ExecAction,
-            ObjectFieldSelector, Probe, Secret, SecurityContext, Service, ServiceAccount,
-            ServicePort, ServiceSpec, VolumeMount,
+            Capabilities, ConfigMap, Container, EmptyDirVolumeSource, EnvVar,
+            EnvVarSource, ExecAction, ObjectFieldSelector, PodSecurityContext, PodSpec,
+            PodTemplateSpec, Probe, Secret, SecurityContext, Service, ServiceAccount,
+            ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
         },
         rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject},
     },
     apimachinery::pkg::{
-        apis::meta::v1::{ObjectMeta, OwnerReference},
+        apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference},
         util::intstr::IntOrString,
     },
 };
@@ -62,7 +64,7 @@ impl Target<'_> {
     }
 
     /// identify an owned resource and attach its controller reference.
-    pub fn metadata(&self, annotations: BTreeMap<String, String>) -> ObjectMeta {
+    fn metadata(&self, annotations: BTreeMap<String, String>) -> ObjectMeta {
         ObjectMeta {
             name: Some(self.name.into()),
             namespace: Some(self.namespace.into()),
@@ -74,7 +76,7 @@ impl Target<'_> {
     }
 
     /// label the pod template for selection by both the deployment and the service.
-    pub fn pod_metadata(&self, settings: &Settings) -> ObjectMeta {
+    fn pod_metadata(&self, settings: &Settings) -> ObjectMeta {
         let mut labels = self.labels(settings.pod_labels.clone());
         labels.insert(OWNER.into(), self.owner.uid.clone());
         ObjectMeta {
@@ -153,12 +155,80 @@ impl Target<'_> {
     }
 
     /// select only the pods serving this gateway uid.
-    pub fn selector(&self) -> BTreeMap<String, String> {
+    fn selector(&self) -> BTreeMap<String, String> {
         BTreeMap::from([(OWNER.into(), self.owner.uid.clone())])
     }
 
+    /// deploy the requested replicas with the same pod selector used by the service.
+    pub fn deployment(&self, settings: &Settings, replicas: i32) -> Deployment {
+        Deployment {
+            metadata: self.metadata(BTreeMap::new()),
+            spec: DeploymentSpec {
+                replicas: Some(replicas),
+                selector: LabelSelector {
+                    match_labels: Some(self.selector()),
+                    ..Default::default()
+                },
+                template: PodTemplateSpec {
+                    metadata: Some(self.pod_metadata(settings)),
+                    spec: Some(self.pod_spec(settings)),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// configure the pod network namespace, scheduling and memory-backed runtime volume.
+    fn pod_spec(&self, settings: &Settings) -> PodSpec {
+        let mut node_selector = settings.node_selector.clone();
+        node_selector.insert("kubernetes.io/os".into(), "linux".into());
+        let mut spec = PodSpec {
+            service_account_name: Some(self.name.into()),
+            node_selector: Some(node_selector),
+            image_pull_secrets: Some(settings.pull_secrets.clone()),
+            termination_grace_period_seconds: Some(
+                settings.termination_grace_period_seconds,
+            ),
+            volumes: Some(vec![Volume {
+                name: "run".into(),
+                empty_dir: Some(EmptyDirVolumeSource {
+                    medium: Some("Memory".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            containers: vec![self.container(settings)],
+            dns_policy: settings.dns_policy.clone(),
+            tolerations: (!settings.tolerations.is_empty())
+                .then(|| settings.tolerations.clone()),
+            affinity: settings.affinity.clone(),
+            topology_spread_constraints: (!settings
+                .topology_spread_constraints
+                .is_empty())
+            .then(|| settings.topology_spread_constraints.clone()),
+            priority_class_name: settings.priority_class_name.clone(),
+            ..Default::default()
+        };
+        if settings.host_network {
+            spec.host_network = Some(true);
+            spec.dns_policy
+                .get_or_insert_with(|| "ClusterFirstWithHostNet".into());
+        } else {
+            // the unprivileged port sysctl requires a private network namespace.
+            spec.security_context = Some(PodSecurityContext {
+                sysctls: Some(vec![Sysctl {
+                    name: "net.ipv4.ip_unprivileged_port_start".into(),
+                    value: "0".into(),
+                }]),
+                ..Default::default()
+            });
+        }
+        spec
+    }
+
     /// configure the proxy process, readiness command and container privileges.
-    pub fn container(&self, settings: &Settings) -> Container {
+    fn container(&self, settings: &Settings) -> Container {
         Container {
             name: "proxy".into(),
             image: Some(settings.image.clone()),
