@@ -12,7 +12,13 @@ use super::{
 };
 use compio::runtime::time::sleep;
 use futures::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
-use std::{collections::BTreeMap, io, net::SocketAddr, rc::Rc, sync::Arc};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    io,
+    net::SocketAddr,
+    rc::Rc,
+    sync::Arc,
+};
 use tokio::sync::watch;
 
 /// accept or datagram loop driven on the worker that owns its socket.
@@ -91,41 +97,63 @@ impl Listeners {
     ) -> anyhow::Result<bool> {
         worker.server.service.apply(&snapshot)?;
         let gateway = &snapshot.gateway;
-        self.http.retain(|address, http| {
-            gateway
-                .sockets
-                .get(address)
-                .is_some_and(|socket| http.reload(&socket.listener))
+        retain(&mut self.http, &gateway.sockets, |http, socket| {
+            http.reload(&socket.listener)
         });
-        for (&address, socket) in &gateway.sockets {
-            if self.http.contains_key(&address) {
-                continue;
-            }
-            match worker.bind_http(address, &socket.listener) {
-                Ok((listener, task)) => {
-                    self.serving.push(task);
-                    self.http.insert(address, listener);
-                }
-                Err(error) => tracing::warn!(%address, %error, "listener bind failed"),
-            }
-        }
+        let retry_http = bind_listeners(
+            &self.serving,
+            &mut self.http,
+            &gateway.sockets,
+            |_, _| {},
+            |address, socket| worker.bind_http(address, &socket.listener),
+            |address, error| tracing::warn!(%address, %error, "listener bind failed"),
+        );
+
         let changed = self.revision.replace(snapshot.revision) != Some(snapshot.revision);
         let retry_quic =
             worker.runtime.http3 && self.reconcile_http3(worker, gateway, changed);
         // release obsolete stream routes before binding replacement passthrough sockets.
-        self.streams.retain(|key, stream| {
-            gateway
-                .streams
-                .get(key)
-                .is_some_and(|listener| listener.gateway_uid == stream.gateway_uid)
+        retain(&mut self.streams, &gateway.streams, |active, next| {
+            active.gateway_uid == next.gateway_uid
         });
-        self.reconcile_tls(worker, gateway);
-        self.reconcile_streams(worker, gateway);
+        retain(&mut self.tls, &gateway.tls, |tx, next| {
+            tx.borrow().gateway_uid == next.gateway_uid
+        });
+        let retry_tls = bind_listeners(
+            &self.serving,
+            &mut self.tls,
+            &gateway.tls,
+            update,
+            |address, socket| {
+                let (tx, rx) = watch::channel(socket.clone());
+                Ok((tx, tcp::bind(worker, address, rx, tcp::passthrough)?))
+            },
+            |address, error| tracing::warn!(%address, %error, "tls listener bind failed"),
+        );
+        let retry_streams = bind_listeners(
+            &self.serving,
+            &mut self.streams,
+            &gateway.streams,
+            |active, next| update(&active.routes, &next.route),
+            |(transport, address), next| {
+                let (routes, rx) = watch::channel(next.route.clone());
+                let task = match transport {
+                    Transport::Tcp => tcp::bind(worker, address, rx, tcp::forward)?,
+                    Transport::Udp => udp::bind(worker, address, rx)?,
+                };
+                Ok((
+                    StreamListener { gateway_uid: next.gateway_uid.clone(), routes },
+                    task,
+                ))
+            },
+            |(transport, address), error| {
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    tracing::warn!(%address, ?transport, %error, "transport listener bind failed");
+                }
+            },
+        );
         worker.group.report(worker.id, self.status(snapshot.revision));
-        Ok(retry_quic
-            || self.http.len() != gateway.sockets.len()
-            || self.tls.len() != gateway.tls.len()
-            || self.streams.len() != gateway.streams.len())
+        Ok(retry_http || retry_quic || retry_tls || retry_streams)
     }
 
     /// follow terminating HTTP bindings unless an explicit UDP route owns the address.
@@ -141,95 +169,32 @@ impl Listeners {
                 .is_some_and(|http| http.binding == listener.binding)
                 && !gateway.streams.contains_key(&(Transport::Udp, *addr))
         });
-        let mut retry = false;
-        for (&address, http) in &self.http {
+        let desired = self.http.iter().filter(|&(&address, http)| {
             if !http.binding.tls {
-                continue;
+                return false;
             }
-            if gateway.streams.contains_key(&(Transport::Udp, address)) {
-                if changed && worker.id == 0 {
-                    tracing::warn!(%address, "explicit udp listener takes precedence over http/3");
-                }
-                continue;
+            let explicit = gateway.streams.contains_key(&(Transport::Udp, address));
+            if explicit && changed && worker.id == 0 {
+                tracing::warn!(%address, "explicit udp listener takes precedence over http/3");
             }
-            if let Some(listener) = self.quic.get(&address) {
+            !explicit
+        });
+        bind_listeners(
+            &self.serving,
+            &mut self.quic,
+            desired,
+            |listener, http| {
                 if changed {
                     listener.certificates.update(&http.certs.borrow());
                 }
-                continue;
-            }
-            match quic::Listener::bind(worker, address, http) {
-                Ok((listener, task)) => {
-                    self.serving.push(task);
-                    self.quic.insert(address, listener);
+            },
+            |address, http| quic::Listener::bind(worker, address, http),
+            |address, error| {
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    tracing::warn!(%address, %error, "http/3 listener bind failed");
                 }
-                Err(error) => {
-                    retry = true;
-                    if error.kind() != io::ErrorKind::WouldBlock {
-                        tracing::warn!(%address, %error, "http/3 listener bind failed");
-                    }
-                }
-            }
-        }
-        retry
-    }
-
-    /// preserve passthrough sockets while their owning gateway stays the same.
-    fn reconcile_tls(&mut self, worker: &Worker, gateway: &GatewaySnapshot) {
-        self.tls.retain(|addr, tx| {
-            gateway
-                .tls
-                .get(addr)
-                .is_some_and(|s| s.gateway_uid == tx.borrow().gateway_uid)
-        });
-        for (&address, socket) in &gateway.tls {
-            if let Some(tx) = self.tls.get(&address) {
-                update(tx, socket);
-                continue;
-            }
-            let (tx, rx) = watch::channel(socket.clone());
-            match tcp::bind(worker, address, rx, tcp::passthrough) {
-                Ok(task) => {
-                    self.serving.push(task);
-                    self.tls.insert(address, tx);
-                }
-                Err(error) => {
-                    tracing::warn!(%address, %error, "tls listener bind failed")
-                }
-            }
-        }
-    }
-
-    /// update forwarding tables in place and bind missing raw TCP and UDP sockets.
-    fn reconcile_streams(&mut self, worker: &Worker, gateway: &GatewaySnapshot) {
-        for (&key, listener) in &gateway.streams {
-            if let Some(stream) = self.streams.get(&key) {
-                update(&stream.routes, &listener.route);
-                continue;
-            }
-            let (tx, rx) = watch::channel(listener.route.clone());
-            let (transport, address) = key;
-            let task = match transport {
-                Transport::Tcp => tcp::bind(worker, address, rx, tcp::forward),
-                Transport::Udp => udp::bind(worker, address, rx),
-            };
-            match task {
-                Ok(task) => {
-                    self.serving.push(task);
-                    self.streams.insert(
-                        key,
-                        StreamListener {
-                            gateway_uid: listener.gateway_uid.clone(),
-                            routes: tx,
-                        },
-                    );
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    tracing::warn!(%address, ?transport, %error, "transport listener bind failed")
-                }
-            }
-        }
+            },
+        )
     }
 
     /// report only sockets this worker has successfully bound at the current revision.
@@ -278,6 +243,45 @@ impl Worker {
         );
         Ok((HttpListener { binding, certs }, task.boxed_local()))
     }
+}
+
+/// release missing or incompatible owners before opening any replacement sockets.
+fn retain<K: Ord, L, D>(
+    live: &mut BTreeMap<K, L>,
+    desired: &BTreeMap<K, D>,
+    keep: impl Fn(&L, &D) -> bool,
+) {
+    live.retain(|key, listener| {
+        desired.get(key).is_some_and(|next| keep(listener, next))
+    });
+}
+
+/// update retained sockets in key order, register successful binds and flag failures for retry.
+fn bind_listeners<'a, K: Ord + Copy + 'a, L, D: 'a>(
+    serving: &FuturesUnordered<Task>,
+    live: &mut BTreeMap<K, L>,
+    desired: impl IntoIterator<Item = (&'a K, &'a D)>,
+    update: impl Fn(&L, &D),
+    bind: impl Fn(K, &D) -> io::Result<(L, Task)>,
+    warn: impl Fn(K, io::Error),
+) -> bool {
+    let mut retry = false;
+    for (&key, next) in desired {
+        match live.entry(key) {
+            Entry::Occupied(entry) => update(entry.get(), next),
+            Entry::Vacant(entry) => match bind(key, next) {
+                Ok((listener, task)) => {
+                    serving.push(task);
+                    entry.insert(listener);
+                }
+                Err(error) => {
+                    retry = true;
+                    warn(key, error);
+                }
+            },
+        }
+    }
+    retry
 }
 
 /// notify an existing socket only when its forwarding table changes.
