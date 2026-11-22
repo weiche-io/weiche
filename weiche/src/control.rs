@@ -39,39 +39,66 @@ use weiche_gtwapi::v1::{
     udproutes::UdpRoute,
 };
 
-/// live snapshots maintained by kube-runtime, including updates and deletions.
-/// wait for each store's initial list before reading it; caches are eventually
-/// consistent and do not form an atomic snapshot.
-#[derive(Clone)]
-pub struct GatewayStores {
+/// register each watched kind once for both reflector setup and initial readiness.
+macro_rules! stores {
+    ($(#[doc = $doc:literal] $field:ident: $kind:ty $(=> $selector:literal)?),+ $(,)?) => {
+        /// live, eventually consistent snapshots maintained by the reflectors.
+        #[derive(Clone)]
+        pub struct GatewayStores {
+            $(#[doc = $doc] pub $field: Store<$kind>,)+
+        }
+
+        impl GatewayStores {
+            /// wait for every reflector to publish its initial list.
+            pub async fn wait_until_ready(&self) -> anyhow::Result<()> {
+                tokio::try_join!($(self.$field.wait_until_ready()),+)?;
+                Ok(())
+            }
+        }
+
+        impl GatewayController {
+            /// create cluster-wide reflectors for the controller.
+            pub fn new(client: Client) -> Self {
+                let mut watches = Vec::new();
+                let stores = GatewayStores {
+                    $($field: cache(Api::all(client.clone()),
+                        watcher::Config::default()$(.fields($selector))?, &mut watches),)+
+                };
+                Self { stores, watches }
+            }
+        }
+    };
+}
+
+stores! {
     /// gateway classes used to identify owned gateways.
-    pub gateway_classes: Store<GatewayClass>,
+    gateway_classes: GatewayClass,
     /// gateways that may own proxy workloads.
-    pub gateways: Store<Gateway>,
-    /// watched routes for TCP listeners.
-    pub tcp_routes: Store<TcpRoute>,
-    /// watched routes for TLS listeners.
-    pub tls_routes: Store<TlsRoute>,
-    /// watched routes for UDP listeners.
-    pub udp_routes: Store<UdpRoute>,
+    gateways: Gateway,
     /// watched routes for HTTP and HTTPS listeners.
-    pub http_routes: Store<HttpRoute>,
+    http_routes: HttpRoute,
     /// watched gRPC routes available for listener attachment.
-    pub grpc_routes: Store<GrpcRoute>,
+    grpc_routes: GrpcRoute,
+    /// watched routes for TCP listeners.
+    tcp_routes: TcpRoute,
+    /// watched routes for TLS listeners.
+    tls_routes: TlsRoute,
+    /// watched routes for UDP listeners.
+    udp_routes: UdpRoute,
     /// certificate chains and keys for terminating TLS.
-    pub secrets: Store<Secret>,
+    secrets: Secret => "type=kubernetes.io/tls",
     /// namespace labels used by listener selectors.
-    pub namespaces: Store<Namespace>,
+    namespaces: Namespace,
     /// permissions for references into another namespace.
-    pub grants: Store<ReferenceGrant>,
+    grants: ReferenceGrant,
     /// certificate authorities referenced by backend policies.
-    pub config_maps: Store<ConfigMap>,
+    config_maps: ConfigMap,
     /// authentication policies attached to backend Services.
-    pub tls_policies: Store<BackendTlsPolicy>,
+    tls_policies: BackendTlsPolicy,
     /// backend Services and their declared ports.
-    pub services: Store<Service>,
+    services: Service,
     /// addresses and ports of ready backends.
-    pub endpoint_slices: Store<EndpointSlice>,
+    endpoint_slices: EndpointSlice,
 }
 
 /// maintains resource caches for the reconciliation loop.
@@ -83,60 +110,6 @@ pub struct GatewayController {
     watches: Vec<BoxStream<'static, ()>>,
 }
 impl GatewayController {
-    /// create cluster-wide reflectors for the controller.
-    pub fn new(client: Client) -> Self {
-        let defaults = watcher::Config::default;
-        let (gateway_classes, classes_watch) =
-            cache(Api::all(client.clone()), defaults());
-        let (gateways, gateways_watch) = cache(Api::all(client.clone()), defaults());
-        let (tcp_routes, tcp_watch) = cache(Api::all(client.clone()), defaults());
-        let (tls_routes, tls_watch) = cache(Api::all(client.clone()), defaults());
-        let (udp_routes, udp_watch) = cache(Api::all(client.clone()), defaults());
-        let (http_routes, routes_watch) = cache(Api::all(client.clone()), defaults());
-        let (grpc_routes, grpc_watch) = cache(Api::all(client.clone()), defaults());
-        let (secrets, secrets_watch) =
-            cache(Api::all(client.clone()), defaults().fields("type=kubernetes.io/tls"));
-        let (namespaces, namespaces_watch) = cache(Api::all(client.clone()), defaults());
-        let (grants, grants_watch) = cache(Api::all(client.clone()), defaults());
-        let (config_maps, maps_watch) = cache(Api::all(client.clone()), defaults());
-        let (tls_policies, policies_watch) = cache(Api::all(client.clone()), defaults());
-        let (services, services_watch) = cache(Api::all(client.clone()), defaults());
-        let (endpoint_slices, endpoints_watch) = cache(Api::all(client), defaults());
-        Self {
-            stores: GatewayStores {
-                gateway_classes,
-                gateways,
-                http_routes,
-                grpc_routes,
-                tcp_routes,
-                tls_routes,
-                udp_routes,
-                secrets,
-                namespaces,
-                grants,
-                config_maps,
-                tls_policies,
-                services,
-                endpoint_slices,
-            },
-            watches: vec![
-                classes_watch,
-                gateways_watch,
-                routes_watch,
-                grpc_watch,
-                tcp_watch,
-                tls_watch,
-                udp_watch,
-                secrets_watch,
-                namespaces_watch,
-                grants_watch,
-                maps_watch,
-                policies_watch,
-                services_watch,
-                endpoints_watch,
-            ],
-        }
-    }
     /// clone the read handles for reconciliation.
     pub fn stores(&self) -> GatewayStores {
         self.stores.clone()
@@ -156,7 +129,11 @@ impl GatewayController {
 }
 
 /// watch one resource type and signal after applying changes.
-fn cache<K>(api: Api<K>, config: watcher::Config) -> (Store<K>, BoxStream<'static, ()>)
+fn cache<K>(
+    api: Api<K>,
+    config: watcher::Config,
+    watches: &mut Vec<BoxStream<'static, ()>>,
+) -> Store<K>
 where
     K: Resource<DynamicType = ()>
         + Clone
@@ -181,7 +158,8 @@ where
                 None
             }
         })).boxed();
-    (reader, stream)
+    watches.push(stream);
+    reader
 }
 
 impl GatewayStores {

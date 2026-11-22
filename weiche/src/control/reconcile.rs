@@ -64,22 +64,7 @@ async fn lead(
     settings: &Settings,
     mut changes: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
-    tokio::try_join!(
-        stores.gateway_classes.wait_until_ready(),
-        stores.gateways.wait_until_ready(),
-        stores.http_routes.wait_until_ready(),
-        stores.grpc_routes.wait_until_ready(),
-        stores.tcp_routes.wait_until_ready(),
-        stores.tls_routes.wait_until_ready(),
-        stores.udp_routes.wait_until_ready(),
-        stores.secrets.wait_until_ready(),
-        stores.namespaces.wait_until_ready(),
-        stores.grants.wait_until_ready(),
-        stores.config_maps.wait_until_ready(),
-        stores.tls_policies.wait_until_ready(),
-        stores.services.wait_until_ready(),
-        stores.endpoint_slices.wait_until_ready()
-    )?;
+    stores.wait_until_ready().await?;
     let mut applied = Applied::default();
     loop {
         changes.mark_unchanged();
