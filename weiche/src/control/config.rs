@@ -5,23 +5,35 @@ use k8s_openapi::api::core::v1::{
     Affinity, EnvVar, LocalObjectReference, ResourceRequirements, SeccompProfile,
     Toleration, TopologySpreadConstraint,
 };
-use serde::{
-    Deserialize, Deserializer,
-    de::{DeserializeOwned, IntoDeserializer},
-};
+use serde::{Deserialize, Deserializer, de::Error};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
+    num::NonZeroU16,
 };
 
 /// declare each setting's accepted spellings together with its wire representation.
 macro_rules! setting {
-    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $variant:ident = $wire:literal),+ }) => {
+    ($($(#[$doc:meta])* $name:ident {
+        $($variant:ident = $wire:literal $(| $alias:literal)?),+
+    })+) => { $(
         $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+        #[serde(try_from = "String")]
         pub enum $name {
             $(#[doc = concat!("use the `", $wire, "` setting.")]
-              $(#[$attr])* #[serde(rename = $wire)] $variant),+
+              $variant),+
+        }
+        impl TryFrom<String> for $name {
+            /// error returned for an unknown setting.
+            type Error = &'static str;
+            /// accept only a string spelling of this setting.
+            fn try_from(raw: String) -> Result<Self, Self::Error> {
+                match raw.as_str() {
+                    $($wire $(| $alias)? => Ok(Self::$variant),)+
+                    _ => Err(concat!("unsupported ", stringify!($name))),
+                }
+            }
         }
         impl $name {
             /// return the spelling expected by the proxy or Kubernetes API.
@@ -29,80 +41,88 @@ macro_rules! setting {
                 match self { $(Self::$variant => $wire),+ }
             }
         }
-    };
+    )+ };
 }
 
 setting! {
     /// proxy log encoding.
     LogFormat { Text = "text", Json = "json" }
-}
-setting! {
     /// exposure of a gateway Service.
-    #[derive(Default)]
     ServiceType {
-        #[default] #[serde(alias = "")] ClusterIP = "ClusterIP",
+        ClusterIP = "ClusterIP" | "",
         LoadBalancer = "LoadBalancer", NodePort = "NodePort"
     }
-}
-setting! {
     /// stack allocation policy for a gateway Service.
-    #[derive(Default)]
+    #[expect(clippy::enum_variant_names, reason = "use the Kubernetes policy names")]
     IpFamilyPolicy {
-        SingleStack = "SingleStack", #[default] PreferDualStack = "PreferDualStack",
+        SingleStack = "SingleStack", PreferDualStack = "PreferDualStack",
         RequireDualStack = "RequireDualStack"
     }
-}
-setting! {
     /// address family allocated to a gateway Service.
     IpFamily { IPv4 = "IPv4", IPv6 = "IPv6" }
-}
-setting! {
     /// scope of externally received Service traffic.
     ExternalTrafficPolicy { Cluster = "Cluster", Local = "Local" }
 }
 
 /// accept null, an omitted setting or Helm's empty string for an optional override.
-fn optional<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+fn optional<'de, T: TryFrom<String>, D: Deserializer<'de>>(
     d: D,
-) -> Result<Option<T>, D::Error> {
+) -> Result<Option<T>, D::Error>
+where
+    T::Error: std::fmt::Display,
+{
     Option::<String>::deserialize(d)?
         .filter(|s| !s.is_empty())
-        .map(|s| T::deserialize(s.into_deserializer()))
+        .map(T::try_from)
         .transpose()
+        .map_err(D::Error::custom)
 }
 
-/// platform logging defaults for provisioned proxy containers.
-#[derive(Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct LogSettings {
-    /// default RUST_LOG filter applied to proxy pods.
-    pub level: String,
-    /// output log format (`text` or `json`).
-    pub format: LogFormat,
+/// keep the serde schema and its installation defaults in the same field declarations.
+macro_rules! defaults {
+    (#[doc = $doc:literal] $name:ident {
+        $($(#[$attr:meta])* $field:ident: $ty:ty = $value:expr),+ $(,)?
+    }) => {
+        #[doc = $doc]
+        #[derive(Deserialize)]
+        #[serde(default, rename_all = "camelCase")]
+        pub struct $name {
+            $($(#[$attr])* pub $field: $ty,)+
+        }
+        impl Default for $name {
+            /// use the platform defaults for omitted fields.
+            fn default() -> Self {
+                Self { $($field: $value,)+ }
+            }
+        }
+    };
 }
 
-impl Default for LogSettings {
-    /// use the installation's default proxy log level and format.
-    fn default() -> Self {
-        Self { level: "info".into(), format: LogFormat::Text }
+defaults! {
+    /// platform logging defaults for provisioned proxy containers.
+    LogSettings {
+        /// default RUST_LOG filter applied to proxy pods.
+        level: String = "info".into(),
+        /// output log encoding.
+        format: LogFormat = LogFormat::Text,
     }
 }
 
-/// platform networking defaults for provisioned Gateway Services.
-#[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ServiceSettings {
-    /// gateway Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
-    pub r#type: ServiceType,
-    /// gateway IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
-    pub ip_family_policy: IpFamilyPolicy,
-    /// optional ordered IP families (`IPv4`, `IPv6`).
-    pub ip_families: Vec<IpFamily>,
-    /// optional external traffic policy (`Cluster` or `Local`) for LoadBalancer or NodePort.
-    #[serde(deserialize_with = "optional")]
-    pub external_traffic_policy: Option<ExternalTrafficPolicy>,
-    /// default annotations merged onto every Gateway Service.
-    pub annotations: BTreeMap<String, String>,
+defaults! {
+    /// platform networking defaults for provisioned Gateway Services.
+    ServiceSettings {
+        /// gateway Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
+        r#type: ServiceType = ServiceType::ClusterIP,
+        /// gateway IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
+        ip_family_policy: IpFamilyPolicy = IpFamilyPolicy::PreferDualStack,
+        /// optional ordered IP families (`IPv4`, `IPv6`).
+        ip_families: Vec<IpFamily> = Vec::new(),
+        /// optional external traffic policy (`Cluster` or `Local`) for LoadBalancer or NodePort.
+        #[serde(deserialize_with = "optional")]
+        external_traffic_policy: Option<ExternalTrafficPolicy> = None,
+        /// default annotations merged onto every Gateway Service.
+        annotations: BTreeMap<String, String> = BTreeMap::new(),
+    }
 }
 
 /// platform policy for exposing HTTPS listeners over QUIC.
@@ -112,35 +132,50 @@ pub struct Http3Settings {
     /// serve HTTP/3 on eligible HTTPS ports.
     pub enabled: bool,
     /// external UDP port advertised to HTTPS clients.
-    pub advertised_port: Option<u16>,
+    pub advertised_port: Option<NonZeroU16>,
 }
 
-/// installation defaults shared by the controller and its proxy workloads.
-#[derive(Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Installation {
-    /// release instance name used to isolate multi-release workloads.
-    pub release: String,
-    /// gateway class controller name matched by this controller.
-    pub controller_name: String,
-    /// coordination Lease name used for leader election.
-    pub lease_name: String,
-    /// provisioner RoleBinding and ClusterRole name checked by proxies.
-    pub provisioner_binding: String,
-    /// graceful termination window in seconds for proxy pods.
-    pub termination_grace_period_seconds: i64,
-}
-
-impl Default for Installation {
-    /// use the standard release identity, RBAC and pod shutdown window.
-    fn default() -> Self {
-        Self {
-            release: "weiche".into(),
-            controller_name: CONTROLLER_NAME.into(),
-            lease_name: "weiche-controller".into(),
-            provisioner_binding: "weiche-gateway-provisioner".into(),
-            termination_grace_period_seconds: 30,
-        }
+defaults! {
+    /// optional platform configuration shared by the controller and proxy workloads.
+    Installation {
+        /// release instance name used to isolate multi-release workloads.
+        release: String = "weiche".into(),
+        /// gateway class controller name matched by this controller.
+        controller_name: String = CONTROLLER_NAME.into(),
+        /// coordination Lease name used for leader election.
+        lease_name: String = "weiche-controller".into(),
+        /// provisioner RoleBinding and ClusterRole name checked by proxies.
+        provisioner_binding: String = "weiche-gateway-provisioner".into(),
+        /// graceful termination window in seconds for proxy pods.
+        termination_grace_period_seconds: i64 = 30,
+        /// bind proxy listeners directly on the host network namespace.
+        host_network: bool = false,
+        /// optional Kubernetes DNS policy override for proxy pods.
+        #[serde(deserialize_with = "optional")]
+        dns_policy: Option<String> = None,
+        /// additional node selector labels merged with kubernetes.io/os=linux.
+        node_selector: BTreeMap<String, String> = BTreeMap::new(),
+        /// scheduling tolerations applied to proxy pods.
+        tolerations: Vec<Toleration> = Vec::new(),
+        /// scheduling affinity rules applied to proxy pods.
+        affinity: Option<Affinity> = None,
+        /// topology spread constraints applied to proxy pods.
+        topology_spread_constraints: Vec<TopologySpreadConstraint> = Vec::new(),
+        /// optional priorityClassName applied to proxy pods.
+        #[serde(deserialize_with = "optional")]
+        priority_class_name: Option<String> = None,
+        /// additional pod template labels applied to proxy pods.
+        pod_labels: BTreeMap<String, String> = BTreeMap::new(),
+        /// additional pod template annotations applied to proxy pods.
+        pod_annotations: BTreeMap<String, String> = BTreeMap::new(),
+        /// proxy container logging settings.
+        log: LogSettings = LogSettings::default(),
+        /// extra environment variables appended to proxy containers.
+        extra_env: Vec<EnvVar> = Vec::new(),
+        /// networking defaults for every Gateway Service.
+        service: ServiceSettings = ServiceSettings::default(),
+        /// opt-in downstream HTTP/3 configuration for this installation.
+        http3: Http3Settings = Http3Settings::default(),
     }
 }
 
@@ -169,44 +204,6 @@ pub struct Settings {
     pub replicas: i32,
     /// compio worker thread count inside each proxy pod.
     pub workers: std::num::NonZeroUsize,
-    /// bind proxy listeners directly on the host network namespace.
-    #[serde(default)]
-    pub host_network: bool,
-    /// optional Kubernetes DNS policy override for proxy pods.
-    #[serde(default, deserialize_with = "optional")]
-    pub dns_policy: Option<String>,
-    /// additional node selector labels merged with kubernetes.io/os=linux.
-    #[serde(default)]
-    pub node_selector: BTreeMap<String, String>,
-    /// scheduling tolerations applied to proxy pods.
-    #[serde(default)]
-    pub tolerations: Vec<Toleration>,
-    /// scheduling affinity rules applied to proxy pods.
-    pub affinity: Option<Affinity>,
-    /// topology spread constraints applied to proxy pods.
-    #[serde(default)]
-    pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
-    /// optional priorityClassName applied to proxy pods.
-    #[serde(default, deserialize_with = "optional")]
-    pub priority_class_name: Option<String>,
-    /// additional pod template labels applied to proxy pods.
-    #[serde(default)]
-    pub pod_labels: BTreeMap<String, String>,
-    /// additional pod template annotations applied to proxy pods.
-    #[serde(default)]
-    pub pod_annotations: BTreeMap<String, String>,
-    /// proxy container logging settings.
-    #[serde(default)]
-    pub log: LogSettings,
-    /// extra environment variables appended to proxy containers.
-    #[serde(default)]
-    pub extra_env: Vec<EnvVar>,
-    /// networking defaults for every Gateway Service.
-    #[serde(default)]
-    pub service: ServiceSettings,
-    /// opt-in downstream HTTP/3 configuration for this installation.
-    #[serde(default)]
-    pub http3: Http3Settings,
 }
 
 impl Settings {
@@ -215,7 +212,7 @@ impl Settings {
         let settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
         let installation = &settings.installation;
-        let service = &settings.service;
+        let service = &installation.service;
         ensure!(
             !installation.release.is_empty()
                 && !installation.controller_name.is_empty()
@@ -244,19 +241,18 @@ impl Settings {
                 || service.r#type != ServiceType::ClusterIP,
             "invalid gateway service externalTrafficPolicy"
         );
+        let reserved = [
+            "POD_UID",
+            "WEICHE_PROVISIONER_BINDING",
+            "WEICHE_WORKERS",
+            "WEICHE_HTTP3",
+            "WEICHE_HTTP3_PORT",
+        ];
         ensure!(
-            settings.http3.advertised_port != Some(0),
-            "invalid advertised HTTP/3 port"
-        );
-        ensure!(
-            !settings.extra_env.iter().any(|var| matches!(
-                var.name.as_str(),
-                "POD_UID"
-                    | "WEICHE_PROVISIONER_BINDING"
-                    | "WEICHE_WORKERS"
-                    | "WEICHE_HTTP3"
-                    | "WEICHE_HTTP3_PORT"
-            )),
+            !installation
+                .extra_env
+                .iter()
+                .any(|v| reserved.contains(&v.name.as_str())),
             "proxy extraEnv cannot override reserved environment variables"
         );
         Ok(settings)

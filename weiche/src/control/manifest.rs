@@ -77,11 +77,12 @@ impl Target<'_> {
 
     /// label the pod template for selection by both the deployment and the service.
     fn pod_metadata(&self, settings: &Settings) -> ObjectMeta {
-        let mut labels = self.labels(settings.pod_labels.clone());
+        let options = &settings.installation;
+        let mut labels = self.labels(options.pod_labels.clone());
         labels.insert(OWNER.into(), self.owner.uid.clone());
         ObjectMeta {
             labels: Some(labels),
-            annotations: self.annotations(settings.pod_annotations.clone()),
+            annotations: self.annotations(options.pod_annotations.clone()),
             ..Default::default()
         }
     }
@@ -181,14 +182,15 @@ impl Target<'_> {
 
     /// configure the pod network namespace, scheduling and memory-backed runtime volume.
     fn pod_spec(&self, settings: &Settings) -> PodSpec {
-        let mut node_selector = settings.node_selector.clone();
+        let options = &settings.installation;
+        let mut node_selector = options.node_selector.clone();
         node_selector.insert("kubernetes.io/os".into(), "linux".into());
         let mut spec = PodSpec {
             service_account_name: Some(self.name.into()),
             node_selector: Some(node_selector),
             image_pull_secrets: Some(settings.pull_secrets.clone()),
             termination_grace_period_seconds: Some(
-                settings.installation.termination_grace_period_seconds,
+                options.termination_grace_period_seconds,
             ),
             volumes: Some(vec![Volume {
                 name: "run".into(),
@@ -199,18 +201,18 @@ impl Target<'_> {
                 ..Default::default()
             }]),
             containers: vec![self.container(settings)],
-            dns_policy: settings.dns_policy.clone(),
-            tolerations: (!settings.tolerations.is_empty())
-                .then(|| settings.tolerations.clone()),
-            affinity: settings.affinity.clone(),
-            topology_spread_constraints: (!settings
+            dns_policy: options.dns_policy.clone(),
+            tolerations: (!options.tolerations.is_empty())
+                .then(|| options.tolerations.clone()),
+            affinity: options.affinity.clone(),
+            topology_spread_constraints: (!options
                 .topology_spread_constraints
                 .is_empty())
-            .then(|| settings.topology_spread_constraints.clone()),
-            priority_class_name: settings.priority_class_name.clone(),
+            .then(|| options.topology_spread_constraints.clone()),
+            priority_class_name: options.priority_class_name.clone(),
             ..Default::default()
         };
-        if settings.host_network {
+        if options.host_network {
             spec.host_network = Some(true);
             spec.dns_policy
                 .get_or_insert_with(|| "ClusterFirstWithHostNet".into());
@@ -229,6 +231,7 @@ impl Target<'_> {
 
     /// configure the proxy process, readiness command and container privileges.
     fn container(&self, settings: &Settings) -> Container {
+        let options = &settings.installation;
         Container {
             name: "proxy".into(),
             image: Some(settings.image.clone()),
@@ -255,7 +258,7 @@ impl Target<'_> {
                 allow_privilege_escalation: Some(false),
                 capabilities: Some(Capabilities {
                     drop: Some(vec!["ALL".into()]),
-                    add: settings.host_network.then(|| vec!["NET_BIND_SERVICE".into()]),
+                    add: options.host_network.then(|| vec!["NET_BIND_SERVICE".into()]),
                 }),
                 seccomp_profile: Some(settings.seccomp_profile.clone()),
                 ..Default::default()
@@ -316,6 +319,7 @@ impl Target<'_> {
 
 /// assemble the proxy environment with platform-supplied overrides in declaration order.
 fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
+    let options = &settings.installation;
     let literal = |name: &str, value: String| EnvVar {
         name: name.into(),
         value: Some(value),
@@ -323,10 +327,7 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
     };
     let mut env = vec![
         literal("WEICHE_WORKERS", settings.workers.to_string()),
-        literal(
-            "WEICHE_PROVISIONER_BINDING",
-            settings.installation.provisioner_binding.clone(),
-        ),
+        literal("WEICHE_PROVISIONER_BINDING", options.provisioner_binding.clone()),
         EnvVar {
             name: "POD_UID".into(),
             value_from: Some(EnvVarSource {
@@ -339,21 +340,21 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
             ..Default::default()
         },
     ];
-    if settings.http3.enabled {
+    if options.http3.enabled {
         env.push(literal("WEICHE_HTTP3", "true".into()));
-        if let Some(port) = settings.http3.advertised_port {
+        if let Some(port) = options.http3.advertised_port {
             env.push(literal("WEICHE_HTTP3_PORT", port.to_string()));
         }
     }
-    if !settings.log.level.is_empty()
-        && !settings.extra_env.iter().any(|var| var.name == "RUST_LOG")
+    if !options.log.level.is_empty()
+        && !options.extra_env.iter().any(|var| var.name == "RUST_LOG")
     {
-        env.push(literal("RUST_LOG", settings.log.level.clone()));
+        env.push(literal("RUST_LOG", options.log.level.clone()));
     }
-    if !settings.extra_env.iter().any(|var| var.name == "WEICHE_LOG_FORMAT") {
-        env.push(literal("WEICHE_LOG_FORMAT", settings.log.format.as_str().into()));
+    if !options.extra_env.iter().any(|var| var.name == "WEICHE_LOG_FORMAT") {
+        env.push(literal("WEICHE_LOG_FORMAT", options.log.format.as_str().into()));
     }
-    env.extend_from_slice(&settings.extra_env);
+    env.extend_from_slice(&options.extra_env);
     env
 }
 

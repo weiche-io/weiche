@@ -15,6 +15,7 @@ use tokio::sync::watch;
 /// start resource watches and reconcile while holding the writer lease.
 pub async fn run() -> anyhow::Result<()> {
     let settings = Settings::load()?;
+    let options = &settings.installation;
     let mut lease_config = kube::Config::infer().await?;
     let client = Client::try_from(lease_config.clone())?;
     let namespace = client.default_namespace().to_owned();
@@ -22,16 +23,16 @@ pub async fn run() -> anyhow::Result<()> {
     lease_config.connect_timeout = Some(Duration::from_secs(2));
     lease_config.read_timeout = Some(Duration::from_secs(2));
     lease_config.write_timeout = Some(Duration::from_secs(2));
-    let lease = LeaseManagerBuilder::new(
-        Client::try_from(lease_config)?,
-        &settings.installation.lease_name,
-    )
-    .with_namespace(namespace)
-    .with_identity(std::env::var("POD_UID").context("missing controller pod UID")?)
-    .with_duration(15)
-    .with_grace(8)
-    .build()
-    .await?;
+    let lease =
+        LeaseManagerBuilder::new(Client::try_from(lease_config)?, &options.lease_name)
+            .with_namespace(namespace)
+            .with_identity(
+                std::env::var("POD_UID").context("missing controller pod UID")?,
+            )
+            .with_duration(15)
+            .with_grace(8)
+            .build()
+            .await?;
     let controller = GatewayController::new(client.clone());
     let stores = controller.stores();
     let (tx, rx) = watch::channel(());
@@ -64,6 +65,7 @@ async fn lead(
     settings: &Settings,
     mut changes: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let options = &settings.installation;
     stores.wait_until_ready().await?;
     let mut applied = Applied::default();
     loop {
@@ -75,7 +77,7 @@ async fn lead(
             if gateway.metadata.deletion_timestamp.is_some()
                 || !stores.gateway_classes.state().iter().any(|c| {
                     c.name_any() == gateway.spec.gateway_class_name
-                        && c.spec.controller_name == settings.installation.controller_name
+                        && c.spec.controller_name == options.controller_name
                         && c.spec.parameters_ref.is_none()
                         && c.metadata.deletion_timestamp.is_none()
                 })
@@ -109,8 +111,7 @@ async fn lead(
             tokio::task::yield_now().await;
         }
         if let Err(error) =
-            update_status(client, stores, &settings.installation.controller_name, &plans)
-                .await
+            update_status(client, stores, &options.controller_name, &plans).await
         {
             tracing::warn!(%error, "could not update gateway status");
             retry = true;

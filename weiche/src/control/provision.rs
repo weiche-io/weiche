@@ -106,6 +106,7 @@ pub async fn reconcile(
     plan: &mut Plan,
     snapshot: &GatewaySnapshot,
 ) -> anyhow::Result<()> {
+    let options = &settings.installation;
     plan.programmed = false;
     plan.addresses.clear();
     let g = &plan.gateway;
@@ -121,7 +122,7 @@ pub async fn reconcile(
         .config_maps
         .get(&ObjectRef::new(&name).within(&ns))
         .filter(|report| controlled_by(report.as_ref(), &uid));
-    let requested_ips = match requested_addresses(g, &settings.service) {
+    let requested_ips = match requested_addresses(g, &options.service) {
         Ok(ips) => Some(ips),
         Err(message) => {
             plan.issue_reason = Some("AddressNotAssigned");
@@ -153,7 +154,7 @@ pub async fn reconcile(
         namespace: &ns,
         name: &name,
         gateway_name: &g.name_any(),
-        instance: &settings.installation.release,
+        instance: &options.release,
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
@@ -161,7 +162,7 @@ pub async fn reconcile(
     applied.ensure(client, &target, target.snapshot(payload)).await?;
     applied.ensure(client, &target, target.service_account()).await?;
     applied
-        .ensure(client, &target, target.role(&settings.installation.provisioner_binding))
+        .ensure(client, &target, target.role(&options.provisioner_binding))
         .await?;
     applied.ensure(client, &target, target.role_binding()).await?;
     let replicas = if active { settings.replicas } else { 0 };
@@ -169,14 +170,14 @@ pub async fn reconcile(
         .ensure(client, &target, target.deployment(settings, replicas))
         .await?;
     let Some(ips) = requested_ips else { return Ok(()) };
-    let ports = plan.ports(settings.http3.enabled);
+    let ports = plan.ports(options.http3.enabled);
     if !ports.is_empty() {
         applied
-            .ensure(client, &target, target.service(ports, &settings.service, &ips))
+            .ensure(client, &target, target.service(ports, &options.service, &ips))
             .await?;
     }
     let Some(service) = existing_service else { return Ok(()) };
-    plan.addresses = if settings.service.r#type == ServiceType::LoadBalancer {
+    plan.addresses = if options.service.r#type == ServiceType::LoadBalancer {
         service
             .status
             .as_ref()
@@ -287,6 +288,7 @@ pub async fn retired(
     plans: &[Plan],
     applied: &mut Applied,
 ) -> anyhow::Result<()> {
+    let options = &settings.installation;
     for cm in stores.config_maps.state() {
         if cm
             .labels()
@@ -296,8 +298,8 @@ pub async fn retired(
             continue;
         }
         let instance = cm.labels().get("app.kubernetes.io/instance").map(String::as_str);
-        if instance != Some(settings.installation.release.as_str())
-            && !(instance.is_none() && settings.installation.release == "weiche")
+        if instance != Some(options.release.as_str())
+            && !(instance.is_none() && options.release == "weiche")
         {
             continue;
         }
