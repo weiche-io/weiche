@@ -82,26 +82,12 @@ async fn lead(
             {
                 continue;
             }
-            if !settings.namespaces.contains(&gateway.namespace().unwrap_or_default()) {
-                let mut plan = Plan::new(gateway);
-                plan.denied = true;
+            let mut plan = Plan::new(gateway, settings);
+            if plan.denied || plan.invalid_parameters {
                 plans.push(plan);
                 continue;
             }
-            if gateway
-                .spec
-                .infrastructure
-                .as_ref()
-                .and_then(|infra| infra.parameters_ref.as_ref())
-                .is_some()
-            {
-                let mut plan = Plan::new(gateway);
-                plan.invalid_parameters = true;
-                plans.push(plan);
-                continue;
-            }
-            let (mut plan, snapshot) =
-                Plan::compile(stores, gateway, settings.bind_address);
+            let snapshot = plan.compile(stores, settings.bind_address);
             if let Err(error) = provision::reconcile(
                 client,
                 stores,
