@@ -153,14 +153,15 @@ pub async fn reconcile(
     let target = Target {
         namespace: &ns,
         name: &name,
-        gateway_name: &g.name_any(),
         instance: &options.release,
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
-    applied.ensure(client, &target, target.report()).await?;
+    applied.ensure(client, &target, target.owned::<ConfigMap>()).await?;
     applied.ensure(client, &target, target.snapshot(payload)).await?;
-    applied.ensure(client, &target, target.service_account()).await?;
+    applied
+        .ensure(client, &target, target.owned::<ServiceAccount>())
+        .await?;
     applied
         .ensure(client, &target, target.role(&options.provisioner_binding))
         .await?;

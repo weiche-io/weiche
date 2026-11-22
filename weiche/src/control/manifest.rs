@@ -9,10 +9,10 @@ use k8s_openapi::{
     api::{
         apps::v1::{Deployment, DeploymentSpec},
         core::v1::{
-            Capabilities, ConfigMap, Container, EmptyDirVolumeSource, EnvVar,
-            EnvVarSource, ExecAction, ObjectFieldSelector, PodSecurityContext, PodSpec,
-            PodTemplateSpec, Probe, Secret, SecurityContext, Service, ServiceAccount,
-            ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
+            Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+            ExecAction, ObjectFieldSelector, PodSecurityContext, PodSpec,
+            PodTemplateSpec, Probe, Secret, SecurityContext, Service, ServicePort,
+            ServiceSpec, Sysctl, Volume, VolumeMount,
         },
         rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject},
     },
@@ -21,8 +21,17 @@ use k8s_openapi::{
         util::intstr::IntOrString,
     },
 };
+use kube::Resource;
 use std::{collections::BTreeMap, net::IpAddr};
 use weiche_gtwapi::v1::gateways::{Gateway, GatewayInfrastructure};
+
+/// Kubernetes labels or annotations keyed by their qualified names.
+type Tags = BTreeMap<String, String>;
+
+/// build Kubernetes string lists from static names and target identifiers.
+fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values.map(str::to_owned).into()
+}
 
 /// common identity and metadata shared by all resources owned by one Gateway.
 pub struct Target<'a> {
@@ -30,8 +39,6 @@ pub struct Target<'a> {
     pub namespace: &'a str,
     /// deterministic resource name (`weiche-gw-<uid>`).
     pub name: &'a str,
-    /// gateway name used in the standard infrastructure label.
-    pub gateway_name: &'a str,
     /// release instance label isolating multi-release ownership.
     pub instance: &'a str,
     /// controller ownerReference pointing back to the Gateway.
@@ -41,98 +48,63 @@ pub struct Target<'a> {
 }
 
 impl Target<'_> {
-    /// overlay gateway infrastructure labels, reserving the controller's identity labels.
-    fn labels(&self, mut labels: BTreeMap<String, String>) -> BTreeMap<String, String> {
-        if let Some(infra) = self.infra.and_then(|i| i.labels.as_ref()) {
-            labels.extend(infra.clone());
+    /// apply the infrastructure metadata over platform tags, reserving controller labels.
+    fn template(&self, mut labels: Tags, mut annotations: Tags) -> ObjectMeta {
+        if let Some(infra) = self.infra {
+            labels.extend(infra.labels.clone().unwrap_or_default());
+            annotations.extend(infra.annotations.clone().unwrap_or_default());
         }
-        labels.insert(GATEWAY_NAME.into(), self.gateway_name.into());
+        labels.insert(GATEWAY_NAME.into(), self.owner.name.clone());
         labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
         labels.insert("app.kubernetes.io/instance".into(), self.instance.into());
-        labels
-    }
-
-    /// merge gateway annotations over platform defaults and omit an empty result.
-    fn annotations(
-        &self,
-        mut annotations: BTreeMap<String, String>,
-    ) -> Option<BTreeMap<String, String>> {
-        if let Some(infra) = self.infra.and_then(|i| i.annotations.as_ref()) {
-            annotations.extend(infra.clone());
+        ObjectMeta {
+            labels: Some(labels),
+            annotations: (!annotations.is_empty()).then_some(annotations),
+            ..Default::default()
         }
-        (!annotations.is_empty()).then_some(annotations)
     }
 
     /// identify an owned resource and attach its controller reference.
-    fn metadata(&self, annotations: BTreeMap<String, String>) -> ObjectMeta {
+    fn metadata(&self, annotations: Tags) -> ObjectMeta {
         ObjectMeta {
             name: Some(self.name.into()),
             namespace: Some(self.namespace.into()),
-            labels: Some(self.labels(BTreeMap::new())),
-            annotations: self.annotations(annotations),
             owner_references: Some(vec![self.owner.clone()]),
-            ..Default::default()
+            ..self.template(Tags::new(), annotations)
         }
     }
 
-    /// label the pod template for selection by both the deployment and the service.
-    fn pod_metadata(&self, settings: &Settings) -> ObjectMeta {
-        let options = &settings.installation;
-        let mut labels = self.labels(options.pod_labels.clone());
-        labels.insert(OWNER.into(), self.owner.uid.clone());
-        ObjectMeta {
-            labels: Some(labels),
-            annotations: self.annotations(options.pod_annotations.clone()),
-            ..Default::default()
-        }
-    }
-
-    /// leave report data to the pods that acknowledge listener revisions.
-    pub fn report(&self) -> ConfigMap {
-        ConfigMap {
-            metadata: self.metadata(BTreeMap::new()),
-            ..Default::default()
-        }
+    /// construct a metadata-only resource, leaving report data under proxy ownership.
+    pub fn owned<K: Default + Resource>(&self) -> K {
+        let mut resource = K::default();
+        *resource.meta_mut() = self.metadata(Tags::new());
+        resource
     }
 
     /// publish the encoded gateway snapshot under the proxy's watched key.
     pub fn snapshot(&self, payload: Vec<u8>) -> Secret {
         Secret {
-            metadata: self.metadata(BTreeMap::new()),
             type_: Some("weiche.io/snapshot".into()),
             data: Some(BTreeMap::from([(SNAPSHOT_KEY.into(), ByteString(payload))])),
-            ..Default::default()
-        }
-    }
-
-    /// identify the proxy pods to the Kubernetes API.
-    pub fn service_account(&self) -> ServiceAccount {
-        ServiceAccount {
-            metadata: self.metadata(BTreeMap::new()),
-            ..Default::default()
+            ..self.owned()
         }
     }
 
     /// restrict proxy access to its snapshot, report and provisioner binding.
-    pub fn role(&self, provisioner_binding: &str) -> Role {
+    pub fn role(&self, binding: &str) -> Role {
         let rule = |group: &str, resource: &str, name: &str, verbs: &[&str]| PolicyRule {
-            api_groups: Some(vec![group.into()]),
-            resources: Some(vec![resource.into()]),
-            resource_names: Some(vec![name.into()]),
+            api_groups: Some(strings([group])),
+            resources: Some(strings([resource])),
+            resource_names: Some(strings([name])),
             verbs: verbs.iter().map(|v| (*v).into()).collect(),
             ..Default::default()
         };
         Role {
-            metadata: self.metadata(BTreeMap::new()),
+            metadata: self.metadata(Tags::new()),
             rules: Some(vec![
                 rule("", "secrets", self.name, &["get", "list", "watch"]),
                 rule("", "configmaps", self.name, &["patch"]),
-                rule(
-                    "rbac.authorization.k8s.io",
-                    "rolebindings",
-                    provisioner_binding,
-                    &["get"],
-                ),
+                rule("rbac.authorization.k8s.io", "rolebindings", binding, &["get"]),
             ]),
         }
     }
@@ -140,7 +112,7 @@ impl Target<'_> {
     /// bind the gateway role to its namespaced proxy service account.
     pub fn role_binding(&self) -> RoleBinding {
         RoleBinding {
-            metadata: self.metadata(BTreeMap::new()),
+            metadata: self.metadata(Tags::new()),
             role_ref: RoleRef {
                 api_group: Some("rbac.authorization.k8s.io".into()),
                 kind: "Role".into(),
@@ -156,14 +128,17 @@ impl Target<'_> {
     }
 
     /// select only the pods serving this gateway uid.
-    fn selector(&self) -> BTreeMap<String, String> {
+    fn selector(&self) -> Tags {
         BTreeMap::from([(OWNER.into(), self.owner.uid.clone())])
     }
 
     /// deploy the requested replicas with the same pod selector used by the service.
     pub fn deployment(&self, settings: &Settings, replicas: i32) -> Deployment {
+        let options = &settings.installation;
+        let mut pod =
+            self.template(options.pod_labels.clone(), options.pod_annotations.clone());
+        pod.labels.get_or_insert_default().extend(self.selector());
         Deployment {
-            metadata: self.metadata(BTreeMap::new()),
             spec: DeploymentSpec {
                 replicas: Some(replicas),
                 selector: LabelSelector {
@@ -171,12 +146,12 @@ impl Target<'_> {
                     ..Default::default()
                 },
                 template: PodTemplateSpec {
-                    metadata: Some(self.pod_metadata(settings)),
+                    metadata: Some(pod),
                     spec: Some(self.pod_spec(settings)),
                 },
                 ..Default::default()
             },
-            ..Default::default()
+            ..self.owned()
         }
     }
 
