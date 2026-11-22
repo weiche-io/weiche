@@ -197,7 +197,21 @@ pub struct Settings {
     /// legacy flat serviceType field retained for backward compatibility.
     #[serde(default)]
     service_type: Option<String>,
+    /// opt-in downstream HTTP/3 configuration for this installation.
+    #[serde(default)]
+    http3: Http3Settings,
 }
+
+/// platform policy for exposing HTTPS listeners over QUIC.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Http3Settings {
+    /// serve HTTP/3 on eligible HTTPS ports.
+    enabled: bool,
+    /// external UDP port advertised to HTTPS clients.
+    advertised_port: Option<u16>,
+}
+
 impl Settings {
     /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
@@ -271,9 +285,17 @@ impl Settings {
             );
         }
         ensure!(
+            settings.http3.advertised_port != Some(0),
+            "invalid advertised HTTP/3 port"
+        );
+        ensure!(
             !settings.extra_env.iter().any(|var| matches!(
                 var.name.as_str(),
-                "POD_UID" | "WEICHE_PROVISIONER_BINDING" | "WEICHE_WORKERS"
+                "POD_UID"
+                    | "WEICHE_PROVISIONER_BINDING"
+                    | "WEICHE_WORKERS"
+                    | "WEICHE_HTTP3"
+                    | "WEICHE_HTTP3_PORT"
             )),
             "proxy extraEnv cannot override reserved environment variables"
         );
@@ -300,10 +322,12 @@ struct Target<'a> {
 pub struct Applied(BTreeMap<(String, String, String), (String, Instant)>);
 
 impl Applied {
+    /// forget cached applies after the drift check interval.
     pub fn expire(&mut self) {
         self.0.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(30));
     }
 
+    /// create or update fields owned by this gateway.
     async fn ensure<K: Resource<DynamicType = ()>>(
         &mut self,
         client: &Client,
@@ -442,7 +466,12 @@ pub async fn reconcile(
         .ensure::<Service>(
             client,
             &target,
-            proxy_service(&labels, plan.ports(), settings, &requested_ips),
+            proxy_service(
+                &labels,
+                plan.ports(settings.http3.enabled),
+                settings,
+                &requested_ips,
+            ),
         )
         .await?;
     let Some(service) = stores.services.get(&ObjectRef::new(&name).within(&ns)) else {
@@ -555,6 +584,7 @@ fn proxy_role(name: &str, provisioner_binding: &str) -> Value {
     })
 }
 
+/// bind the gateway role to its proxy service account.
 fn proxy_role_binding(name: &str, namespace: &str) -> Value {
     json!({
         "roleRef": {
@@ -665,6 +695,12 @@ fn proxy_deployment(
         json!({"name": "WEICHE_PROVISIONER_BINDING", "value": settings.provisioner_binding}),
         json!({"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}}),
     ];
+    if settings.http3.enabled {
+        env.push(json!({"name": "WEICHE_HTTP3", "value": "true"}));
+        if let Some(port) = settings.http3.advertised_port {
+            env.push(json!({"name": "WEICHE_HTTP3_PORT", "value": port.to_string()}));
+        }
+    }
     if !settings.log.level.is_empty()
         && !settings.extra_env.iter().any(|v| v.name == "RUST_LOG")
     {

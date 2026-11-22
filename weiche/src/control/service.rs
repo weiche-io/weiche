@@ -1,6 +1,8 @@
 //! compile one Gateway and expose its proxy pods at the declared listener ports.
 use super::{
-    super::ir::{GatewaySnapshot, Listener, SocketRoutes, StreamListener, TlsSocket},
+    super::ir::{
+        GatewaySnapshot, Listener, SocketRoutes, StreamListener, TlsSocket, Transport,
+    },
     Compiled, GatewayStores, compile,
 };
 use kube::ResourceExt;
@@ -106,21 +108,34 @@ impl Plan {
             }
             listeners.push(result);
         }
-        for socket in snapshot.sockets.values_mut() {
-            socket.listener.tls.sort_by_key(|tls| {
-                std::cmp::Reverse((!tls.hostname.is_empty(), tls.hostname.len()))
-            });
-        }
+        snapshot.order_certificates();
         (Self { listeners, ..Self::new(gateway) }, snapshot)
     }
 
     /// expose each requested port once across virtual hosts sharing a transport.
-    pub fn ports(&self) -> Vec<serde_json::Value> {
-        self.gateway.spec.listeners.iter()
-            .map(|l| (super::super::ir::Transport::for_protocol(&l.protocol).protocol(), l.port))
-            .collect::<BTreeSet<_>>().into_iter().map(|(protocol, port)| serde_json::json!({
+    pub fn ports(&self, http3: bool) -> Vec<serde_json::Value> {
+        let declared = &self.gateway.spec.listeners;
+        let mut ports: BTreeSet<_> = declared
+            .iter()
+            .map(|l| (Transport::for_protocol(&l.protocol), l.port))
+            .collect();
+        if http3 {
+            ports.extend(
+                declared
+                    .iter()
+                    .zip(&self.listeners)
+                    .filter(|(listener, result)| {
+                        listener.protocol == "HTTPS" && result.accepted
+                    })
+                    .map(|(listener, _)| (Transport::Udp, listener.port)),
+            );
+        }
+        ports.into_iter().map(|(transport, port)| {
+            let protocol = transport.protocol();
+            serde_json::json!({
                 "name": format!("{}-{port}", protocol.to_ascii_lowercase()), "port":port,
                 "protocol":protocol, "targetPort":port,
-            })).collect()
+            })
+        }).collect()
     }
 }

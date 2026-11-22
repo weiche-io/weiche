@@ -73,3 +73,6 @@ proxy:
     ipFamilies: []
     externalTrafficPolicy: ""
     annotations: {}
+  http3:
+    enabled: false
+    advertisedPort: null

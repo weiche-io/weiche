@@ -23,6 +23,7 @@
     "log" .Values.proxy.log
     "extraEnv" .Values.proxy.extraEnv
     "service" .Values.proxy.service
+    "http3" .Values.proxy.http3
     "namespaces" (.Values.gatewayNamespaces | default (list .Release.Namespace) | uniq)
 -}}
 {{- if .Values.proxy.affinity }}
