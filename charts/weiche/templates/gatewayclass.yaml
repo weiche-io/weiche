@@ -1,6 +1,8 @@
+{{- if .Values.gatewayClass.create }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
-  name: weiche
+  name: {{ include "weiche.gatewayClassName" . | quote }}
 spec:
-  controllerName: weiche.io/gateway-controller
+  controllerName: {{ .Values.gatewayClass.controllerName | quote }}
+{{- end }}

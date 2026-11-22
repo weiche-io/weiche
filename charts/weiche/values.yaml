@@ -1,3 +1,6 @@
+nameOverride: ""
+fullnameOverride: ""
+
 image:
   repository: ghcr.io/weiche-io/weiche
   # Empty uses appVersion from Chart.yaml.
@@ -5,23 +8,68 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# Workers need a seccomp profile that permits io_uring.
-seccompProfile:
-  type: Unconfined
+gatewayClass:
+  create: true
+  # Empty defaults to the release fullname (for example "weiche").
+  name: ""
+  controllerName: weiche.io/gateway-controller
 
-resources:
-  requests:
-    cpu: 100m
-    memory: 64Mi
-  limits:
-    memory: 256Mi
-
-controllerReplicas: 2
 # Existing, platform-controlled namespaces where proxies and their TLS material may run.
 # An empty list selects the release namespace. Pull secrets must exist in each namespace.
 gatewayNamespaces: []
+
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podLabels: {}
+  podAnnotations: {}
+  terminationGracePeriodSeconds: 10
+  log:
+    level: info
+    format: text
+  extraEnv: []
+
 proxy:
-  replicas: 2
+  replicas: 1
   workers: 1
   bindAddress: "::"
-  serviceType: ClusterIP
+  hostNetwork: false
+  # Empty defaults to ClusterFirstWithHostNet when hostNetwork is true.
+  dnsPolicy: ""
+  terminationGracePeriodSeconds: 30
+  # Workers need a seccomp profile that permits io_uring.
+  seccompProfile:
+    type: Unconfined
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podLabels: {}
+  podAnnotations: {}
+  log:
+    level: info
+    format: text
+  extraEnv: []
+  service:
+    type: ClusterIP
+    ipFamilyPolicy: PreferDualStack
+    ipFamilies: []
+    externalTrafficPolicy: ""
+    annotations: {}

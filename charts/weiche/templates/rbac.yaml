@@ -1,13 +1,18 @@
+{{- $fullname := include "weiche.fullname" . -}}
+{{- $controllerRole := include "weiche.controllerRole" . -}}
+{{- $provisionerRole := include "weiche.provisionerRole" . -}}
+{{- $electionRole := include "weiche.electionRole" . -}}
+{{- $leaseName := include "weiche.leaseName" . -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ .Release.Name | quote }}
+  name: {{ $fullname | quote }}
   namespace: {{ .Release.Namespace | quote }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: weiche-gateway-controller
+  name: {{ $controllerRole | quote }}
 rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses, gateways, httproutes, grpcroutes, tcproutes, tlsroutes, udproutes, referencegrants, backendtlspolicies]
@@ -28,20 +33,20 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: weiche-gateway-controller
+  name: {{ $controllerRole | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: weiche-gateway-controller
+  name: {{ $controllerRole | quote }}
 subjects:
   - kind: ServiceAccount
-    name: {{ .Release.Name | quote }}
+    name: {{ $fullname | quote }}
     namespace: {{ .Release.Namespace | quote }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ .Release.Name }}-election
+  name: {{ $electionRole | quote }}
   namespace: {{ .Release.Namespace | quote }}
 rules:
   - apiGroups: [coordination.k8s.io]
@@ -49,27 +54,27 @@ rules:
     verbs: [create]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    resourceNames: [weiche-controller]
+    resourceNames: [{{ $leaseName | quote }}]
     verbs: [get, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ .Release.Name }}-election
+  name: {{ $electionRole | quote }}
   namespace: {{ .Release.Namespace | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ .Release.Name }}-election
+  name: {{ $electionRole | quote }}
 subjects:
   - kind: ServiceAccount
-    name: {{ .Release.Name | quote }}
+    name: {{ $fullname | quote }}
     namespace: {{ .Release.Namespace | quote }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: weiche-gateway-provisioner
+  name: {{ $provisionerRole | quote }}
 rules:
   - apiGroups: ['']
     resources: [services, secrets, configmaps, serviceaccounts]
@@ -85,14 +90,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: weiche-gateway-provisioner
+  name: {{ $provisionerRole | quote }}
   namespace: {{ . | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: weiche-gateway-provisioner
+  name: {{ $provisionerRole | quote }}
 subjects:
   - kind: ServiceAccount
-    name: {{ $.Release.Name | quote }}
+    name: {{ $fullname | quote }}
     namespace: {{ $.Release.Namespace | quote }}
 {{- end }}
