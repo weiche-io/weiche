@@ -1,5 +1,6 @@
 //! report gateway and route conditions for the applied worker revision.
 use super::{GatewayStores, compile::RouteReport, service::Plan, tls::TlsError};
+use k8s_openapi::NamespaceResourceScope;
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{Patch, PatchParams},
@@ -8,9 +9,6 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use weiche_gtwapi::v1::{
-    backendtlspolicies::BackendTlsPolicy, gatewayclasses::GatewayClass, gateways::Gateway,
-};
 
 /// condition type, truth value, reason and user-facing message.
 type Cond<'a> = (&'a str, bool, &'a str, &'a str);
@@ -63,21 +61,30 @@ fn stamp_conditions<'a>(
     Value::Array(conditions)
 }
 
+/// scope a status request to the namespace observed by the reflector.
+fn namespaced<K: Resource<DynamicType = (), Scope = NamespaceResourceScope>>(
+    client: &Client,
+    resource: &K,
+) -> Api<K> {
+    Api::namespaced(
+        client.clone(),
+        resource.meta().namespace.as_deref().unwrap_or_default(),
+    )
+}
+
 /// apply changed status with optimistic concurrency.
 async fn patch_status<K>(
     api: Api<K>,
     resource: &K,
-    old: &Value,
-    desired: Value,
+    status: Option<&impl Serialize>,
+    build: impl FnOnce(&Value) -> Option<Value>,
 ) -> anyhow::Result<()>
 where
-    K: Resource<DynamicType = ()>
-        + Clone
-        + std::fmt::Debug
-        + DeserializeOwned
-        + Serialize,
+    K: Resource<DynamicType = ()> + Clone + std::fmt::Debug + DeserializeOwned,
 {
-    if old == &desired {
+    let old = status.map_or_else(|| Ok(json!({})), serde_json::to_value)?;
+    let Some(desired) = build(&old) else { return Ok(()) };
+    if old == desired {
         return Ok(());
     }
     let patch = json!({"metadata":{"resourceVersion": resource.resource_version()}, "status":desired});
@@ -85,6 +92,45 @@ where
         .await?;
     Ok(())
 }
+
+/// supported Gateway API features in the order published on GatewayClass.
+const FEATURES: &[&str] = &[
+    "BackendTLSPolicy",
+    "GRPCRoute",
+    "GRPCRouteNamedRouteRule",
+    "GRPCRouteRequestHeaderModifier",
+    "Gateway",
+    "GatewayHTTPListenerIsolation",
+    "GatewayInfrastructure",
+    "GatewayPort8080",
+    "GatewayRouteHostnameIntersectionPrecedence",
+    "HTTPRoute",
+    "HTTPRoute303RedirectStatusCode",
+    "HTTPRoute307RedirectStatusCode",
+    "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendProtocolH2C",
+    "HTTPRouteBackendProtocolWebSocket",
+    "HTTPRouteBackendRequestHeaderModification",
+    "HTTPRouteBackendTimeout",
+    "HTTPRouteBackendURLRewrite",
+    "HTTPRouteCORS",
+    "HTTPRouteDestinationPortMatching",
+    "HTTPRouteHostRewrite",
+    "HTTPRouteMethodMatching",
+    "HTTPRouteNamedRouteRule",
+    "HTTPRouteParentRefPort",
+    "HTTPRoutePathRedirect",
+    "HTTPRoutePathRewrite",
+    "HTTPRoutePortRedirect",
+    "HTTPRouteQueryParamMatching",
+    "HTTPRouteRequestTimeout",
+    "HTTPRouteResponseHeaderModification",
+    "HTTPRouteSchemeRedirect",
+    "ReferenceGrant",
+    "TCPRoute",
+    "TLSRoute",
+    "UDPRoute",
+];
 
 /// patch only changed conditions, preserving their transition times.
 pub async fn update_status(
@@ -99,68 +145,27 @@ pub async fn update_status(
         .into_iter()
         .filter(|c| c.spec.controller_name == controller_name)
     {
-        let class_old = class
-            .status
-            .as_ref()
-            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-        let class_accepted = class.spec.parameters_ref.is_none();
-        let mut class_status = class_old.clone();
-        let reason = if class_accepted { "Accepted" } else { "InvalidParameters" };
-        class_status["conditions"] = stamp_conditions(
-            Some(&class_old),
-            class.metadata.generation,
-            [("Accepted", class_accepted, reason, "Weiche gateway controller")],
-        );
-        class_status["supportedFeatures"] = [
-            "BackendTLSPolicy",
-            "GRPCRoute",
-            "GRPCRouteNamedRouteRule",
-            "GRPCRouteRequestHeaderModifier",
-            "Gateway",
-            "GatewayHTTPListenerIsolation",
-            "GatewayInfrastructure",
-            "GatewayPort8080",
-            "GatewayRouteHostnameIntersectionPrecedence",
-            "HTTPRoute",
-            "HTTPRoute303RedirectStatusCode",
-            "HTTPRoute307RedirectStatusCode",
-            "HTTPRoute308RedirectStatusCode",
-            "HTTPRouteBackendProtocolH2C",
-            "HTTPRouteBackendProtocolWebSocket",
-            "HTTPRouteBackendRequestHeaderModification",
-            "HTTPRouteBackendTimeout",
-            "HTTPRouteBackendURLRewrite",
-            "HTTPRouteCORS",
-            "HTTPRouteDestinationPortMatching",
-            "HTTPRouteHostRewrite",
-            "HTTPRouteMethodMatching",
-            "HTTPRouteNamedRouteRule",
-            "HTTPRouteParentRefPort",
-            "HTTPRoutePathRedirect",
-            "HTTPRoutePathRewrite",
-            "HTTPRoutePortRedirect",
-            "HTTPRouteQueryParamMatching",
-            "HTTPRouteRequestTimeout",
-            "HTTPRouteResponseHeaderModification",
-            "HTTPRouteSchemeRedirect",
-            "ReferenceGrant",
-            "TCPRoute",
-            "TLSRoute",
-            "UDPRoute",
-        ]
-        .into_iter()
-        .map(|name| json!({"name":name}))
-        .collect();
-        patch_status(
-            Api::<GatewayClass>::all(client.clone()),
-            class.as_ref(),
-            &class_old,
-            class_status,
-        )
+        patch_status(Api::all(client.clone()), &*class, class.status.as_ref(), |old| {
+            let accepted = class.spec.parameters_ref.is_none();
+            let reason = if accepted { "Accepted" } else { "InvalidParameters" };
+            let mut status = old.clone();
+            status["conditions"] = stamp_conditions(
+                Some(old),
+                class.metadata.generation,
+                [("Accepted", accepted, reason, "Weiche gateway controller")],
+            );
+            status["supportedFeatures"] =
+                FEATURES.iter().map(|name| json!({"name":name})).collect();
+            Some(status)
+        })
         .await?;
     }
     for plan in plans {
-        update_gateway(client, plan).await?;
+        let g = plan.gateway.as_ref();
+        patch_status(namespaced(client, g), g, g.status.as_ref(), |old| {
+            Some(gateway_status(plan, old))
+        })
+        .await?;
     }
     update_policies(client, stores, controller_name, plans).await?;
 
@@ -171,56 +176,35 @@ pub async fn update_status(
 
     /// publish parent conditions for each supported route kind.
     macro_rules! routes {
-        ($store:expr) => {
-            for route in $store.state() {
-                let old = route
-                    .status
-                    .as_ref()
-                    .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-                let api = Api::namespaced(
-                    client.clone(),
-                    &route.namespace().unwrap_or_default(),
-                );
-                let reports = reports_by_uid
-                    .get(&route.metadata.uid.as_deref())
+        ($($store:ident),+) => { $(
+            for route in stores.$store.state() {
+                let r = route.as_ref();
+                let reports = reports_by_uid.get(&r.metadata.uid.as_deref())
                     .map_or(&[][..], Vec::as_slice);
-                update_route(api, route.as_ref(), old, controller_name, reports).await?;
+                patch_status(namespaced(client, r), r, r.status.as_ref(), |old| {
+                    route_status(old, r.metadata.generation, controller_name, reports)
+                }).await?;
             }
-        };
+        )+ };
     }
-    routes!(stores.http_routes);
-    routes!(stores.grpc_routes);
-    routes!(stores.tcp_routes);
-    routes!(stores.tls_routes);
-    routes!(stores.udp_routes);
+    routes!(http_routes, grpc_routes, tcp_routes, tls_routes, udp_routes);
     Ok(())
 }
 
-/// merge parent conditions for any Route kind while preserving foreign controller entries.
-async fn update_route<K>(
-    api: Api<K>,
-    route: &K,
-    old: Value,
+/// merge parent conditions for any route kind while preserving foreign controller entries.
+fn route_status(
+    old: &Value,
+    generation: Option<i64>,
     controller_name: &str,
     route_reports: &[&RouteReport],
-) -> anyhow::Result<()>
-where
-    K: Resource<DynamicType = ()>
-        + Clone
-        + std::fmt::Debug
-        + DeserializeOwned
-        + Serialize,
-{
-    let old_parents = old
-        .get("parents")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+) -> Option<Value> {
+    let old_parents = entries(old, "parents");
     let owned_parent = |p: &Value| p["controllerName"] == controller_name;
     let mut parents: Vec<_> =
         old_parents.iter().filter(|p| !owned_parent(p)).cloned().collect();
     let mut reports = BTreeMap::new();
     for &report in route_reports {
-        let key = serde_json::to_string(&report.parent)?;
+        let key = report.parent.to_string();
         let score = |r: &RouteReport| {
             // report the closest eligible listener when every attachment was rejected.
             let matched = match r.reason {
@@ -241,7 +225,6 @@ where
         let previous = old_parents
             .iter()
             .find(|p| owned_parent(p) && &p["parentRef"] == parent);
-        let generation = route.meta().generation;
         let refs_message = if report.resolved {
             "backend references resolved"
         } else if report.refs_reason == "InvalidBackendTLSPolicy" {
@@ -263,22 +246,15 @@ where
             "conditions": conditions,
         }));
     }
-    if parents.is_empty() && old_parents.is_empty() {
-        return Ok(());
-    }
-    patch_status(api, route, &old, json!({"parents":parents})).await
+    (!parents.is_empty() || !old_parents.is_empty()).then(|| json!({"parents":parents}))
 }
 
 /// default programming condition message for gateways and their listeners.
 const READINESS: &str = "proxy snapshot and listener readiness";
 
 /// publish independent listener status and the address actually assigned by Kubernetes.
-async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
+fn gateway_status(plan: &Plan, old: &Value) -> Value {
     let gateway = &plan.gateway;
-    let old = gateway
-        .status
-        .as_ref()
-        .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
     let generation = gateway.metadata.generation;
     let accepted = plan.accepted();
     let all_valid = plan.listeners.iter().all(|l| l.accepted);
@@ -306,7 +282,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
     let mut desired = old.clone();
     let ready_message = plan.issue.as_deref().unwrap_or(READINESS);
     desired["conditions"] = stamp_conditions(
-        Some(&old),
+        Some(old),
         generation,
         [
             ("Accepted", accepted, reason, message),
@@ -320,7 +296,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
         .collect();
     let mut statuses = Vec::new();
     for (l, report) in gateway.spec.listeners.iter().zip(&plan.listeners) {
-        let previous = entries(&old, "listeners").iter().find(|v| v["name"] == l.name);
+        let previous = entries(old, "listeners").iter().find(|v| v["name"] == l.name);
         let bound = plan.programmed && report.accepted;
         let error = report.refs_error.as_ref();
         let attached = report
@@ -360,16 +336,7 @@ async fn update_gateway(client: &Client, plan: &Plan) -> anyhow::Result<()> {
         }));
     }
     desired["listeners"] = Value::Array(statuses);
-    patch_status(
-        Api::<Gateway>::namespaced(
-            client.clone(),
-            &gateway.namespace().unwrap_or_default(),
-        ),
-        gateway.as_ref(),
-        &old,
-        desired,
-    )
-    .await
+    desired
 }
 
 /// publish all gateway ancestors for a policy against a single observed resource version.
@@ -394,71 +361,61 @@ async fn update_policies(
         }
     }
     for policy in stores.tls_policies.state() {
-        let old = policy
-            .status
-            .as_ref()
-            .map_or_else(|| Ok(json!({})), serde_json::to_value)?;
-        let entries = old["ancestors"].as_array().map_or(&[][..], Vec::as_slice);
-        let owned = |p: &Value| {
-            let ancestor = &p["ancestorRef"];
-            p["controllerName"] == controller_name
-                && ancestor["kind"] == "Gateway"
-                && ancestor["group"] == "gateway.networking.k8s.io"
-        };
-        let mut ancestors: Vec<_> =
-            entries.iter().filter(|entry| !owned(entry)).cloned().collect();
         let key = ObjectRef::from_obj(policy.as_ref());
         let reports = reports.remove(&key).unwrap_or_default();
-        if reports.is_empty() && ancestors.len() == entries.len() {
-            continue;
-        }
-        for ((namespace, name), report) in reports {
-            let previous = entries.iter().find(|entry| {
-                owned(entry)
-                    && entry["ancestorRef"]["name"] == name
-                    && entry["ancestorRef"]["namespace"] == namespace
-            });
-            let error = report.as_ref().err();
-            let refs_error = error.filter(|e| {
-                matches!(
-                    e.reason,
-                    "InvalidCACertificateRef" | "InvalidKind" | "TargetNotFound"
-                )
-            });
-            let reason = if refs_error.is_some_and(|e| e.reason != "TargetNotFound") {
-                "NoValidCACertificate"
-            } else {
-                error.map_or("Accepted", |e| e.reason)
+        let p = policy.as_ref();
+        patch_status(namespaced(client, p), p, p.status.as_ref(), |old| {
+            let entries = entries(old, "ancestors");
+            let owned = |p: &Value| {
+                let ancestor = &p["ancestorRef"];
+                p["controllerName"] == controller_name
+                    && ancestor["kind"] == "Gateway"
+                    && ancestor["group"] == "gateway.networking.k8s.io"
             };
-            let message =
-                error.map_or("backend TLS policy applied", |e| e.message.as_str());
-            let generation = policy.metadata.generation;
-            let conditions = stamp_conditions(
-                previous,
-                generation,
-                [
-                    ("Accepted", error.is_none(), reason, message),
-                    resolved(refs_error, "policy references resolved"),
-                ],
-            );
-            ancestors.push(json!({
-                "ancestorRef": {
-                    "group": "gateway.networking.k8s.io", "kind": "Gateway",
-                    "name": name, "namespace": namespace
-                },
-                "controllerName": controller_name,
-                "conditions": conditions
-            }));
-        }
-        patch_status(
-            Api::<BackendTlsPolicy>::namespaced(
-                client.clone(),
-                &policy.namespace().unwrap_or_default(),
-            ),
-            policy.as_ref(),
-            &old,
-            json!({"ancestors":ancestors}),
-        )
+            let mut ancestors: Vec<_> =
+                entries.iter().filter(|entry| !owned(entry)).cloned().collect();
+            if reports.is_empty() && ancestors.len() == entries.len() {
+                return None;
+            }
+            for ((namespace, name), report) in reports {
+                let previous = entries.iter().find(|entry| {
+                    owned(entry)
+                        && entry["ancestorRef"]["name"] == name
+                        && entry["ancestorRef"]["namespace"] == namespace
+                });
+                let error = report.as_ref().err();
+                let refs_error = error.filter(|e| {
+                    matches!(
+                        e.reason,
+                        "InvalidCACertificateRef" | "InvalidKind" | "TargetNotFound"
+                    )
+                });
+                let reason = if refs_error.is_some_and(|e| e.reason != "TargetNotFound") {
+                    "NoValidCACertificate"
+                } else {
+                    error.map_or("Accepted", |e| e.reason)
+                };
+                let message =
+                    error.map_or("backend TLS policy applied", |e| e.message.as_str());
+                let conditions = stamp_conditions(
+                    previous,
+                    p.metadata.generation,
+                    [
+                        ("Accepted", error.is_none(), reason, message),
+                        resolved(refs_error, "policy references resolved"),
+                    ],
+                );
+                ancestors.push(json!({
+                    "ancestorRef": {
+                        "group": "gateway.networking.k8s.io", "kind": "Gateway",
+                        "name": name, "namespace": namespace
+                    },
+                    "controllerName": controller_name,
+                    "conditions": conditions
+                }));
+            }
+            Some(json!({"ancestors":ancestors}))
+        })
         .await?;
     }
     Ok(())
