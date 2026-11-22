@@ -2,7 +2,7 @@
 use super::{
     super::ir::{GatewaySnapshot, wire},
     GatewayStores,
-    config::Settings,
+    config::{ServiceType, Settings},
     manifest::{Target, requested_addresses},
     service::{Plan, controlled_by},
 };
@@ -153,7 +153,7 @@ pub async fn reconcile(
         namespace: &ns,
         name: &name,
         gateway_name: &g.name_any(),
-        instance: &settings.release,
+        instance: &settings.installation.release,
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
@@ -161,7 +161,7 @@ pub async fn reconcile(
     applied.ensure(client, &target, target.snapshot(payload)).await?;
     applied.ensure(client, &target, target.service_account()).await?;
     applied
-        .ensure(client, &target, target.role(&settings.provisioner_binding))
+        .ensure(client, &target, target.role(&settings.installation.provisioner_binding))
         .await?;
     applied.ensure(client, &target, target.role_binding()).await?;
     let replicas = if active { settings.replicas } else { 0 };
@@ -176,7 +176,7 @@ pub async fn reconcile(
             .await?;
     }
     let Some(service) = existing_service else { return Ok(()) };
-    plan.addresses = if settings.service.r#type == "LoadBalancer" {
+    plan.addresses = if settings.service.r#type == ServiceType::LoadBalancer {
         service
             .status
             .as_ref()
@@ -296,8 +296,8 @@ pub async fn retired(
             continue;
         }
         let instance = cm.labels().get("app.kubernetes.io/instance").map(String::as_str);
-        if instance != Some(settings.release.as_str())
-            && !(instance.is_none() && settings.release == "weiche")
+        if instance != Some(settings.installation.release.as_str())
+            && !(instance.is_none() && settings.installation.release == "weiche")
         {
             continue;
         }

@@ -5,25 +5,70 @@ use k8s_openapi::api::core::v1::{
     Affinity, EnvVar, LocalObjectReference, ResourceRequirements, SeccompProfile,
     Toleration, TopologySpreadConstraint,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, IntoDeserializer},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
 };
 
-/// default proxy log level.
-fn default_log_level() -> String {
-    "info".into()
+/// declare each setting's accepted spellings together with its wire representation.
+macro_rules! setting {
+    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $variant:ident = $wire:literal),+ }) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+        pub enum $name {
+            $(#[doc = concat!("use the `", $wire, "` setting.")]
+              $(#[$attr])* #[serde(rename = $wire)] $variant),+
+        }
+        impl $name {
+            /// return the spelling expected by the proxy or Kubernetes API.
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+    };
 }
 
-/// default proxy log format.
-fn default_log_format() -> String {
-    "text".into()
+setting! {
+    /// proxy log encoding.
+    LogFormat { Text = "text", Json = "json" }
+}
+setting! {
+    /// exposure of a gateway Service.
+    #[derive(Default)]
+    ServiceType {
+        #[default] #[serde(alias = "")] ClusterIP = "ClusterIP",
+        LoadBalancer = "LoadBalancer", NodePort = "NodePort"
+    }
+}
+setting! {
+    /// stack allocation policy for a gateway Service.
+    #[derive(Default)]
+    IpFamilyPolicy {
+        SingleStack = "SingleStack", #[default] PreferDualStack = "PreferDualStack",
+        RequireDualStack = "RequireDualStack"
+    }
+}
+setting! {
+    /// address family allocated to a gateway Service.
+    IpFamily { IPv4 = "IPv4", IPv6 = "IPv6" }
+}
+setting! {
+    /// scope of externally received Service traffic.
+    ExternalTrafficPolicy { Cluster = "Cluster", Local = "Local" }
 }
 
-/// default Kubernetes IP family policy for Gateway Services.
-fn default_ip_family_policy() -> String {
-    "PreferDualStack".into()
+/// accept null, an omitted setting or Helm's empty string for an optional override.
+fn optional<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<String>::deserialize(d)?
+        .filter(|s| !s.is_empty())
+        .map(|s| T::deserialize(s.into_deserializer()))
+        .transpose()
 }
 
 /// platform logging defaults for provisioned proxy containers.
@@ -33,46 +78,31 @@ pub struct LogSettings {
     /// default RUST_LOG filter applied to proxy pods.
     pub level: String,
     /// output log format (`text` or `json`).
-    pub format: String,
+    pub format: LogFormat,
 }
 
 impl Default for LogSettings {
     /// use the installation's default proxy log level and format.
     fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            format: default_log_format(),
-        }
+        Self { level: "info".into(), format: LogFormat::Text }
     }
 }
 
 /// platform networking defaults for provisioned Gateway Services.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServiceSettings {
     /// gateway Service type (`ClusterIP`, `LoadBalancer`, or `NodePort`).
-    pub r#type: String,
+    pub r#type: ServiceType,
     /// gateway IP family policy (`SingleStack`, `PreferDualStack`, or `RequireDualStack`).
-    pub ip_family_policy: String,
+    pub ip_family_policy: IpFamilyPolicy,
     /// optional ordered IP families (`IPv4`, `IPv6`).
-    pub ip_families: Vec<String>,
+    pub ip_families: Vec<IpFamily>,
     /// optional external traffic policy (`Cluster` or `Local`) for LoadBalancer or NodePort.
-    pub external_traffic_policy: Option<String>,
+    #[serde(deserialize_with = "optional")]
+    pub external_traffic_policy: Option<ExternalTrafficPolicy>,
     /// default annotations merged onto every Gateway Service.
     pub annotations: BTreeMap<String, String>,
-}
-
-impl Default for ServiceSettings {
-    /// prefer dual-stack allocation and leave the Service type to installation settings.
-    fn default() -> Self {
-        Self {
-            r#type: String::new(),
-            ip_family_policy: default_ip_family_policy(),
-            ip_families: Vec::new(),
-            external_traffic_policy: None,
-            annotations: BTreeMap::new(),
-        }
-    }
 }
 
 /// platform policy for exposing HTTPS listeners over QUIC.
@@ -85,47 +115,42 @@ pub struct Http3Settings {
     pub advertised_port: Option<u16>,
 }
 
-/// default Helm release instance label for generated workloads.
-fn default_release() -> String {
-    "weiche".into()
+/// installation defaults shared by the controller and its proxy workloads.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Installation {
+    /// release instance name used to isolate multi-release workloads.
+    pub release: String,
+    /// gateway class controller name matched by this controller.
+    pub controller_name: String,
+    /// coordination Lease name used for leader election.
+    pub lease_name: String,
+    /// provisioner RoleBinding and ClusterRole name checked by proxies.
+    pub provisioner_binding: String,
+    /// graceful termination window in seconds for proxy pods.
+    pub termination_grace_period_seconds: i64,
 }
 
-/// default GatewayClass controllerName owned by this installation.
-fn default_controller_name() -> String {
-    CONTROLLER_NAME.into()
-}
-
-/// default leader-election Lease name in the release namespace.
-fn default_lease_name() -> String {
-    "weiche-controller".into()
-}
-
-/// default provisioner RoleBinding and ClusterRole name in authorized namespaces.
-fn default_provisioner_binding() -> String {
-    "weiche-gateway-provisioner".into()
-}
-
-/// default graceful termination window in seconds for proxy pods.
-fn default_termination_grace() -> i64 {
-    30
+impl Default for Installation {
+    /// use the standard release identity, RBAC and pod shutdown window.
+    fn default() -> Self {
+        Self {
+            release: "weiche".into(),
+            controller_name: CONTROLLER_NAME.into(),
+            lease_name: "weiche-controller".into(),
+            provisioner_binding: "weiche-gateway-provisioner".into(),
+            termination_grace_period_seconds: 30,
+        }
+    }
 }
 
 /// installation policy supplied by the platform, outside of tenant-writable Gateway specs.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    /// release instance name used to isolate multi-release workloads.
-    #[serde(default = "default_release")]
-    pub release: String,
-    /// gateway class controller name matched by this controller.
-    #[serde(default = "default_controller_name")]
-    pub controller_name: String,
-    /// coordination Lease name used for leader election.
-    #[serde(default = "default_lease_name")]
-    pub lease_name: String,
-    /// provisioner RoleBinding and ClusterRole name checked by proxies.
-    #[serde(default = "default_provisioner_binding")]
-    pub provisioner_binding: String,
+    /// platform defaults accepted alongside the required workload settings.
+    #[serde(flatten)]
+    pub installation: Installation,
     /// local IP address bound by proxy listeners.
     pub bind_address: IpAddr,
     /// namespaces authorized to host Gateway proxy workloads.
@@ -148,11 +173,8 @@ pub struct Settings {
     #[serde(default)]
     pub host_network: bool,
     /// optional Kubernetes DNS policy override for proxy pods.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional")]
     pub dns_policy: Option<String>,
-    /// graceful termination window in seconds for proxy pods.
-    #[serde(default = "default_termination_grace")]
-    pub termination_grace_period_seconds: i64,
     /// additional node selector labels merged with kubernetes.io/os=linux.
     #[serde(default)]
     pub node_selector: BTreeMap<String, String>,
@@ -160,13 +182,12 @@ pub struct Settings {
     #[serde(default)]
     pub tolerations: Vec<Toleration>,
     /// scheduling affinity rules applied to proxy pods.
-    #[serde(default)]
     pub affinity: Option<Affinity>,
     /// topology spread constraints applied to proxy pods.
     #[serde(default)]
     pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
     /// optional priorityClassName applied to proxy pods.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional")]
     pub priority_class_name: Option<String>,
     /// additional pod template labels applied to proxy pods.
     #[serde(default)]
@@ -183,9 +204,6 @@ pub struct Settings {
     /// networking defaults for every Gateway Service.
     #[serde(default)]
     pub service: ServiceSettings,
-    /// legacy flat serviceType field retained for backward compatibility.
-    #[serde(default)]
-    service_type: Option<String>,
     /// opt-in downstream HTTP/3 configuration for this installation.
     #[serde(default)]
     pub http3: Http3Settings,
@@ -194,75 +212,38 @@ pub struct Settings {
 impl Settings {
     /// read and validate platform installation settings from `/etc/weiche/proxy.json`.
     pub fn load() -> anyhow::Result<Self> {
-        let mut settings: Self =
+        let settings: Self =
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
-        if settings.service.r#type.is_empty() {
-            settings.service.r#type =
-                settings.service_type.take().unwrap_or_else(|| "ClusterIP".into());
-        }
-        if settings.service.external_traffic_policy.as_deref() == Some("") {
-            settings.service.external_traffic_policy = None;
-        }
-        if settings.dns_policy.as_deref() == Some("") {
-            settings.dns_policy = None;
-        }
-        if settings.priority_class_name.as_deref() == Some("") {
-            settings.priority_class_name = None;
-        }
+        let installation = &settings.installation;
+        let service = &settings.service;
         ensure!(
-            !settings.release.is_empty()
-                && !settings.controller_name.is_empty()
-                && !settings.lease_name.is_empty()
-                && !settings.provisioner_binding.is_empty()
+            !installation.release.is_empty()
+                && !installation.controller_name.is_empty()
+                && !installation.lease_name.is_empty()
+                && !installation.provisioner_binding.is_empty()
                 && !settings.namespaces.is_empty()
                 && settings.replicas > 0
-                && settings.termination_grace_period_seconds > 0
+                && installation.termination_grace_period_seconds > 0
                 && !settings.image.is_empty(),
             "invalid proxy installation settings"
         );
+        let families = service.ip_families.as_slice();
         ensure!(
-            matches!(settings.log.format.as_str(), "text" | "json"),
-            "unsupported proxy log format"
+            families.len() <= 1 || matches!(families, [a, b] if a != b),
+            "invalid gateway service ipFamilies"
         );
         ensure!(
-            matches!(
-                settings.service.r#type.as_str(),
-                "ClusterIP" | "LoadBalancer" | "NodePort"
+            !matches!(
+                (service.ip_family_policy, families.len()),
+                (IpFamilyPolicy::SingleStack, 2) | (IpFamilyPolicy::RequireDualStack, 1)
             ),
-            "unsupported gateway service type"
-        );
-        ensure!(
-            matches!(
-                settings.service.ip_family_policy.as_str(),
-                "SingleStack" | "PreferDualStack" | "RequireDualStack"
-            ),
-            "unsupported gateway service ipFamilyPolicy"
-        );
-        let mut seen = BTreeSet::new();
-        for family in &settings.service.ip_families {
-            ensure!(
-                matches!(family.as_str(), "IPv4" | "IPv6")
-                    && seen.insert(family.as_str()),
-                "invalid gateway service ipFamilies"
-            );
-        }
-        ensure!(
-            !(settings.service.ip_family_policy == "SingleStack"
-                && settings.service.ip_families.len() > 1)
-                && !(settings.service.ip_family_policy == "RequireDualStack"
-                    && settings.service.ip_families.len() == 1),
             "gateway service ipFamilies conflicts with ipFamilyPolicy"
         );
-        if let Some(policy) = settings.service.external_traffic_policy.as_deref() {
-            ensure!(
-                matches!(policy, "Cluster" | "Local")
-                    && matches!(
-                        settings.service.r#type.as_str(),
-                        "LoadBalancer" | "NodePort"
-                    ),
-                "invalid gateway service externalTrafficPolicy"
-            );
-        }
+        ensure!(
+            service.external_traffic_policy.is_none()
+                || service.r#type != ServiceType::ClusterIP,
+            "invalid gateway service externalTrafficPolicy"
+        );
         ensure!(
             settings.http3.advertised_port != Some(0),
             "invalid advertised HTTP/3 port"

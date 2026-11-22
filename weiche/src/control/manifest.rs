@@ -1,7 +1,7 @@
 //! build the Kubernetes resources owned by a gateway.
 use super::{
     super::ir::{Transport, wire::SNAPSHOT_KEY},
-    config::{ServiceSettings, Settings},
+    config::{IpFamily, IpFamilyPolicy, ServiceSettings, ServiceType, Settings},
     service::{GATEWAY_NAME, OWNER},
 };
 use k8s_openapi::{
@@ -188,7 +188,7 @@ impl Target<'_> {
             node_selector: Some(node_selector),
             image_pull_secrets: Some(settings.pull_secrets.clone()),
             termination_grace_period_seconds: Some(
-                settings.termination_grace_period_seconds,
+                settings.installation.termination_grace_period_seconds,
             ),
             volumes: Some(vec![Volume {
                 name: "run".into(),
@@ -285,17 +285,20 @@ impl Target<'_> {
             })
             .collect();
         let mut spec = ServiceSpec {
-            type_: Some(settings.r#type.clone()),
-            ip_family_policy: Some(settings.ip_family_policy.clone()),
-            ip_families: (!settings.ip_families.is_empty())
-                .then(|| settings.ip_families.clone()),
-            external_traffic_policy: settings.external_traffic_policy.clone(),
+            type_: Some(settings.r#type.as_str().into()),
+            ip_family_policy: Some(settings.ip_family_policy.as_str().into()),
+            ip_families: (!settings.ip_families.is_empty()).then(|| {
+                settings.ip_families.iter().map(|f| f.as_str().into()).collect()
+            }),
+            external_traffic_policy: settings
+                .external_traffic_policy
+                .map(|p| p.as_str().into()),
             selector: Some(self.selector()),
             ports: Some(ports),
             ..Default::default()
         };
         if let Some(first) = requested_ips.first() {
-            if settings.r#type == "LoadBalancer" {
+            if settings.r#type == ServiceType::LoadBalancer {
                 spec.load_balancer_ip = Some(first.to_string());
             } else {
                 spec.cluster_ip = Some(first.to_string());
@@ -320,7 +323,10 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
     };
     let mut env = vec![
         literal("WEICHE_WORKERS", settings.workers.to_string()),
-        literal("WEICHE_PROVISIONER_BINDING", settings.provisioner_binding.clone()),
+        literal(
+            "WEICHE_PROVISIONER_BINDING",
+            settings.installation.provisioner_binding.clone(),
+        ),
         EnvVar {
             name: "POD_UID".into(),
             value_from: Some(EnvVarSource {
@@ -345,15 +351,15 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
         env.push(literal("RUST_LOG", settings.log.level.clone()));
     }
     if !settings.extra_env.iter().any(|var| var.name == "WEICHE_LOG_FORMAT") {
-        env.push(literal("WEICHE_LOG_FORMAT", settings.log.format.clone()));
+        env.push(literal("WEICHE_LOG_FORMAT", settings.log.format.as_str().into()));
     }
     env.extend_from_slice(&settings.extra_env);
     env
 }
 
 /// return the Kubernetes IP family name for an IP address.
-fn ip_family(ip: IpAddr) -> &'static str {
-    if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+fn ip_family(ip: IpAddr) -> IpFamily {
+    if ip.is_ipv4() { IpFamily::IPv4 } else { IpFamily::IPv6 }
 }
 
 /// validate and parse optional static IP addresses requested in `Gateway.spec.addresses`.
@@ -381,21 +387,21 @@ pub fn requested_addresses(
     if ips.is_empty() {
         return Ok(ips);
     }
-    if service.r#type == "LoadBalancer" {
+    if service.r#type == ServiceType::LoadBalancer {
         if ips.len() > 1 {
             return Err(
                 "LoadBalancer Service supports at most one requested IP address".into()
             );
         }
         if !service.ip_families.is_empty()
-            && !service.ip_families.iter().any(|f| f == ip_family(ips[0]))
+            && !service.ip_families.contains(&ip_family(ips[0]))
         {
             return Err("requested IP family does not match service ipFamilies".into());
         }
         return Ok(ips);
     }
     if ips.len() > 2
-        || (service.ip_family_policy == "SingleStack" && ips.len() > 1)
+        || (service.ip_family_policy == IpFamilyPolicy::SingleStack && ips.len() > 1)
         || (ips.len() == 2 && ips[0].is_ipv4() == ips[1].is_ipv4())
     {
         return Err(
@@ -408,7 +414,7 @@ pub fn requested_addresses(
             || ips
                 .iter()
                 .zip(&service.ip_families)
-                .any(|(ip, family)| ip_family(*ip) != family))
+                .any(|(ip, family)| ip_family(*ip) != *family))
     {
         return Err(
             "requested IP families do not match configured service ipFamilies".into()
