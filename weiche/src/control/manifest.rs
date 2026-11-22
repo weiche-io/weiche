@@ -1,7 +1,17 @@
 //! build the Kubernetes resources owned by a gateway.
-use super::{super::ir::Transport, config::ServiceSettings, service::OWNER};
+use super::{
+    super::ir::{Transport, wire::SNAPSHOT_KEY},
+    config::{ServiceSettings, Settings},
+    service::{GATEWAY_NAME, OWNER},
+};
 use k8s_openapi::{
-    api::core::v1::{Service, ServicePort, ServiceSpec},
+    ByteString,
+    api::{
+        core::v1::{
+            ConfigMap, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
+        },
+        rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject},
+    },
     apimachinery::pkg::{
         apis::meta::v1::{ObjectMeta, OwnerReference},
         util::intstr::IntOrString,
@@ -27,6 +37,119 @@ pub struct Target<'a> {
 }
 
 impl Target<'_> {
+    /// overlay gateway infrastructure labels, reserving the controller's identity labels.
+    fn labels(&self, mut labels: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        if let Some(infra) = self.infra.and_then(|i| i.labels.as_ref()) {
+            labels.extend(infra.clone());
+        }
+        labels.insert(GATEWAY_NAME.into(), self.gateway_name.into());
+        labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
+        labels.insert("app.kubernetes.io/instance".into(), self.instance.into());
+        labels
+    }
+
+    /// merge gateway annotations over platform defaults and omit an empty result.
+    fn annotations(
+        &self,
+        mut annotations: BTreeMap<String, String>,
+    ) -> Option<BTreeMap<String, String>> {
+        if let Some(infra) = self.infra.and_then(|i| i.annotations.as_ref()) {
+            annotations.extend(infra.clone());
+        }
+        (!annotations.is_empty()).then_some(annotations)
+    }
+
+    /// identify an owned resource and attach its controller reference.
+    pub fn metadata(&self, annotations: BTreeMap<String, String>) -> ObjectMeta {
+        ObjectMeta {
+            name: Some(self.name.into()),
+            namespace: Some(self.namespace.into()),
+            labels: Some(self.labels(BTreeMap::new())),
+            annotations: self.annotations(annotations),
+            owner_references: Some(vec![self.owner.clone()]),
+            ..Default::default()
+        }
+    }
+
+    /// label the pod template for selection by both the deployment and the service.
+    pub fn pod_metadata(&self, settings: &Settings) -> ObjectMeta {
+        let mut labels = self.labels(settings.pod_labels.clone());
+        labels.insert(OWNER.into(), self.owner.uid.clone());
+        ObjectMeta {
+            labels: Some(labels),
+            annotations: self.annotations(settings.pod_annotations.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// leave report data to the pods that acknowledge listener revisions.
+    pub fn report(&self) -> ConfigMap {
+        ConfigMap {
+            metadata: self.metadata(BTreeMap::new()),
+            ..Default::default()
+        }
+    }
+
+    /// publish the encoded gateway snapshot under the proxy's watched key.
+    pub fn snapshot(&self, payload: Vec<u8>) -> Secret {
+        Secret {
+            metadata: self.metadata(BTreeMap::new()),
+            type_: Some("weiche.io/snapshot".into()),
+            data: Some(BTreeMap::from([(SNAPSHOT_KEY.into(), ByteString(payload))])),
+            ..Default::default()
+        }
+    }
+
+    /// identify the proxy pods to the Kubernetes API.
+    pub fn service_account(&self) -> ServiceAccount {
+        ServiceAccount {
+            metadata: self.metadata(BTreeMap::new()),
+            ..Default::default()
+        }
+    }
+
+    /// restrict proxy access to its snapshot, report and provisioner binding.
+    pub fn role(&self, provisioner_binding: &str) -> Role {
+        let rule = |group: &str, resource: &str, name: &str, verbs: &[&str]| PolicyRule {
+            api_groups: Some(vec![group.into()]),
+            resources: Some(vec![resource.into()]),
+            resource_names: Some(vec![name.into()]),
+            verbs: verbs.iter().map(|v| (*v).into()).collect(),
+            ..Default::default()
+        };
+        Role {
+            metadata: self.metadata(BTreeMap::new()),
+            rules: Some(vec![
+                rule("", "secrets", self.name, &["get", "list", "watch"]),
+                rule("", "configmaps", self.name, &["patch"]),
+                rule(
+                    "rbac.authorization.k8s.io",
+                    "rolebindings",
+                    provisioner_binding,
+                    &["get"],
+                ),
+            ]),
+        }
+    }
+
+    /// bind the gateway role to its namespaced proxy service account.
+    pub fn role_binding(&self) -> RoleBinding {
+        RoleBinding {
+            metadata: self.metadata(BTreeMap::new()),
+            role_ref: RoleRef {
+                api_group: Some("rbac.authorization.k8s.io".into()),
+                kind: "Role".into(),
+                name: self.name.into(),
+            },
+            subjects: Some(vec![Subject {
+                kind: "ServiceAccount".into(),
+                name: self.name.into(),
+                namespace: Some(self.namespace.into()),
+                ..Default::default()
+            }]),
+        }
+    }
+
     /// select only the pods serving this gateway uid.
     pub fn selector(&self) -> BTreeMap<String, String> {
         BTreeMap::from([(OWNER.into(), self.owner.uid.clone())])
@@ -72,11 +195,7 @@ impl Target<'_> {
             }
         }
         Service {
-            metadata: ObjectMeta {
-                annotations: (!settings.annotations.is_empty())
-                    .then(|| settings.annotations.clone()),
-                ..Default::default()
-            },
+            metadata: self.metadata(settings.annotations.clone()),
             spec: Some(spec),
             ..Default::default()
         }

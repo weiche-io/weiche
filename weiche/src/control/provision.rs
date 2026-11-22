@@ -1,22 +1,16 @@
 //! reconcile Gateway-owned resources in platform-approved namespaces.
 use super::{
-    super::ir::{
-        GatewaySnapshot,
-        wire::{self, SNAPSHOT_KEY},
-    },
+    super::ir::{GatewaySnapshot, wire},
     GatewayStores,
     config::Settings,
     manifest::{Target, requested_addresses},
-    service::{GATEWAY_NAME, OWNER, Plan, controlled_by},
+    service::{Plan, controlled_by},
 };
 use anyhow::{Context, ensure};
-use k8s_openapi::{
-    ByteString,
-    api::{
-        apps::v1::Deployment,
-        core::v1::{ConfigMap, Secret, Service, ServiceAccount},
-        rbac::v1::{Role, RoleBinding},
-    },
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{ConfigMap, Secret, Service, ServiceAccount},
+    rbac::v1::{Role, RoleBinding},
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -63,25 +57,6 @@ impl Applied {
         let mut fields = serde_json::to_value(manifest)?;
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
-        if let Some(infra) = target.infra {
-            if let Some(labels) = &infra.labels {
-                for (k, v) in labels {
-                    fields["metadata"]["labels"][k] = json!(v);
-                }
-            }
-            if let Some(annotations) = &infra.annotations {
-                for (k, v) in annotations {
-                    fields["metadata"]["annotations"][k] = json!(v);
-                }
-            }
-        }
-        fields["metadata"]["labels"][GATEWAY_NAME] = json!(target.gateway_name);
-        fields["metadata"]["labels"]["app.kubernetes.io/managed-by"] = json!("weiche");
-        fields["metadata"]["labels"]["app.kubernetes.io/instance"] =
-            json!(target.instance);
-        fields["metadata"]["name"] = json!(target.name);
-        fields["metadata"]["namespace"] = json!(target.namespace);
-        fields["metadata"]["ownerReferences"] = json!([target.owner]);
         let key =
             (target.namespace.to_owned(), target.name.to_owned(), kind.kind.clone());
         let digest = wire::version(&serde_json::to_vec(&fields)?);
@@ -182,22 +157,18 @@ pub async fn reconcile(
         owner: &owner,
         infra: g.spec.infrastructure.as_ref(),
     };
-    applied.ensure::<ConfigMap>(client, &target, json!({})).await?;
+    applied.ensure::<ConfigMap>(client, &target, target.report()).await?;
     applied
-        .ensure::<Secret>(
-            client,
-            &target,
-            json!({
-                "type":"weiche.io/snapshot", "data":{(SNAPSHOT_KEY):ByteString(payload)}
-            }),
-        )
-        .await?;
-    applied.ensure::<ServiceAccount>(client, &target, json!({})).await?;
-    applied
-        .ensure::<Role>(client, &target, proxy_role(&name, &settings.provisioner_binding))
+        .ensure::<Secret>(client, &target, target.snapshot(payload))
         .await?;
     applied
-        .ensure::<RoleBinding>(client, &target, proxy_role_binding(&name, &ns))
+        .ensure::<ServiceAccount>(client, &target, target.service_account())
+        .await?;
+    applied
+        .ensure::<Role>(client, &target, target.role(&settings.provisioner_binding))
+        .await?;
+    applied
+        .ensure::<RoleBinding>(client, &target, target.role_binding())
         .await?;
     let replicas = if active { settings.replicas } else { 0 };
     let selector = json!(target.selector());
@@ -295,48 +266,6 @@ pub async fn reconcile(
     Ok(())
 }
 
-/// render least-privilege RBAC for one proxy pod.
-fn proxy_role(name: &str, provisioner_binding: &str) -> Value {
-    json!({
-        "rules": [
-            {
-                "apiGroups": [""],
-                "resources": ["secrets"],
-                "resourceNames": [name],
-                "verbs": ["get", "list", "watch"],
-            },
-            {
-                "apiGroups": [""],
-                "resources": ["configmaps"],
-                "resourceNames": [name],
-                "verbs": ["patch"],
-            },
-            {
-                "apiGroups": ["rbac.authorization.k8s.io"],
-                "resources": ["rolebindings"],
-                "resourceNames": [provisioner_binding],
-                "verbs": ["get"],
-            },
-        ]
-    })
-}
-
-/// bind the gateway role to its proxy service account.
-fn proxy_role_binding(name: &str, namespace: &str) -> Value {
-    json!({
-        "roleRef": {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "Role",
-            "name": name,
-        },
-        "subjects": [{
-            "kind": "ServiceAccount",
-            "name": name,
-            "namespace": namespace,
-        }],
-    })
-}
-
 /// render the per-Gateway proxy Deployment using platform and Gateway infrastructure settings.
 fn proxy_deployment(
     target: &Target<'_>,
@@ -345,21 +274,6 @@ fn proxy_deployment(
     replicas: i32,
 ) -> Value {
     let name = target.name;
-    let infra = target.infra;
-    let mut pod_labels = settings.pod_labels.clone();
-    if let Some(labels) = infra.and_then(|i| i.labels.as_ref()) {
-        pod_labels.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-    pod_labels.insert(OWNER.into(), target.owner.uid.clone());
-    pod_labels.insert(GATEWAY_NAME.into(), target.gateway_name.into());
-    pod_labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
-    pod_labels.insert("app.kubernetes.io/instance".into(), settings.release.clone());
-
-    let mut pod_annotations = settings.pod_annotations.clone();
-    if let Some(annotations) = infra.and_then(|i| i.annotations.as_ref()) {
-        pod_annotations.extend(annotations.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-
     let mut node_selector = settings.node_selector.clone();
     node_selector.insert("kubernetes.io/os".into(), "linux".into());
 
@@ -449,16 +363,13 @@ fn proxy_deployment(
         pod_spec["priorityClassName"] = json!(priority_class);
     }
 
-    let mut pod_meta = json!({"labels": pod_labels});
-    if !pod_annotations.is_empty() {
-        pod_meta["annotations"] = json!(pod_annotations);
-    }
     json!({
+        "metadata": target.metadata(BTreeMap::new()),
         "spec": {
             "replicas": replicas,
             "selector": {"matchLabels": selector},
             "template": {
-                "metadata": pod_meta,
+                "metadata": target.pod_metadata(settings),
                 "spec": pod_spec,
             },
         }
