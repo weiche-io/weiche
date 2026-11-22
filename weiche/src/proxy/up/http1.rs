@@ -71,8 +71,7 @@ impl ConnectionPool {
                 continue;
             }
             if let Some(slot) = self.try_reserve() {
-                let transport =
-                    self.dial(&endpoint, self.connector.connect(&endpoint.key)).await?;
+                let transport = self.dial(&endpoint, self.connect(&endpoint.key)).await?;
                 let connection = Connection { transport, _slot: slot };
                 return Ok(Lease { connection, endpoint, reused: false });
             }

@@ -25,10 +25,7 @@ impl Endpoint {
 
 impl ConnectionPool {
     /// acquire stream capacity or open a new HTTP/2 transport.
-    pub async fn acquire_http2(
-        &self,
-        endpoint: &Rc<Endpoint>,
-    ) -> anyhow::Result<Http2Lease> {
+    pub async fn acquire_http2(&self, endpoint: &Endpoint) -> anyhow::Result<Http2Lease> {
         loop {
             let changed = self.watch_capacity(endpoint)?;
             endpoint.prune(self.idle_timeout);
@@ -49,9 +46,8 @@ impl ConnectionPool {
                     endpoint.connecting.set(false);
                     endpoint.budget.changed.notify_waiters();
                 });
-                let transport = self
-                    .dial(endpoint, self.connector.connect_http2(&endpoint.key))
-                    .await?;
+                let transport =
+                    self.dial(endpoint, self.connect_http2(&endpoint.key)).await?;
                 let connection = Rc::new(Http2Connection {
                     transport,
                     slot,
@@ -141,4 +137,4 @@ impl Http2Lease {
 }
 
 /// the upload holds its share of the stream reservation independently of the response.
-type Upload = TimedBody<RequestBody, Rc<Stream>>;
+pub type Upload = TimedBody<RequestBody, Rc<Stream>>;

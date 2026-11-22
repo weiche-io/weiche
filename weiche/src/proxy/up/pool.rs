@@ -2,7 +2,6 @@
 
 use super::{
     super::{super::ir::Protocol, admission::EndpointKey, config::RuntimeConfig},
-    connector::Connector,
     http1::{Idle, Lease},
     http2::{Http2Connection, Http2Lease},
 };
@@ -115,8 +114,8 @@ pub struct ConnectionPool {
     pub max_streams: usize,
     /// maximum idle age before a connection expires.
     pub idle_timeout: Duration,
-    /// handshake limits used for fresh transports.
-    pub connector: Connector,
+    /// maximum HTTP connection buffer size for fresh handshakes.
+    pub max_buffer: usize,
     /// shared socket capacity on this worker.
     budget: Rc<Budget>,
     /// whether the worker has stopped accepting new connections.
@@ -133,7 +132,7 @@ impl ConnectionPool {
             limit: config.upstream_connections_per_worker.get(),
             max_streams: config.http2_max_concurrent_streams as usize,
             idle_timeout: config.upstream_idle_timeout,
-            connector: Connector { max_buffer: config.http_max_buffer },
+            max_buffer: config.http_max_buffer,
             budget: Rc::new(Budget::default()),
             closed: Cell::new(false),
             reaper: RefCell::new(None),

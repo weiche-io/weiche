@@ -120,7 +120,7 @@ impl ConnectionPool {
     /// retire a stale HTTP/2 sender before retrying an undispatched stream.
     async fn http2(
         &self,
-        endpoint: &Rc<Endpoint>,
+        endpoint: &Endpoint,
         request: Request<RequestBody>,
         end: Option<Instant>,
     ) -> anyhow::Result<Attempt> {
