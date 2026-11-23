@@ -50,7 +50,12 @@ impl Target<'_> {
             labels.extend(infra.labels.clone().unwrap_or_default());
             annotations.extend(infra.annotations.clone().unwrap_or_default());
         }
-        labels.insert(GATEWAY_NAME.into(), self.owner.name.clone());
+        // gateway names are DNS subdomains; the API only allows 63 bytes in a label value.
+        if self.owner.name.len() <= 63 {
+            labels.insert(GATEWAY_NAME.into(), self.owner.name.clone());
+        } else {
+            labels.remove(GATEWAY_NAME);
+        }
         labels.insert("app.kubernetes.io/managed-by".into(), "weiche".into());
         labels.insert("app.kubernetes.io/instance".into(), self.instance.into());
         ObjectMeta {
@@ -129,7 +134,7 @@ impl Target<'_> {
     }
 
     /// bind the platform pod template to this gateway's identity and snapshot.
-    pub fn deployment(&self, settings: &Settings, replicas: i32) -> Deployment {
+    pub fn deployment(&self, settings: &Settings) -> Deployment {
         let mut template = settings.pod_template.clone();
         let meta = template.metadata.get_or_insert_default();
         let gateway = self.template(
@@ -142,8 +147,9 @@ impl Target<'_> {
         template.spec.get_or_insert_default().service_account_name =
             Some(self.name.into());
         let mut deployment: Deployment = self.owned();
+        deployment.metadata.name = Some(self.owner.name.clone());
         deployment.spec = DeploymentSpec {
-            replicas: Some(replicas),
+            replicas: Some(settings.replicas),
             selector: LabelSelector {
                 match_labels: Some(self.selector()),
                 ..Default::default()
