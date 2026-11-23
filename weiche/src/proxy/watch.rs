@@ -80,9 +80,6 @@ impl Desired {
                 sockets.insert((Transport::Udp, addr));
             }
         }
-        if sockets.is_empty() {
-            tracing::info!(secret = %secret.name_any(), "snapshot has no active listeners; proxy readiness withdrawn");
-        }
         Ok(Self {
             version: wire::version(bytes),
             listeners,
@@ -93,10 +90,9 @@ impl Desired {
 
     /// check every expected socket against its worker acknowledgements.
     fn applied(&self, workers: &[WorkerStatus]) -> bool {
-        !self.sockets.is_empty()
-            && !workers.is_empty()
+        !workers.is_empty()
             && workers.iter().all(|worker| {
-                worker.revision == self.revision && self.sockets.is_subset(&worker.bound)
+                worker.revision == self.revision && self.sockets == worker.bound
             })
     }
 }

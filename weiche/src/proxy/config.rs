@@ -160,7 +160,8 @@ pub type Reader = watch::Receiver<Arc<PublishedSnapshot>>;
 
 /// create a snapshot publication channel starting at revision zero.
 pub fn channel(initial: GatewaySnapshot) -> (Writer, Reader) {
-    let initial = Arc::new(PublishedSnapshot { revision: 0, gateway: initial });
+    // zero identifies workers that have not reported a snapshot or have stopped.
+    let initial = Arc::new(PublishedSnapshot { revision: 1, gateway: initial });
     let (tx, rx) = watch::channel(initial);
     (Writer { tx }, rx)
 }
