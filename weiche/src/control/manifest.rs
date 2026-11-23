@@ -306,7 +306,6 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
         ..Default::default()
     };
     let mut env = vec![
-        literal("WEICHE_WORKERS", settings.workers.to_string()),
         literal("WEICHE_PROVISIONER_BINDING", binding.clone()),
         EnvVar {
             name: "POD_UID".into(),

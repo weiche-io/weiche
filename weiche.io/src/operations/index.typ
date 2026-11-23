@@ -31,18 +31,22 @@ data-plane proxies or Gateway Services.
   columns: 3,
   table.header([Owner], [Resources], [Scope]),
   [Helm chart],
-  [Controller `Deployment`, `<release>-settings`, `GatewayClass/weiche`, controller & election RBAC, `weiche-gateway-provisioner` `RoleBinding`s],
+  [Controller `Deployment`, `<release>-settings`, `GatewayClass/weiche`,
+    controller & election RBAC, `weiche-gateway-provisioner` `RoleBinding`s],
   [Release namespace + each `gatewayNamespaces` entry],
+
   [Controller leader],
-  [`weiche-gw-<uid>` `Secret`, `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `Deployment`, `Service`],
+  [`weiche-gw-<uid>` `Secret`, `ConfigMap`, `ServiceAccount`, `Role`,
+    `RoleBinding`, `Deployment`, `Service`],
   [Each accepted `Gateway`'s namespace],
+
   [Target namespace admin],
   [`ReferenceGrant` (`gateway.networking.k8s.io/v1`)],
   [Namespace of the referenced `Secret` or `Service`],
 )
 
-Install the bundled Gateway API v1.7.0 standard CRDs, create the namespaces
-that will host Gateways, and install the chart:
+Install the bundled Gateway API v1.7.0 standard CRDs, create the namespaces that
+will host Gateways, and install the chart:
 
 ```sh
 kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
@@ -54,8 +58,8 @@ helm install weiche charts/weiche \
   --set proxy.service.type=LoadBalancer
 ```
 
-See #link(blob + "charts/weiche/values.yaml")[`values.yaml`] for the full set
-of platform defaults (`gatewayClass.*`, `controller.*`, `proxy.*`,
+See #link(blob + "charts/weiche/values.yaml")[`values.yaml`] for the full set of
+platform defaults (`gatewayClass.*`, `controller.*`, `proxy.*`,
 `proxy.service.*` and `imagePullSecrets`). Controller and proxy workloads have
 independent replicas, resources, scheduling (`nodeSelector`, `tolerations`,
 `affinity`, `topologySpreadConstraints`, `priorityClassName`), pod metadata,
@@ -63,6 +67,10 @@ logging (`level` and `format: text|json`) and `extraEnv`. Changing chart
 settings updates `<fullname>-settings` and its SHA-256 annotation
 (`weiche.io/settings`) on the controller pod template, rolling controller
 replicas cleanly.
+
+Each proxy sizes its worker pool at startup using the CPU parallelism available
+to the process. If you would like to pin the count, set `WEICHE_WORKERS` through
+`proxy.extraEnv` to keep that override.
 
 = Namespace authorization <namespaces>
 
@@ -76,23 +84,23 @@ empty, Helm authorizes only the release namespace.
 - Gateways created outside `gatewayNamespaces` are rejected with
   `Accepted: False` (`reason: NamespaceNotAllowed`), and the controller creates
   no proxy resources for them.
-- Use platform-controlled namespaces for `gatewayNamespaces`. Each proxy reads
-  a `Secret` in the Gateway's namespace containing its compiled routes and
+- Use platform-controlled namespaces for `gatewayNamespaces`. Each proxy reads a
+  `Secret` in the Gateway's namespace containing its compiled routes and
   authorized TLS private keys, so untrusted workloads should not share Secret
   read access in those namespaces.
 
 Authorization is enforced continuously on the data plane as well as the control
 plane. Every proxy pod checks every 15 seconds that
-`RoleBinding/weiche-gateway-provisioner` still exists in its namespace.
-Removing a namespace from `gatewayNamespaces` withdraws that `RoleBinding`;
-running proxies in that namespace drop readiness and exit instead of continuing
-to serve cached routes.
+`RoleBinding/weiche-gateway-provisioner` still exists in its namespace. Removing
+a namespace from `gatewayNamespaces` withdraws that `RoleBinding`; running
+proxies in that namespace drop readiness and exit instead of continuing to serve
+cached routes.
 
 = Per-Gateway proxies <proxies>
 
-Controller replicas coordinate through a `coordination.k8s.io/v1` `Lease`
-named `weiche-controller` in the release namespace (15s duration, 8s grace).
-The active leader compiles each accepted `Gateway` into a deterministic,
+Controller replicas coordinate through a `coordination.k8s.io/v1` `Lease` named
+`weiche-controller` in the release namespace (15s duration, 8s grace). The
+active leader compiles each accepted `Gateway` into a deterministic,
 zlib-compressed MessagePack snapshot (`routes.v1`) and reconciles seven
 Gateway-owned resources named `weiche-gw-<gateway-uid>` in the Gateway's
 namespace:
@@ -109,27 +117,28 @@ namespace:
   `ConfigMap`, and `get` on `RoleBinding/weiche-gateway-provisioner`.
 - `Deployment`: runs `weiche proxy weiche-gw-<uid>` (`proxy.replicas: 1` by
   default) as non-root UID `65532` with all capabilities dropped,
-  `net.ipv4.ip_unprivileged_port_start=0` to bind ports such as 80 and 443
-  (or `NET_BIND_SERVICE` with `ClusterFirstWithHostNet` when
+  `net.ipv4.ip_unprivileged_port_start=0` to bind ports such as 80 and 443 (or
+  `NET_BIND_SERVICE` with `ClusterFirstWithHostNet` when
   `proxy.hostNetwork: true`), `proxy.seccompProfile: Unconfined` by default for
   `io_uring`, an in-memory `emptyDir` at `/run/weiche` and an exec readiness
   probe (`weiche ready`) every 2 seconds.
 - `Service`: `ClusterIP`, `LoadBalancer` or `NodePort` configured by
-  `proxy.service.*` (`ipFamilyPolicy`, `ipFamilies`, `externalTrafficPolicy`
-  and default annotations), selecting pods by `weiche.io/gateway-uid: <uid>`
-  and exposing deduplicated listener ports (including matching `UDP` ports for
-  accepted `HTTPS` listeners when `proxy.http3.enabled: true`). Static
-  IPv4/IPv6 requests in `Gateway.spec.addresses` map to
-  `clusterIP`/`clusterIPs` or `loadBalancerIP`, and `Gateway.spec.infrastructure`
-  labels and annotations propagate to provisioned resources while preserving
-  controller selector and ownership labels.
+  `proxy.service.*` (`ipFamilyPolicy`, `ipFamilies`, `externalTrafficPolicy` and
+  default annotations), selecting pods by `weiche.io/gateway-uid: <uid>` and
+  exposing deduplicated listener ports (including matching `UDP` ports for
+  accepted `HTTPS` listeners when `proxy.http3.enabled: true`). Static IPv4/IPv6
+  requests in `Gateway.spec.addresses` map to `clusterIP`/`clusterIPs` or
+  `loadBalancerIP`, and `Gateway.spec.infrastructure` labels and annotations
+  propagate to provisioned resources while preserving controller selector and
+  ownership labels.
 
 Each proxy watches only its own `Secret`. Once all local `compio` workers bind
 every socket for a snapshot revision, the proxy atomically writes the digest to
-`/run/weiche/ready` and patches its `POD_UID` entry in `ConfigMap/weiche-gw-<uid>`.
-The controller reports `Programmed: True` on the `Gateway` only after the
-`Service` has an assigned address and at least one ready, non-terminating
-`EndpointSlice` endpoint has acknowledged the current snapshot digest.
+`/run/weiche/ready` and patches its `POD_UID` entry in
+`ConfigMap/weiche-gw-<uid>`. The controller reports `Programmed: True` on the
+`Gateway` only after the `Service` has an assigned address and at least one
+ready, non-terminating `EndpointSlice` endpoint has acknowledged the current
+snapshot digest.
 
 = Cross-namespace ReferenceGrant <referencegrant>
 
@@ -141,8 +150,8 @@ administrator of the target namespace using `gateway.networking.k8s.io/v1`
 
 == TLS Secrets in another namespace
 
-An `HTTPS` listener accepts a single `kubernetes.io/tls` `Secret` (`tls.crt`
-and `tls.key`) in TLS termination mode. When the `Secret` lives in a different
+An `HTTPS` listener accepts a single `kubernetes.io/tls` `Secret` (`tls.crt` and
+`tls.key`) in TLS termination mode. When the `Secret` lives in a different
 namespace than the `Gateway`, the Secret namespace administrator must grant
 access:
 
@@ -163,17 +172,17 @@ spec:
       name: app-tls
 ```
 
-Omit `to[].name` to allow all Secrets in the target namespace, or keep it set
-to scope the grant to one certificate. Without a matching grant, the listener
+Omit `to[].name` to allow all Secrets in the target namespace, or keep it set to
+scope the grant to one certificate. Without a matching grant, the listener
 reports `ResolvedRefs: False` with reason `RefNotPermitted`.
 
 == Cross-namespace backend Services
 
-Routes (`HTTPRoute`, `TCPRoute` and `UDPRoute`) targeting a `Service` in
-another namespace follow the same rule: the Service namespace administrator
-creates a `ReferenceGrant` allowing that route kind from the route's namespace
-to reference `kind: Service` (`group: ""`). `BackendTLSPolicy` always lives in
-the target `Service`'s namespace and references either a same-namespace CA
+Routes (`HTTPRoute`, `TCPRoute` and `UDPRoute`) targeting a `Service` in another
+namespace follow the same rule: the Service namespace administrator creates a
+`ReferenceGrant` allowing that route kind from the route's namespace to
+reference `kind: Service` (`group: ""`). `BackendTLSPolicy` always lives in the
+target `Service`'s namespace and references either a same-namespace CA
 `ConfigMap` (`ca.crt`) or `wellKnownCACertificates: System`.
 
 = Certificate rotation <tls-rotation>
@@ -186,8 +195,7 @@ TLS rotation happens in place without restarting proxy pods:
 + The controller validates the PEM chain and private key match, recompiles the
   `GatewaySnapshot` with a new SHA-256 digest and patches
   `Secret/weiche-gw-<uid>`. If the replacement is malformed or mismatched, the
-  listener reports `InvalidCertificateRef` instead of pushing broken TLS
-  config.
+  listener reports `InvalidCertificateRef` instead of pushing broken TLS config.
 + Every proxy replica's Secret watcher decodes the new snapshot, rebuilds its
   TLS configuration, publishes it to all local workers and patches the new
   digest into `ConfigMap/weiche-gw-<uid>`. New TLS handshakes immediately

@@ -202,8 +202,6 @@ pub struct Settings {
     pub seccomp_profile: SeccompProfile,
     /// desired proxy Deployment replica count.
     pub replicas: i32,
-    /// compio worker thread count inside each proxy pod.
-    pub workers: std::num::NonZeroUsize,
 }
 
 impl Settings {
@@ -244,7 +242,6 @@ impl Settings {
         let reserved = [
             "POD_UID",
             "WEICHE_PROVISIONER_BINDING",
-            "WEICHE_WORKERS",
             "WEICHE_HTTP3",
             "WEICHE_HTTP3_PORT",
         ];

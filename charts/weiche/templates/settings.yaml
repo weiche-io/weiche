@@ -9,7 +9,6 @@
     "seccompProfile" .Values.proxy.seccompProfile
     "resources" .Values.proxy.resources
     "replicas" .Values.proxy.replicas
-    "workers" .Values.proxy.workers
     "bindAddress" .Values.proxy.bindAddress
     "hostNetwork" .Values.proxy.hostNetwork
     "dnsPolicy" .Values.proxy.dnsPolicy
