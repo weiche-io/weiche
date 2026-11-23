@@ -47,7 +47,7 @@ impl ContentLength {
     }
 
     /// require all declared bytes before accepting trailers or EOF.
-    pub fn finish(self) -> io::Result<()> {
+    pub fn finish(&self) -> io::Result<()> {
         if self.0.is_some_and(|left| left != 0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -19,9 +19,9 @@ pub enum RequestBody {
         /// incoming data and trailer frames.
         Incoming,
     ),
-    /// receive decoded HTTP/3 frames from the worker-local reader.
+    /// read HTTP/3 frames when the backend polls the request body.
     Http3(
-        /// bounded upload and its reader task.
+        /// downstream receive stream and its framing state.
         Upload,
     ),
 }
