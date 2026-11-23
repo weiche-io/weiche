@@ -6,19 +6,10 @@ use std::{collections::HashSet, net::IpAddr};
 use weiche_gtwapi::v1::httproutes::HttpRouteRulesMatchesPathType as PathType;
 use weiche_gtwapi::v1::{grpcroutes::*, httproutes::*};
 
-/// validate an explicit Gateway API precise hostname.
+/// the CRD's hostname pattern admits IP literals and DNS labels longer than 63 bytes.
 fn hostname(host: &str) -> Result<&str, ResolveError> {
-    let valid = host.len() <= 253
-        && host.parse::<IpAddr>().is_err()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        });
+    let valid =
+        host.parse::<IpAddr>().is_err() && host.split('.').all(|label| label.len() <= 63);
     valid.then_some(host).ok_or(ResolveError::UnsupportedValue)
 }
 
@@ -111,67 +102,6 @@ macro_rules! modifier {
     };
 }
 
-/// check the set bounds and wildcard combinations of Gateway API CORS lists.
-fn cors_list(
-    values: &[String],
-    limit: usize,
-    exclusive_wildcard: bool,
-) -> Result<(), ResolveError> {
-    if values.len() > limit
-        || values.iter().collect::<HashSet<_>>().len() != values.len()
-        || (exclusive_wildcard && values.len() > 1 && values.iter().any(|v| v == "*"))
-    {
-        return Err(ResolveError::UnsupportedValue);
-    }
-    Ok(())
-}
-
-/// validate both generated CORS schemas against the same origin, token and age rules.
-fn cors(
-    origins: &[String],
-    methods: &[String],
-    headers: &[String],
-    expose: &[String],
-    credentials: bool,
-    max_age: u32,
-) -> Result<Cors, ResolveError> {
-    let invalid = ResolveError::UnsupportedValue;
-    cors_list(origins, 64, true)?;
-    cors_list(methods, 9, true)?;
-    cors_list(headers, 64, true)?;
-    cors_list(expose, 64, false)?;
-    let verbs = [
-        "*", "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE",
-        "PATCH",
-    ];
-    if !(1..=i32::MAX as u32).contains(&max_age)
-        || !methods.iter().all(|m| verbs.contains(&m.as_str()))
-        || !headers
-            .iter()
-            .chain(expose)
-            .all(|h| h.len() <= 256 && h.parse::<HeaderName>().is_ok())
-    {
-        return Err(invalid);
-    }
-    let origins = origins
-        .iter()
-        .map(|o| {
-            if o.len() > 253 {
-                return Err(invalid);
-            }
-            Origin::parse(o).ok_or(invalid)
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Cors {
-        origins,
-        methods: methods.to_vec(),
-        headers: headers.to_vec(),
-        expose: expose.to_vec(),
-        credentials,
-        max_age,
-    })
-}
-
 /// compile identical filter semantics for both generated Gateway API shapes.
 macro_rules! filters {
     ($name:ident, $filter:ty, $kind:ident $(, $rule:ident: $scheme:ident, $redirect:ident, $rewrite_kind:ident, $rewrite:ident)?) => {
@@ -182,12 +112,8 @@ macro_rules! filters {
         ) -> Result<Filters, ResolveError> {
             use $kind as Kind;
             let invalid = ResolveError::UnsupportedValue;
-            let mut seen = HashSet::new();
             let mut result = Filters::default();
             for f in filters.unwrap_or_default() {
-                if !seen.insert(std::mem::discriminant(&f.r#type)) {
-                    return Err(ResolveError::IncompatibleFilters);
-                }
                 match f.r#type {
                     Kind::RequestHeaderModifier => result.headers.extend(changes!(
                         f.request_header_modifier.as_ref().ok_or(invalid)?
@@ -199,23 +125,31 @@ macro_rules! filters {
                     $(
                     Kind::Cors => {
                         let c = f.cors.as_ref().ok_or(invalid)?;
-                        result.cors = Some(cors(
-                            c.allow_origins.as_deref().unwrap_or_default(),
-                            c.allow_methods.as_deref().unwrap_or_default(),
-                            c.allow_headers.as_deref().unwrap_or_default(),
-                            c.expose_headers.as_deref().unwrap_or_default(),
-                            c.allow_credentials.unwrap_or(false),
-                            c.max_age.unwrap_or(5),
-                        )?);
+                        // admission checks the lists. workers need each origin's host and port.
+                        result.cors = Some(Cors {
+                            origins: c.allow_origins.iter().flatten()
+                                .map(|origin| Origin::parse(origin).ok_or(invalid))
+                                .collect::<Result<_, _>>()?,
+                            methods: c.allow_methods.clone().unwrap_or_default(),
+                            headers: c.allow_headers.clone().unwrap_or_default(),
+                            expose: c.expose_headers.clone().unwrap_or_default(),
+                            credentials: c.allow_credentials.unwrap_or(false),
+                            max_age: c.max_age.unwrap_or(5),
+                        });
                     }
                     Kind::RequestRedirect => {
                         let r = f.request_redirect.as_ref().ok_or(invalid)?;
-                        let code = r.status_code.unwrap_or(302);
-                        if !matches!(code, 301 | 302 | 303 | 307 | 308) || r.port == Some(0) {
-                            return Err(invalid);
-                        }
+                        // report unknown redirect codes as UnsupportedValue under Gateway API.
+                        let status = match r.status_code.unwrap_or(302) {
+                            301 => StatusCode::MOVED_PERMANENTLY,
+                            302 => StatusCode::FOUND,
+                            303 => StatusCode::SEE_OTHER,
+                            307 => StatusCode::TEMPORARY_REDIRECT,
+                            308 => StatusCode::PERMANENT_REDIRECT,
+                            _ => return Err(invalid),
+                        };
                         result.redirect = Some(Redirect {
-                            status: StatusCode::from_u16(code as u16).map_err(|_| invalid)?,
+                            status,
                             hostname: r.hostname.as_deref().map(hostname).transpose()?.map(str::to_owned),
                             scheme: r.scheme.as_ref().map(|s| {
                                 match s {
@@ -243,11 +177,6 @@ macro_rules! filters {
                     _ => return Err(invalid),
                 }
             }
-            $(if result.redirect.is_some()
-                && seen.contains(&std::mem::discriminant(&Kind::$rewrite_kind))
-            {
-                return Err(ResolveError::IncompatibleFilters);
-            })?
             Ok(result)
         }
     };

@@ -105,13 +105,11 @@ impl GatewayStores {
         let timeouts = timeouts(rule)?;
         let filters = filters::rule_filters(rule, rule.filters.as_deref())?;
         let references = rule.backend_refs.as_deref().unwrap_or_default();
-        if filters.redirect.is_some() && !references.is_empty() {
-            return Err(ResolveError::IncompatibleFilters);
-        }
         // validate the entire rule before recording any backend TLS policy status.
         let mut validated = Vec::with_capacity(references.len());
         for reference in references {
             let backend = filters::backend_filters(rule, reference.filters.as_deref())?;
+            // the CRD checks redirect/rewrite conflicts only within a single filter list.
             if backend.redirect.is_some()
                 && rule.filters.iter().flatten().any(|f| f.url_rewrite.is_some())
             {
@@ -203,21 +201,16 @@ fn duration(mut input: &str) -> Result<Duration, ResolveError> {
     Err(ResolveError::UnsupportedValue)
 }
 
-/// validate the request budget and preserve explicit zero durations.
+/// parse both request budgets, preserving explicit zero durations.
 fn timeouts(rule: &HttpRouteRules) -> Result<Timeouts, ResolveError> {
     let Some(t) = &rule.timeouts else { return Ok(Timeouts::default()) };
-    let request = t.request.as_deref().map(duration).transpose()?;
-    let backend_request = t.backend_request.as_deref().map(duration).transpose()?;
-    if let (Some(total), Some(attempt)) = (request, backend_request)
-        && !total.is_zero()
-        && attempt > total
-    {
-        return Err(ResolveError::UnsupportedValue);
-    }
-    Ok(Timeouts { request, backend_request })
+    Ok(Timeouts {
+        request: t.request.as_deref().map(duration).transpose()?,
+        backend_request: t.backend_request.as_deref().map(duration).transpose()?,
+    })
 }
 
-/// validate the same unanchored Rust regex that the worker will compile.
+/// reject a bad rule before its regex reaches workers installing the whole snapshot.
 fn regex(pattern: &str) -> Result<String, ResolveError> {
     regex::Regex::new(pattern).map_err(|_| ResolveError::UnsupportedValue)?;
     Ok(pattern.to_owned())
