@@ -7,6 +7,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      # no test.yml since it's expensive to test
+      # - '.github/workflows/test.yml'
   # warm branch caches on master so new pull requests reuse them.
   push:
     branches: [master]
@@ -18,8 +20,17 @@ concurrency:
   cancel-in-progress: true
 jobs:
   conformance:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    name: conformance${{ matrix.suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            suffix: ''
+          - runner: ubuntu-24.04-arm
+            suffix: -arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -48,13 +59,13 @@ jobs:
           context: .
           tags: localhost/weiche:spec
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=buildkit${{ matrix.suffix }}
+          cache-to: type=gha,scope=buildkit${{ matrix.suffix }},mode=max
       - if: github.event_name == 'pull_request'
         run: make IMAGE=localhost/weiche:spec conformance
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() && hashFiles('target/conformance/report.yaml') != '' }}
         with:
-          name: gateway-api-conformance
+          name: gateway-api-conformance${{ matrix.suffix }}
           path: target/conformance/report.yaml
           if-no-files-found: error

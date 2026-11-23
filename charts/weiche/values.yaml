@@ -41,7 +41,6 @@ controller:
 
 proxy:
   replicas: 1
-  workers: 1
   bindAddress: "::"
   hostNetwork: false
   # Empty defaults to ClusterFirstWithHostNet when hostNetwork is true.

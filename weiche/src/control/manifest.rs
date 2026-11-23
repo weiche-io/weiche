@@ -306,7 +306,6 @@ fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
         ..Default::default()
     };
     let mut env = vec![
-        literal("WEICHE_WORKERS", settings.workers.to_string()),
         literal("WEICHE_PROVISIONER_BINDING", binding.clone()),
         EnvVar {
             name: "POD_UID".into(),
@@ -350,6 +349,7 @@ pub fn requested_addresses(
 ) -> anyhow::Result<Vec<IpAddr>> {
     let mut ips = Vec::new();
     for addr in gateway.spec.addresses.iter().flatten() {
+        // the Service fields used for static addresses can only carry IP literals.
         ensure!(
             addr.r#type.as_deref().unwrap_or("IPAddress") == "IPAddress",
             "only IPAddress gateway addresses are supported"
@@ -362,21 +362,23 @@ pub fn requested_addresses(
         let ip: IpAddr = raw
             .parse()
             .with_context(|| format!("invalid gateway IP address: {raw}"))?;
-        ensure!(!ips.contains(&ip), "duplicate gateway IP address: {ip}");
         ips.push(ip);
     }
     let configured = &service.ip_families;
     if service.r#type == ServiceType::LoadBalancer {
+        // loadBalancerIP carries one address, so report any extra request on the Gateway.
         ensure!(
             ips.len() <= 1,
             "LoadBalancer Service supports at most one requested IP address"
         );
+        // report an external IP outside the configured families as AddressNotAssigned.
         ensure!(
             configured.is_empty()
                 || ips.first().is_none_or(|ip| configured.contains(&ip_family(*ip))),
             "requested IP family does not match service ipFamilies"
         );
     } else {
+        // clusterIPs can hold one address per family, subject to the Service's stack policy.
         let compatible = match ips.as_slice() {
             [] | [_] => true,
             [a, b] => {
@@ -389,10 +391,12 @@ pub fn requested_addresses(
             compatible,
             "requested gateway addresses are incompatible with Service IP families"
         );
-        let families = ips.iter().copied().map(ip_family);
+        // explicit positions must agree so Kubernetes can infer the rest from clusterIPs.
         ensure!(
-            configured.is_empty()
-                || configured.iter().copied().take(ips.len()).eq(families),
+            configured
+                .iter()
+                .zip(&ips)
+                .all(|(&family, &ip)| family == ip_family(ip)),
             "requested IP families do not match configured service ipFamilies"
         );
     }

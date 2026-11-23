@@ -202,8 +202,6 @@ pub struct Settings {
     pub seccomp_profile: SeccompProfile,
     /// desired proxy Deployment replica count.
     pub replicas: i32,
-    /// compio worker thread count inside each proxy pod.
-    pub workers: std::num::NonZeroUsize,
 }
 
 impl Settings {
@@ -213,29 +211,31 @@ impl Settings {
             serde_json::from_reader(std::fs::File::open("/etc/weiche/proxy.json")?)?;
         let installation = &settings.installation;
         let service = &installation.service;
+        // a broken platform setting would affect every gateway managed by this controller.
         ensure!(
             !installation.release.is_empty()
                 && !installation.controller_name.is_empty()
                 && !installation.lease_name.is_empty()
                 && !installation.provisioner_binding.is_empty()
                 && !settings.namespaces.is_empty()
-                && settings.replicas > 0
-                && installation.termination_grace_period_seconds > 0
+                && settings.replicas >= 0
+                && installation.termination_grace_period_seconds >= 0
                 && !settings.image.is_empty(),
             "invalid proxy installation settings"
         );
         let families = service.ip_families.as_slice();
+        // a Service can request each family once, in primary-first order.
         ensure!(
             families.len() <= 1 || matches!(families, [a, b] if a != b),
             "invalid gateway service ipFamilies"
         );
+        // dual-stack Services can leave the secondary family to Kubernetes.
         ensure!(
-            !matches!(
-                (service.ip_family_policy, families.len()),
-                (IpFamilyPolicy::SingleStack, 2) | (IpFamilyPolicy::RequireDualStack, 1)
-            ),
+            service.ip_family_policy != IpFamilyPolicy::SingleStack
+                || families.len() <= 1,
             "gateway service ipFamilies conflicts with ipFamilyPolicy"
         );
+        // the provisioned ClusterIP Service has no externally facing address for this policy.
         ensure!(
             service.external_traffic_policy.is_none()
                 || service.r#type != ServiceType::ClusterIP,
@@ -244,10 +244,10 @@ impl Settings {
         let reserved = [
             "POD_UID",
             "WEICHE_PROVISIONER_BINDING",
-            "WEICHE_WORKERS",
             "WEICHE_HTTP3",
             "WEICHE_HTTP3_PORT",
         ];
+        // extraEnv is appended last and could replace the pod identity or listener settings.
         ensure!(
             !installation
                 .extra_env

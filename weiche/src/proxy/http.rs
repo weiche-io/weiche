@@ -50,8 +50,6 @@ impl WorkerView {
         previous: Option<&WorkerView>,
     ) -> anyhow::Result<(Self, HashSet<EndpointKey>)> {
         let gateway = &snapshot.gateway;
-        let deadline = gateway.forwarding.response_header_timeout;
-        anyhow::ensure!(!deadline.is_zero(), "response header timeout must be positive");
         let mut clusters = HashMap::new();
         let mut endpoints = HashSet::new();
         let mut resolve = |spec: &Arc<ClusterSpec>| {
@@ -87,7 +85,7 @@ impl WorkerView {
         }
         let view = Self {
             revision: snapshot.revision,
-            deadline,
+            deadline: gateway.forwarding.response_header_timeout,
             routes,
             clusters,
         };

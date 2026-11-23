@@ -64,10 +64,6 @@ impl Desired {
         tx: &mut config::Writer,
         http3: bool,
     ) -> anyhow::Result<Self> {
-        ensure!(
-            secret.type_.as_deref() == Some("weiche.io/snapshot"),
-            "unexpected snapshot Secret type"
-        );
         let bytes = &secret
             .data
             .as_ref()
@@ -139,6 +135,7 @@ pub async fn run(
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_PROVISIONER_BINDING.to_owned());
     let bindings = Api::<RoleBinding>::namespaced(client.clone(), ns);
+    // a pod may start after the platform has withdrawn permission to serve this namespace.
     ensure!(
         authorized(&bindings, &binding_name).await?,
         "gateway namespace authorization withdrawn"

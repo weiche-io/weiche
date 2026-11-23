@@ -1,31 +1,63 @@
 //! configure the workers and publish immutable gateway snapshots.
 use super::super::ir::{GatewaySnapshot, PublishedSnapshot, Revision};
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use std::{
     env::{self, VarError},
-    num::NonZeroUsize,
+    num::{NonZeroU16, NonZeroUsize},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::watch;
 
+/// requested payload capacity in bytes for each direction of a listener socket.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SocketBuffers {
+    pub recv: Option<usize>,
+    pub send: Option<usize>,
+}
+
+/// listener queue and stream settings for TCP.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpConfig {
+    pub backlog: i32,
+    pub nodelay: bool,
+    pub buffers: SocketBuffers,
+    pub connect_timeout: Duration,
+}
+
+/// downstream UDP socket sizing and per-peer flow lifetime.
+#[derive(Clone, Debug)]
+pub struct UdpConfig {
+    pub buffers: SocketBuffers,
+    pub idle_timeout: Duration,
+}
+
+/// downstream HTTP/3 advertisement and QUIC transport settings.
+#[derive(Clone, Debug)]
+pub struct QuicConfig {
+    /// serve downstream HTTP/3 alongside terminating HTTPS listeners.
+    pub enabled: bool,
+    /// externally reachable UDP port when different from the listener port.
+    pub advertised_port: Option<NonZeroU16>,
+    pub buffers: SocketBuffers,
+    pub max_concurrent_bidi_streams: u32,
+    pub idle_timeout: Duration,
+}
+
 /// process-wide limits and downstream listener policy.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    /// serve downstream HTTP/3 alongside terminating HTTPS listeners.
-    pub http3: bool,
-    /// externally reachable UDP port when different from the listener port.
-    pub http3_advertised_port: Option<u16>,
+    pub tcp: TcpConfig,
+    pub udp: UdpConfig,
+    pub quic: QuicConfig,
     /// number of worker runtimes sharing the listener sockets.
     pub workers: NonZeroUsize,
     /// maximum downstream connections and flows across workers.
     pub downstream_connections_global: NonZeroUsize,
     /// maximum backend connections on each worker.
     pub upstream_connections_per_worker: NonZeroUsize,
-    /// deadline for opening a raw TCP backend connection.
-    pub tcp_connect_timeout: Duration,
-    /// idle timeout for pooled backends, UDP flows and QUIC connections.
+    /// idle timeout for pooled HTTP backends.
     pub upstream_idle_timeout: Duration,
     /// maximum time a downstream socket may occupy a permit before TLS completes.
     pub tls_handshake_timeout: Duration,
@@ -39,7 +71,7 @@ pub struct RuntimeConfig {
     pub http_max_headers: usize,
     /// maximum HTTP/1 buffer and multiplexed HTTP field section size.
     pub http_max_buffer: usize,
-    /// maximum concurrent HTTP/2 streams and QUIC bidirectional streams.
+    /// maximum concurrent HTTP/2 streams.
     pub http2_max_concurrent_streams: u32,
 }
 
@@ -47,12 +79,33 @@ impl RuntimeConfig {
     /// use the default connection limits and disable downstream HTTP/3.
     pub fn new(workers: NonZeroUsize) -> Self {
         Self {
-            http3: false,
-            http3_advertised_port: None,
+            tcp: TcpConfig {
+                backlog: 1024,
+                nodelay: true,
+                // leave both buffers unlocked for linux TCP auto-tuning.
+                buffers: SocketBuffers::default(),
+                connect_timeout: Duration::from_secs(10),
+            },
+            udp: UdpConfig {
+                buffers: SocketBuffers {
+                    recv: Some(2 * 1024 * 1024),
+                    send: Some(2 * 1024 * 1024),
+                },
+                idle_timeout: Duration::from_secs(30),
+            },
+            quic: QuicConfig {
+                enabled: false,
+                advertised_port: None,
+                buffers: SocketBuffers {
+                    recv: Some(4 * 1024 * 1024),
+                    send: Some(4 * 1024 * 1024),
+                },
+                max_concurrent_bidi_streams: 128,
+                idle_timeout: Duration::from_secs(30),
+            },
             workers,
             downstream_connections_global: NonZeroUsize::new(1024).unwrap(),
             upstream_connections_per_worker: NonZeroUsize::new(1024).unwrap(),
-            tcp_connect_timeout: Duration::from_secs(10),
             upstream_idle_timeout: Duration::from_secs(30),
             tls_handshake_timeout: Duration::from_secs(10),
             connection_drain_timeout: Duration::from_secs(5),
@@ -64,7 +117,7 @@ impl RuntimeConfig {
         }
     }
 
-    /// load and validate process policy from the proxy environment.
+    /// load process policy from the proxy environment.
     pub fn from_env() -> anyhow::Result<Self> {
         let workers =
             setting("WEICHE_WORKERS", "WEICHE_WORKERS must be a positive integer")?;
@@ -73,40 +126,14 @@ impl RuntimeConfig {
             Some(count) => count,
             None => std::thread::available_parallelism()?,
         });
-        config.http3 = match env::var("WEICHE_HTTP3").as_deref() {
+        config.quic.enabled = match env::var("WEICHE_HTTP3").as_deref() {
             Ok("true" | "1") => true,
             Ok("false" | "0") | Err(VarError::NotPresent) => false,
             _ => anyhow::bail!("WEICHE_HTTP3 must be true, 1, false or 0"),
         };
-        config.http3_advertised_port =
+        config.quic.advertised_port =
             setting("WEICHE_HTTP3_PORT", "invalid WEICHE_HTTP3_PORT")?;
-        config.validate()?;
         Ok(config)
-    }
-
-    /// check parser, listener and drain limits before starting the workers.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.http3_advertised_port != Some(0),
-            "WEICHE_HTTP3_PORT must be positive"
-        );
-        ensure!(
-            self.http_max_headers > 0
-                && (8192..=u32::MAX as usize).contains(&self.http_max_buffer)
-                && self.http2_max_concurrent_streams > 0,
-            "invalid HTTP parser limits"
-        );
-        for (timeout, message) in [
-            (self.listener_retry_interval, "listener retry interval must be positive"),
-            (self.tcp_connect_timeout, "tcp connect timeout must be positive"),
-        ] {
-            ensure!(!timeout.is_zero(), message);
-        }
-        ensure!(
-            self.worker_drain_timeout >= self.connection_drain_timeout,
-            "worker drain must allow connection drain to finish"
-        );
-        Ok(())
     }
 }
 

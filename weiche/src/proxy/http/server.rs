@@ -60,7 +60,7 @@ impl Worker {
         address: SocketAddr,
         listener: &Listener,
     ) -> io::Result<(HttpListener, Task)> {
-        let socket = tcp::listen(address)?;
+        let socket = tcp::listen(address, &self.runtime.tcp, self.id)?;
         let binding = Rc::new(listener.binding());
         let (certs, mut rx) = watch::channel(Rc::from(listener.tls.as_slice()));
         let http = HttpListener { binding: binding.clone(), certs };
@@ -105,6 +105,10 @@ impl Worker {
         mut shutdown: watch::Receiver<bool>,
     ) {
         if *shutdown.borrow() || shutdown.has_changed().unwrap_or(true) {
+            return;
+        }
+        if let Err(error) = stream.set_nodelay(self.runtime.tcp.nodelay) {
+            tracing::warn!(%peer, %error, "failed to set tcp nodelay");
             return;
         }
         let (stream, h2) = if listener.tls {

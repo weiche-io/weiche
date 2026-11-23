@@ -1,6 +1,8 @@
 //! maintain one QUIC endpoint per terminating HTTPS socket on each worker.
+//! compio drives UDP I/O, packet dispatch and per-connection timers for quinn-proto.
 use super::super::{
     super::ir::{Binding, ServerTls, hostname_matches},
+    admission::Permit,
     http::ProxyService,
     stopped,
     worker::{HttpListener, Task, Worker},
@@ -8,10 +10,13 @@ use super::super::{
 use super::{cid, group, h3};
 use compio::{
     quic::{
-        Endpoint, EndpointConfig, ServerConfig, TransportConfig,
+        Endpoint, EndpointConfig, Incoming, ServerConfig, TransportConfig,
         crypto::rustls::QuicServerConfig,
     },
-    runtime::{self, time::timeout_at},
+    runtime::{
+        self,
+        time::{timeout, timeout_at},
+    },
     tls::rustls::{
         self,
         server::{ClientHello, ResolvesServerCert},
@@ -85,8 +90,9 @@ impl Listener {
         address: SocketAddr,
         http: &HttpListener,
     ) -> io::Result<(Self, Task)> {
-        let runtime = &worker.runtime;
-        let (socket, reader) = worker.datagram(address, true)?;
+        let quic = &worker.runtime.quic;
+        let (socket, reader) =
+            worker.group.bind_quic(address, worker.id, quic.buffers)?;
         let certificates = Arc::new(Certificates::default());
         let binding = http.binding.clone();
         certificates.update(&http.certs.borrow());
@@ -100,9 +106,9 @@ impl Listener {
         let mut config = ServerConfig::with_crypto(Arc::new(crypto));
         let mut transport = TransportConfig::default();
         transport
-            .max_concurrent_bidi_streams(runtime.http2_max_concurrent_streams.into())
+            .max_concurrent_bidi_streams(quic.max_concurrent_bidi_streams.into())
             .max_idle_timeout(Some(
-                runtime.upstream_idle_timeout.try_into().map_err(io::Error::other)?,
+                quic.idle_timeout.try_into().map_err(io::Error::other)?,
             ))
             .datagram_receive_buffer_size(None);
         config.transport_config(Arc::new(transport));
@@ -116,7 +122,7 @@ impl Listener {
         let service = worker.server.service.clone();
         service.set_http3(
             &binding,
-            Some(runtime.http3_advertised_port.unwrap_or(binding.port)),
+            Some(quic.advertised_port.map_or(binding.port, |port| port.get())),
         );
         let task = serve(endpoint, worker.clone(), binding.clone(), shutdown, reader);
         Ok((Self { binding, service, certificates, _stop: stop }, task.boxed_local()))
@@ -142,8 +148,7 @@ async fn serve(
             incoming = endpoint.wait_incoming() => {
                 let Some(incoming) = incoming else { break };
                 if let Some(permit) = worker.admission.acquire() {
-                    connections.push(h3::serve(incoming, &worker.server.service, &binding,
-                        &worker.runtime, permit, shutdown.clone()));
+                    connections.push(connection(incoming, &worker, &binding, permit, shutdown.clone()));
                 } else {
                     incoming.refuse();
                 }
@@ -169,4 +174,32 @@ async fn serve(
             Ok(())
         }
     }
+}
+
+/// hold admission through QUIC negotiation, HTTP/3 setup and the session's drain.
+async fn connection(
+    incoming: Incoming,
+    worker: &Worker,
+    binding: &Binding,
+    _permit: Permit,
+    shutdown: watch::Receiver<bool>,
+) {
+    let config = &worker.runtime;
+    let mut stopping = std::pin::pin!(stopped(shutdown));
+    let handshake = async {
+        let transport = incoming.await?;
+        Ok::<_, anyhow::Error>(h3::Session::new(transport, config.http_max_buffer).await?)
+    };
+    let session = tokio::select! {
+        biased;
+        _ = &mut stopping => return,
+        result = timeout(config.tls_handshake_timeout, handshake) => match result {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => { tracing::debug!(%error, "quic handshake failed"); return; }
+            Err(_) => { tracing::debug!("quic handshake timed out"); return; }
+        }
+    };
+    session
+        .serve(&worker.server.service, binding, stopping, config.connection_drain_timeout)
+        .await;
 }
