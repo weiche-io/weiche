@@ -51,7 +51,7 @@ endif
 	export KUBECONFIG="$$run/kubeconfig"
 	trap '"$(KIND)" delete cluster --name "$$cluster"; rm -rf "$$run"' EXIT
 	$(call log,KIND,$$cluster)
-	"$(KIND)" create cluster --name "$$cluster" --image $(NODE_IMAGE) --wait 2m
+	"$(KIND)" create cluster --name "$$cluster" --image $(NODE_IMAGE) --config test/kind.yaml --wait 2m
 	"$(KIND)" load docker-image --name "$$cluster" "$$image"
 	$(call log,APPLY,Gateway API CRDs)
 	kubectl apply --server-side -f weiche-gtwapi/manifests/standard-install.yaml
