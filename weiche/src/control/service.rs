@@ -136,18 +136,16 @@ impl Plan {
             && self.listeners.iter().any(|l| l.accepted)
     }
 
-    /// expose each accepted port once across virtual hosts sharing a transport.
+    /// reserve supported listener ports even while a certificate or route is pending.
     pub fn ports(&self, http3: bool) -> Vec<(Transport, u16)> {
         let mut ports = BTreeSet::new();
-        for (listener, result) in self
-            .gateway
-            .spec
-            .listeners
-            .iter()
-            .zip(&self.listeners)
-            .filter(|(_, result)| result.accepted)
-        {
-            ports.insert((result.transport, listener.port));
+        for listener in &self.gateway.spec.listeners {
+            let transport = match listener.protocol.as_str() {
+                "UDP" => Transport::Udp,
+                "TCP" | "HTTP" | "HTTPS" | "TLS" => Transport::Tcp,
+                _ => continue,
+            };
+            ports.insert((transport, listener.port));
             if http3 && listener.protocol == "HTTPS" {
                 ports.insert((Transport::Udp, listener.port));
             }

@@ -36,8 +36,8 @@ data-plane proxies or Gateway Services.
   [Release namespace + each `gatewayNamespaces` entry],
 
   [Controller leader],
-  [`weiche-gw-<uid>` `Secret`, `ConfigMap`, `ServiceAccount`, `Role`,
-    `RoleBinding`, `Deployment`, `Service`],
+  [`Deployment/<gateway-name>` and `weiche-gw-<uid>` `Secret`, `ConfigMap`,
+    `ServiceAccount`, `Role`, `RoleBinding`, `Service`],
   [Each accepted `Gateway`'s namespace],
 
   [Target namespace admin],
@@ -102,8 +102,14 @@ Controller replicas coordinate through a `coordination.k8s.io/v1` `Lease` named
 `weiche-controller` in the release namespace (15s duration, 8s grace). The
 active leader compiles each accepted `Gateway` into a deterministic,
 zlib-compressed MessagePack snapshot (`routes.v1`) and reconciles seven
-Gateway-owned resources named `weiche-gw-<gateway-uid>` in the Gateway's
-namespace:
+resources in the Gateway's namespace. The proxy Deployment has the Gateway's
+name. Its Service, snapshot and access-control resources use
+`weiche-gw-<gateway-uid>`. An authorized Gateway with a supported listener
+receives its proxy and Service before its first Route attaches. Removing the
+last Route leaves the Deployment and assigned address in place. A proxy can
+acknowledge an empty snapshot once its workers have closed all listeners.
+The Pod is then ready for configuration updates. The Gateway reports
+`Programmed: False` until it has a configured listener and an assigned address.
 
 - `Secret` (`type: weiche.io/snapshot`): carries `routes.v1` with validated
   routes and authorized TLS material. Snapshots are capped at 1 MiB compressed
@@ -115,18 +121,19 @@ namespace:
 - `ServiceAccount`, `Role` and `RoleBinding`: restricts each proxy strictly to
   `get`/`list`/`watch` on its own named `Secret`, `patch` on its own named
   `ConfigMap`, and `get` on `RoleBinding/weiche-gateway-provisioner`.
-- `Deployment`: runs `weiche proxy weiche-gw-<uid>` (`proxy.replicas: 1` by
+- `Deployment`: uses the pod template rendered by Helm and runs
+  `weiche proxy weiche-gw-<uid>` (`proxy.replicas: 1` by
   default) as non-root UID `65532` with all capabilities dropped,
   `net.ipv4.ip_unprivileged_port_start=0` to bind ports such as 80 and 443 (or
   `NET_BIND_SERVICE` with `ClusterFirstWithHostNet` when
   `proxy.hostNetwork: true`), `proxy.seccompProfile: Unconfined` by default for
   `io_uring`, an in-memory `emptyDir` at `/run/weiche` and an exec readiness
-  probe (`weiche ready`) every 2 seconds.
+  probe (`weiche ready`) every second.
 - `Service`: `ClusterIP`, `LoadBalancer` or `NodePort` configured by
   `proxy.service.*` (`ipFamilyPolicy`, `ipFamilies`, `externalTrafficPolicy` and
   default annotations), selecting pods by `weiche.io/gateway-uid: <uid>` and
   exposing deduplicated listener ports (including matching `UDP` ports for
-  accepted `HTTPS` listeners when `proxy.http3.enabled: true`). Static IPv4/IPv6
+  `HTTPS` listeners when `proxy.http3.enabled: true`). Static IPv4/IPv6
   requests in `Gateway.spec.addresses` map to `clusterIP`/`clusterIPs` or
   `loadBalancerIP`, and `Gateway.spec.infrastructure` labels and annotations
   propagate to provisioned resources while preserving controller selector and
@@ -239,13 +246,13 @@ SHA-256 fingerprint, matching the new `tls.crt` stored in the `Secret`.
 
 = Lifecycle and cleanup <lifecycle>
 
-- *Deleting a `Gateway`*: every `weiche-gw-<uid>` resource carries a controller
+- *Deleting a `Gateway`*: each provisioned resource carries a controller
   `ownerReference` to its `Gateway`, so Kubernetes garbage collection removes
   the proxy `Deployment`, `Service`, snapshot `Secret`, acknowledgement
   `ConfigMap` and per-Gateway RBAC automatically.
 - *Withdrawing `GatewayClass/weiche`*: if the `GatewayClass` is removed while a
   `Gateway` still exists, the active controller leader actively deletes the
-  Gateway's seven `weiche-gw-<uid>` resources using `uid` and `resourceVersion`
+  Gateway's seven resources using `uid` and `resourceVersion`
   preconditions.
 - *Retiring a namespace or uninstalling Helm*: delete `Gateway` objects in the
   affected namespaces *before* removing those namespaces from

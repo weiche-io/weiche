@@ -53,18 +53,18 @@ impl Applied {
         target: &Target<'_>,
         manifest: K,
     ) -> anyhow::Result<()> {
+        let name = manifest.name_any();
         let kind = ApiResource::erase::<K>(&());
         let mut fields = serde_json::to_value(manifest)?;
         fields["apiVersion"] = json!(kind.api_version);
         fields["kind"] = json!(kind.kind);
-        let key =
-            (target.namespace.to_owned(), target.name.to_owned(), kind.kind.clone());
+        let key = (target.namespace.to_owned(), name.clone(), kind.kind.clone());
         let digest = wire::version(&serde_json::to_vec(&fields)?);
         if self.0.get(&key).is_some_and(|(old, _)| old == &digest) {
             return Ok(());
         }
         let ns = target.namespace;
-        let name = target.name;
+        let name = name.as_str();
         let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, &kind);
         if let Some(old) = api.get_opt(name).await? {
             // a forced apply would otherwise take over an unrelated object with the same name.
@@ -75,9 +75,28 @@ impl Applied {
             );
             // pin the checked object across replacement while allowing other field managers
             // to update their own fields, including the proxy's ConfigMap acknowledgements.
-            fields["metadata"]["uid"] = json!(old.uid().context("missing workload uid")?);
-            api.patch(name, &PatchParams::apply("weiche").force(), &Patch::Apply(fields))
-                .await?;
+            let uid = old.uid().context("missing workload uid")?;
+            fields["metadata"]["uid"] = json!(uid);
+            let params = PatchParams::apply("weiche");
+            // replace the chart's pod template and the listener ports as units.
+            // SSA manages the remaining fields, including shared resource metadata.
+            let exact = match kind.kind.as_str() {
+                "Deployment" => Some("template"),
+                "Service" => Some("ports"),
+                _ => None,
+            };
+            if let Some(key) = exact {
+                let value = fields["spec"].as_object_mut().and_then(|s| s.remove(key));
+                let mut patch = json!({"metadata":{"uid":uid}, "spec":{(key):value}});
+                let patch = if key == "template" {
+                    patch["spec"][key]["$patch"] = json!("replace");
+                    Patch::Strategic(patch)
+                } else {
+                    Patch::Merge(patch)
+                };
+                api.patch(name, &params, &patch).await?;
+            }
+            api.patch(name, &params.force(), &Patch::Apply(fields)).await?;
         } else {
             let params = PostParams {
                 field_manager: Some("weiche".into()),
@@ -132,7 +151,6 @@ pub async fn reconcile(
     let active = payload.is_some();
     let (payload, listener_revision) = match payload {
         Some(payload) => (payload, snapshot.listener_version()?),
-        None if existing_service.is_none() && existing_report.is_none() => return Ok(()),
         // withdraw routes and private keys when a provisioned gateway cannot serve.
         None => {
             let empty = GatewaySnapshot::default();
@@ -152,17 +170,16 @@ pub async fn reconcile(
     macro_rules! apply {
         ($($resource:expr),+ $(,)?) => { $(applied.ensure(client, &target, $resource).await?;)+ };
     }
-    let replicas = if active { settings.replicas } else { 0 };
     apply!(
         target.owned::<ConfigMap>(),
         target.snapshot(payload),
         target.owned::<ServiceAccount>(),
         target.role(&options.provisioner_binding),
         target.role_binding(),
-        target.deployment(settings, replicas),
+        target.deployment(settings),
     );
     let Some(ips) = requested_ips else { return Ok(()) };
-    let ports = plan.ports(options.http3.enabled);
+    let ports = plan.ports(options.http3);
     if !ports.is_empty() {
         apply!(target.service(ports, &options.service, &ips));
     }
@@ -313,9 +330,17 @@ pub async fn retired(
             continue;
         }
         applied.forget(&ns, &name);
+        applied.forget(&ns, &owner.name);
+        remove(
+            client,
+            ApiResource::erase::<Deployment>(&()),
+            &ns,
+            &owner.name,
+            &owner.uid,
+        )
+        .await?;
         for kind in [
             ApiResource::erase::<Secret>(&()),
-            ApiResource::erase::<Deployment>(&()),
             ApiResource::erase::<Service>(&()),
             ApiResource::erase::<RoleBinding>(&()),
             ApiResource::erase::<Role>(&()),
