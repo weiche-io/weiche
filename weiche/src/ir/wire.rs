@@ -14,10 +14,12 @@ impl GatewaySnapshot {
     /// encode deterministically so independent controller replicas agree on the version.
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         let data = rmp_serde::to_vec_named(self)?;
+        // fail before publication so the controller withdraws routes workers cannot decode.
         ensure!(data.len() <= MAX_DECODED, "snapshot exceeds decoded size limit");
         let mut writer = ZlibEncoder::new(Vec::new(), Compression::fast());
         writer.write_all(&data)?;
         let payload = writer.finish()?;
+        // a rejected Secret write would leave the previous routes serving.
         ensure!(
             payload.len() <= 1024 * 1024,
             "snapshot exceeds Kubernetes Secret size limit"
@@ -28,6 +30,7 @@ impl GatewaySnapshot {
     /// validate the wire representation and reconstruct the worker-local TLS settings.
     pub fn decode(payload: &[u8]) -> anyhow::Result<Self> {
         let mut data = Vec::new();
+        // read one extra byte to distinguish an exact fit from an oversized expansion.
         ZlibDecoder::new(payload)
             .take(MAX_DECODED as u64 + 1)
             .read_to_end(&mut data)?;

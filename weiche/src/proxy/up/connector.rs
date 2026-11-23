@@ -66,6 +66,7 @@ async fn open(endpoint: &EndpointKey, tcp: &TcpConfig) -> anyhow::Result<Io> {
     let name = ServerName::try_from(tls.hostname.clone())
         .context("invalid backend TLS hostname")?;
     let stream = TlsIo::connect(stream, name, tls.config()).await?;
+    // the HTTP/2 client sends its preface immediately and requires h2 on TLS connections.
     ensure!(
         endpoint.protocol != Protocol::Http2 || stream.negotiated_alpn() == Some(b"h2"),
         "backend did not negotiate h2"

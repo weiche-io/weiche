@@ -1,9 +1,9 @@
 //! configure the workers and publish immutable gateway snapshots.
 use super::super::ir::{GatewaySnapshot, PublishedSnapshot, Revision};
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use std::{
     env::{self, VarError},
-    num::NonZeroUsize,
+    num::{NonZeroU16, NonZeroUsize},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -39,7 +39,7 @@ pub struct QuicConfig {
     /// serve downstream HTTP/3 alongside terminating HTTPS listeners.
     pub enabled: bool,
     /// externally reachable UDP port when different from the listener port.
-    pub advertised_port: Option<u16>,
+    pub advertised_port: Option<NonZeroU16>,
     pub buffers: SocketBuffers,
     pub max_concurrent_bidi_streams: u32,
     pub idle_timeout: Duration,
@@ -117,7 +117,7 @@ impl RuntimeConfig {
         }
     }
 
-    /// load and validate process policy from the proxy environment.
+    /// load process policy from the proxy environment.
     pub fn from_env() -> anyhow::Result<Self> {
         let workers =
             setting("WEICHE_WORKERS", "WEICHE_WORKERS must be a positive integer")?;
@@ -133,56 +133,7 @@ impl RuntimeConfig {
         };
         config.quic.advertised_port =
             setting("WEICHE_HTTP3_PORT", "invalid WEICHE_HTTP3_PORT")?;
-        config.validate()?;
         Ok(config)
-    }
-
-    /// check parser, listener and drain limits before starting the workers.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.quic.advertised_port != Some(0),
-            "WEICHE_HTTP3_PORT must be positive"
-        );
-        ensure!(self.tcp.backlog > 0, "tcp backlog must be positive");
-        ensure!(
-            self.quic.max_concurrent_bidi_streams > 0,
-            "quic stream limit must be positive"
-        );
-        ensure!(
-            self.quic.idle_timeout.as_millis() > 0
-                && compio::quic::IdleTimeout::try_from(self.quic.idle_timeout).is_ok(),
-            "quic idle timeout must fit a positive QUIC millisecond interval"
-        );
-        for (protocol, buffers) in [
-            ("tcp", self.tcp.buffers),
-            ("udp", self.udp.buffers),
-            ("quic", self.quic.buffers),
-        ] {
-            for (direction, size) in [("receive", buffers.recv), ("send", buffers.send)] {
-                ensure!(
-                    size.is_none_or(|n| (1..=i32::MAX as usize).contains(&n)),
-                    "{protocol} {direction} buffer size must fit a positive socket option"
-                );
-            }
-        }
-        ensure!(
-            self.http_max_headers > 0
-                && (8192..=u32::MAX as usize).contains(&self.http_max_buffer)
-                && self.http2_max_concurrent_streams > 0,
-            "invalid HTTP parser limits"
-        );
-        for (timeout, message) in [
-            (self.listener_retry_interval, "listener retry interval must be positive"),
-            (self.tcp.connect_timeout, "tcp connect timeout must be positive"),
-            (self.udp.idle_timeout, "udp idle timeout must be positive"),
-        ] {
-            ensure!(!timeout.is_zero(), message);
-        }
-        ensure!(
-            self.worker_drain_timeout >= self.connection_drain_timeout,
-            "worker drain must allow connection drain to finish"
-        );
-        Ok(())
     }
 }
 

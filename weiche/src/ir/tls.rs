@@ -167,6 +167,7 @@ impl BackendTls {
         for cert in certs {
             roots.add(cert.clone().into_owned())?;
         }
+        // an empty trust store would accept the policy but fail every backend handshake.
         ensure!(!roots.is_empty(), "CA bundle is empty");
         let mut config = ClientConfig::builder()
             .with_root_certificates(roots)

@@ -124,7 +124,6 @@ impl Drop for Threads {
 
 /// start the watch on Tokio, run worker zero locally and join the other compio workers.
 pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
-    policy.validate()?;
     let policy = Arc::new(policy);
     let (writer, reader) = config::channel(GatewaySnapshot::default());
     let (listeners, state) = ListenerGroup::new(policy.workers.get());

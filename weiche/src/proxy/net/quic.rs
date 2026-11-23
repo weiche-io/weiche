@@ -120,7 +120,10 @@ impl Listener {
         let endpoint = Endpoint::new(socket, endpoint, Some(config), None)?;
         let (stop, shutdown) = watch::channel(false);
         let service = worker.server.service.clone();
-        service.set_http3(&binding, Some(quic.advertised_port.unwrap_or(binding.port)));
+        service.set_http3(
+            &binding,
+            Some(quic.advertised_port.map_or(binding.port, |port| port.get())),
+        );
         let task = serve(endpoint, worker.clone(), binding.clone(), shutdown, reader);
         Ok((Self { binding, service, certificates, _stop: stop }, task.boxed_local()))
     }

@@ -222,6 +222,7 @@ impl ConnectionPool {
 
     /// subscribe to capacity changes while the endpoint is still usable.
     pub fn watch_capacity(&self, endpoint: &Endpoint) -> anyhow::Result<Notified<'_>> {
+        // retirement may have already woken the waiters for this endpoint.
         anyhow::ensure!(
             !self.closed.get() && endpoint.enabled.get(),
             "backend was removed or pool closed"
@@ -253,6 +254,7 @@ impl ConnectionPool {
             result = handshake => result?,
             _ = endpoint.closed.notified() => anyhow::bail!("backend was removed while connecting"),
         };
+        // the handshake and retirement can both be ready when select polls them.
         anyhow::ensure!(
             endpoint.enabled.get() && !self.closed.get(),
             "backend was removed while connecting"

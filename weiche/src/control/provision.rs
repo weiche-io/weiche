@@ -67,6 +67,7 @@ impl Applied {
         let name = target.name;
         let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, &kind);
         if let Some(old) = api.get_opt(name).await? {
+            // a forced apply would otherwise take over an unrelated object with the same name.
             ensure!(
                 controlled_by(&old, &target.owner.uid),
                 "{} {ns}/{name} has another owner",

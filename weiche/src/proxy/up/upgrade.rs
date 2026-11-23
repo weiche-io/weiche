@@ -66,7 +66,7 @@ impl Upgrade {
         restore(headers, &self.protocols);
     }
 
-    /// check that every protocol selected by the backend was actually offered.
+    /// the 101 response may switch only to protocols offered by the downstream client.
     pub fn accept(
         self,
         response: &mut Response<Incoming>,
