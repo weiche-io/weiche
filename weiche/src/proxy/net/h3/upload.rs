@@ -57,6 +57,15 @@ impl Upload {
     }
 }
 
+impl Drop for Upload {
+    /// allow the client to keep an early response when the proxy skips the remaining upload.
+    fn drop(&mut self) {
+        if let Some(receiving) = &mut self.receiving {
+            receiving.stream.stop_sending(Code::H3_NO_ERROR);
+        }
+    }
+}
+
 impl Body for Upload {
     type Data = Bytes;
     type Error = io::Error;

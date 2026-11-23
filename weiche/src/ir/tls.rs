@@ -110,6 +110,15 @@ pub struct ServerTls {
 }
 
 impl ServerTls {
+    /// select the listener that accepts the ClientHello, including a catch-all without SNI.
+    pub fn for_sni<'a>(certs: &'a [Arc<Self>], sni: Option<&str>) -> Option<&'a Self> {
+        let host = sni.unwrap_or_default().to_ascii_lowercase();
+        certs
+            .iter()
+            .map(Arc::as_ref)
+            .find(|tls| super::hostname_matches(&tls.hostname, &host))
+    }
+
     /// validate the leaf certificate and its key before publishing the listener.
     pub fn from_pem(hostname: &str, chain: &[u8], key: &[u8]) -> anyhow::Result<Self> {
         let certs =

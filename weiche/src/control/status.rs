@@ -105,6 +105,7 @@ const FEATURES: &[&str] = &[
     "GRPCRouteRequestHeaderModifier",
     "Gateway",
     "GatewayHTTPListenerIsolation",
+    "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayInfrastructure",
     "GatewayPort8080",
     "GatewayRouteHostnameIntersectionPrecedence",

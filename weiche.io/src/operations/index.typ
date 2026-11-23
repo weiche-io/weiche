@@ -140,6 +140,12 @@ every socket for a snapshot revision, the proxy atomically writes the digest to
 ready, non-terminating `EndpointSlice` endpoint has acknowledged the current
 snapshot digest.
 
+On a shared HTTPS port, the TLS handshake selects a listener by SNI. If a
+request's authority selects a different listener, the proxy returns HTTP 421
+so the client can open a connection for that authority. Two hostnames served
+by the same wildcard listener can share a connection. An authority with no
+matching HTTPS listener receives HTTP 404.
+
 = Cross-namespace ReferenceGrant <referencegrant>
 
 Helm authorization applies only to provisioning proxy resources inside

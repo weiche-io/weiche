@@ -51,6 +51,7 @@ impl Session {
         mut self,
         service: &ProxyService,
         binding: &Binding,
+        tls_listener: &str,
         mut stopping: impl Future<Output = ()> + Unpin,
         drain_timeout: Duration,
     ) {
@@ -63,7 +64,7 @@ impl Session {
                 result = self.http.accept() => match result {
                     Ok(Some(resolver)) => {
                         let peer = self.transport.remote_address();
-                        requests.push(request(resolver, service, binding, peer).unwrap_or_else(move |error| {
+                        requests.push(request(resolver, service, binding, tls_listener, peer).unwrap_or_else(move |error| {
                             tracing::debug!(%peer, %error, "http/3 stream ended");
                         }));
                     }
@@ -88,6 +89,7 @@ async fn request(
     resolver: RequestResolver<Connection, Bytes>,
     service: &ProxyService,
     binding: &Binding,
+    tls_listener: &str,
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
     let (req, mut stream) = resolver.resolve_request().await?;
@@ -104,7 +106,7 @@ async fn request(
     let (upload, malformed) = Upload::new(recv, length);
     let req = req.map(|()| RequestBody::Http3(upload));
     let exchange = async {
-        let reply = service.call(binding, peer, req).await;
+        let reply = service.call(binding, Some(tls_listener), peer, req).await;
         let write = respond(&mut send, reply.response, head);
         match reply.deadline {
             Some(end) => timeout_at(end, write).await?,

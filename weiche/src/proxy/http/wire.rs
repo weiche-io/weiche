@@ -15,6 +15,10 @@ pub enum ProxyError {
     UnsupportedUpgrade,
     /// missing, ambiguous or malformed request authority.
     InvalidHost,
+    /// no HTTPS listener on this binding matches the request authority.
+    NoHttpsListener,
+    /// the authority selects a different listener from the TLS handshake.
+    Misdirected,
     /// no attached route matches the request.
     NoRoute,
     /// selected reference has no valid backend.
@@ -69,6 +73,8 @@ impl ProxyError {
                 "a valid, consistent Host or :authority is required\n",
                 None,
             ),
+            Self::NoHttpsListener => (S::NOT_FOUND, "no matching HTTPS listener\n", None),
+            Self::Misdirected => (S::MISDIRECTED_REQUEST, "misdirected request\n", None),
             Self::NoRoute => (S::NOT_FOUND, "no matching HTTPRoute\n", Some("12")),
             Self::InvalidBackend => (
                 S::INTERNAL_SERVER_ERROR,

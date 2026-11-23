@@ -69,8 +69,16 @@ impl WorkerView {
         };
         let mut routes = BTreeMap::new();
         for (&address, socket) in &gateway.sockets {
-            let mut by_listener: BTreeMap<_, Vec<_>> =
-                socket.hostnames.iter().map(|h| (h.as_str(), Vec::new())).collect();
+            // a TLS listener owns its hostname even when no route is attached to it.
+            let mut by_listener: BTreeMap<_, Vec<_>> = socket
+                .hostnames
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    socket.listener.tls.iter().map(|identity| identity.hostname.as_str()),
+                )
+                .map(|name| (name, Vec::new()))
+                .collect();
             for route in &socket.routes {
                 let listener = route.host.as_ref().map_or("", |h| h.listener.as_str());
                 by_listener.entry(listener).or_default().push(route);
@@ -153,30 +161,39 @@ impl ProxyService {
     fn select(
         &self,
         listener: &Binding,
+        tls_listener: Option<&str>,
         authority: &Authority,
         request: &Request<RequestBody>,
         start: Instant,
         grpc: bool,
-    ) -> Option<Selection> {
+    ) -> Result<Selection, ProxyError> {
         let view = self.view.borrow();
         let hostname = authority.host().to_ascii_lowercase();
-        let (binding, hosts) = view.routes.get(&listener.address)?;
+        let (binding, hosts) =
+            view.routes.get(&listener.address).ok_or(ProxyError::NoRoute)?;
         if binding != listener {
-            return None;
+            return Err(ProxyError::NoRoute);
         }
-        hosts.matching(&hostname).next()?.find(
-            &hostname,
-            request,
-            grpc,
-            start,
-            view.deadline,
-        )
+        let (pattern, router) =
+            hosts.matching(&hostname).next().ok_or(if tls_listener.is_some() {
+                ProxyError::NoHttpsListener
+            } else {
+                ProxyError::NoRoute
+            })?;
+        // compare listener patterns so different hosts on the same wildcard can share TLS.
+        if tls_listener.is_some_and(|selected| selected != pattern) {
+            return Err(ProxyError::Misdirected);
+        }
+        router
+            .find(&hostname, request, grpc, start, view.deadline)
+            .ok_or(ProxyError::NoRoute)
     }
 
     /// route the original request and apply response filters to the selected response.
     pub async fn call(
         &self,
         listener: &Binding,
+        tls_listener: Option<&str>,
         peer: SocketAddr,
         mut request: Request<RequestBody>,
     ) -> Exchange {
@@ -208,9 +225,16 @@ impl ProxyService {
             Err(error) => return advertise(error.response(false)),
         };
         let grpc = is_grpc(&request);
-        let Some(selection) = self.select(listener, &authority, &request, start, grpc)
-        else {
-            return advertise(ProxyError::NoRoute.response(grpc));
+        let selection = match self.select(
+            listener,
+            tls_listener,
+            &authority,
+            &request,
+            start,
+            grpc,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => return advertise(error.response(grpc)),
         };
         let exchange = if selection.cors.as_ref().is_some_and(|c| c.preflight) {
             Exchange::local(StatusCode::NO_CONTENT, "")
