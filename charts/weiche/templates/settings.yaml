@@ -8,6 +8,7 @@
     "pullSecrets" .Values.imagePullSecrets
     "seccompProfile" .Values.proxy.seccompProfile
     "resources" .Values.proxy.resources
+    "podTemplate" (include "weiche.proxyTemplate" . | fromYaml)
     "replicas" .Values.proxy.replicas
     "bindAddress" .Values.proxy.bindAddress
     "hostNetwork" .Values.proxy.hostNetwork
