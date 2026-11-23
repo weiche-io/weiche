@@ -3,32 +3,13 @@
     "controllerName" .Values.gatewayClass.controllerName
     "leaseName" (include "weiche.leaseName" .)
     "provisionerBinding" (include "weiche.provisionerRole" .)
-    "image" (include "weiche.image" .)
-    "pullPolicy" .Values.image.pullPolicy
-    "pullSecrets" .Values.imagePullSecrets
-    "seccompProfile" .Values.proxy.seccompProfile
-    "resources" .Values.proxy.resources
     "podTemplate" (include "weiche.proxyTemplate" . | fromYaml)
     "replicas" .Values.proxy.replicas
     "bindAddress" .Values.proxy.bindAddress
-    "hostNetwork" .Values.proxy.hostNetwork
-    "dnsPolicy" .Values.proxy.dnsPolicy
-    "terminationGracePeriodSeconds" .Values.proxy.terminationGracePeriodSeconds
-    "nodeSelector" .Values.proxy.nodeSelector
-    "tolerations" .Values.proxy.tolerations
-    "topologySpreadConstraints" .Values.proxy.topologySpreadConstraints
-    "priorityClassName" .Values.proxy.priorityClassName
-    "podLabels" .Values.proxy.podLabels
-    "podAnnotations" .Values.proxy.podAnnotations
-    "log" .Values.proxy.log
-    "extraEnv" .Values.proxy.extraEnv
     "service" .Values.proxy.service
-    "http3" .Values.proxy.http3
+    "http3" .Values.proxy.http3.enabled
     "namespaces" (.Values.gatewayNamespaces | default (list .Release.Namespace) | uniq)
 -}}
-{{- if .Values.proxy.affinity }}
-{{- $_ := set $settings "affinity" .Values.proxy.affinity }}
-{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

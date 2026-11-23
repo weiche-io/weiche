@@ -162,7 +162,7 @@ pub async fn reconcile(
         target.deployment(settings, replicas),
     );
     let Some(ips) = requested_ips else { return Ok(()) };
-    let ports = plan.ports(options.http3.enabled);
+    let ports = plan.ports(options.http3);
     if !ports.is_empty() {
         apply!(target.service(ports, &options.service, &ips));
     }
