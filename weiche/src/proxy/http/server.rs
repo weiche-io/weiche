@@ -1,6 +1,6 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
 use super::super::{
-    super::ir::{Binding, Listener, ServerTls, hostname_matches},
+    super::ir::{Binding, Listener, ServerTls},
     admission::Permit,
     config::RuntimeConfig,
     io::{AcceptedTls, Io, TlsIo},
@@ -111,8 +111,8 @@ impl Worker {
             tracing::warn!(%peer, %error, "failed to set tcp nodelay");
             return;
         }
-        let (stream, h2) = if listener.tls {
-            let stream = tokio::select! {
+        let (stream, h2, tls_listener) = if listener.tls {
+            let (stream, selected) = tokio::select! {
                 _ = shutdown.changed() => return,
                 result = timeout(self.runtime.tls_handshake_timeout, accept_tls(stream, &certs)) => match result {
                     Ok(Ok(stream)) => stream,
@@ -127,25 +127,35 @@ impl Worker {
                 },
             };
             let h2 = stream.negotiated_alpn() == Some(b"h2");
-            (Io::tls(stream), Some(h2))
+            (Io::tls(stream), Some(h2), Some(selected))
         } else {
             let Ok(stream) = Io::plain(stream).inspect_err(|error| {
                 tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
             }) else {
                 return;
             };
-            (stream, None)
+            (stream, None, None)
         };
         drop(certs);
         let drain = self.runtime.connection_drain_timeout;
-        let owner = Rc::new(Owner { _permit: permit, shutdown: shutdown.clone(), drain });
+        let owner = Rc::new(Owner {
+            _permit: permit,
+            tls_listener,
+            shutdown: shutdown.clone(),
+            drain,
+        });
         let service = service_fn(|request| {
             let service = self.server.service.clone();
             let listener = listener.clone();
             let owner = owner.clone();
             async move {
                 let exchange = service
-                    .call(&listener, peer, request.map(RequestBody::Incoming))
+                    .call(
+                        &listener,
+                        owner.tls_listener.as_deref(),
+                        peer,
+                        request.map(RequestBody::Incoming),
+                    )
                     .await;
                 if let Some(tunnel) = exchange.tunnel {
                     runtime::spawn(owner.relay(tunnel)).detach();
@@ -188,6 +198,8 @@ impl Worker {
 
 /// admission and listener shutdown state shared with an upgraded connection.
 struct Owner {
+    /// hostname pattern selected during TLS negotiation, including the empty catch-all.
+    tls_listener: Option<String>,
     /// keep the downstream capacity reserved through tunnel EOF.
     _permit: Permit,
     /// observe removal of the accepting listener.
@@ -214,13 +226,12 @@ impl Owner {
 }
 
 /// a listener without a hostname also accepts clients that omit SNI.
-async fn accept_tls(stream: TcpStream, certs: &[Arc<ServerTls>]) -> io::Result<TlsIo> {
+async fn accept_tls(
+    stream: TcpStream,
+    certs: &[Arc<ServerTls>],
+) -> io::Result<(TlsIo, String)> {
     let handshake = AcceptedTls::accept(stream).await?;
-    let hello = handshake.client_hello();
-    let host = hello.server_name().unwrap_or_default().to_ascii_lowercase();
-    let tls = certs
-        .iter()
-        .find(|tls| hostname_matches(&tls.hostname, &host))
+    let tls = ServerTls::for_sni(certs, handshake.client_hello().server_name())
         .ok_or_else(|| io::Error::other("SNI does not match a listener hostname"))?;
-    handshake.into_stream(tls.config()).await
+    Ok((handshake.into_stream(tls.config()).await?, tls.hostname.clone()))
 }

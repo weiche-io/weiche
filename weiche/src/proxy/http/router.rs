@@ -218,17 +218,21 @@ impl<T> FromIterator<(String, T)> for Hosts<T> {
 
 impl<T> Hosts<T> {
     /// enumerate matching hostnames from most to least specific.
-    pub fn matching<'a>(&'a self, hostname: &str) -> impl Iterator<Item = &'a T> {
+    pub fn matching<'a>(
+        &'a self,
+        hostname: &str,
+    ) -> impl Iterator<Item = (&'a str, &'a T)> {
         self.exact
-            .get(hostname)
+            .get_key_value(hostname)
             .into_iter()
+            .map(|(name, value)| (name.as_str(), value))
             .chain(
                 self.wildcard
                     .iter()
                     .filter(move |(pattern, _)| hostname_matches(pattern, hostname))
-                    .map(|(_, v)| v),
+                    .map(|(name, value)| (name.as_str(), value)),
             )
-            .chain(self.fallback.iter())
+            .chain(self.fallback.iter().map(|value| ("", value)))
     }
 }
 
@@ -313,7 +317,8 @@ impl Router {
         } else {
             &self.http
         };
-        let (route, backend) = table.matching(hostname).flatten().find_map(|route| {
+        let mut routes = table.matching(hostname).flat_map(|(_, routes)| routes);
+        let (route, backend) = routes.find_map(|route| {
             let action = &route.action;
             let expected = route.http.method.as_deref();
             let direct = expected.is_none_or(|m| m == method.as_str());

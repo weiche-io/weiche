@@ -190,11 +190,7 @@ impl Listeners {
             &self.serving,
             &mut self.quic,
             desired,
-            |listener, http| {
-                if changed {
-                    listener.certificates.update(&http.certs.borrow());
-                }
-            },
+            |_, _| {},
             |address, http| quic::Listener::bind(worker, address, http),
             |address, error| {
                 if error.kind() != io::ErrorKind::WouldBlock {
