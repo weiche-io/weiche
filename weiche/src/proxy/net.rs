@@ -1,7 +1,7 @@
 //! downstream listener transports and per-worker application reports.
 mod cid;
 mod group;
-mod h3;
+pub(super) mod h3;
 pub mod quic;
 pub mod tcp;
 pub mod udp;

@@ -1,5 +1,6 @@
 //! adapt HTTP/3 request streams to the worker's shared HTTP service.
 mod fields;
+mod upload;
 
 use super::super::{
     super::ir::Binding,
@@ -8,10 +9,10 @@ use super::super::{
     http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
     stopped,
 };
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use compio::{
     quic::{
-        Incoming,
+        Connection, Incoming,
         h3::{
             self,
             error::Code,
@@ -21,15 +22,12 @@ use compio::{
     runtime::time::{timeout, timeout_at},
 };
 use fields::ContentLength;
-use futures::{
-    StreamExt, TryFutureExt, TryStreamExt,
-    stream::{FuturesUnordered, try_unfold},
-};
+use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
 use http::{Method, Response, StatusCode};
-use http_body_util::{BodyExt, StreamBody};
-use hyper::body::Frame;
-use std::{io, net::SocketAddr, rc::Rc};
-use tokio::sync::{Notify, watch};
+use http_body_util::BodyExt;
+use std::net::SocketAddr;
+use tokio::sync::watch;
+pub use upload::Upload;
 
 /// keep the permit through TLS negotiation, concurrent requests and graceful drain.
 pub async fn serve(
@@ -86,46 +84,13 @@ pub async fn serve(
     .await;
 }
 
-/// stream data and trailers on demand so upstream flow control reaches the QUIC peer.
-fn upload<S: h3::quic::RecvStream>(
-    stream: RequestStream<S, Bytes>,
-    length: ContentLength,
-    malformed: Rc<Notify>,
-) -> impl hyper::body::Body<Data = Bytes, Error = io::Error> {
-    let frames = try_unfold(Some((stream, length)), move |state| async move {
-        let Some((mut stream, mut remaining)) = state else { return Ok(None) };
-        if let Some(mut data) = stream.recv_data().await.map_err(io::Error::other)? {
-            let size = data.remaining();
-            remaining.consume(size)?;
-            let frame = Frame::data(data.copy_to_bytes(size));
-            return Ok(Some((frame, Some((stream, remaining)))));
-        }
-        remaining.finish()?;
-        let trailers = stream
-            .recv_trailers()
-            .await
-            .map_err(io::Error::other)?
-            .map(fields::trailers)
-            .transpose()?;
-        Ok(trailers.map(|h| (Frame::trailers(h), None)))
-    });
-    StreamBody::new(frames.inspect_err(move |error: &io::Error| {
-        if error.kind() == io::ErrorKind::InvalidData {
-            malformed.notify_one();
-        }
-    }))
-}
-
-/// bridge one request without serializing header resolution or buffering either body.
-async fn request<C: h3::quic::Connection<Bytes> + 'static>(
-    resolver: RequestResolver<C, Bytes>,
+/// resolve one request and forward its upload and response independently.
+async fn request(
+    resolver: RequestResolver<Connection, Bytes>,
     service: &ProxyService,
     binding: &Binding,
     peer: SocketAddr,
-) -> anyhow::Result<()>
-where
-    C::BidiStream: h3::quic::BidiStream<Bytes>,
-{
+) -> anyhow::Result<()> {
     let (req, mut stream) = resolver.resolve_request().await?;
     let length = match ContentLength::parse(req.headers()) {
         Ok(length) => length,
@@ -137,9 +102,8 @@ where
     };
     let head = req.method() == Method::HEAD;
     let (mut send, recv) = stream.split();
-    let malformed = Rc::new(Notify::new());
-    let req = req
-        .map(|()| RequestBody::Stream(Box::pin(upload(recv, length, malformed.clone()))));
+    let (upload, malformed) = Upload::new(recv, length);
+    let req = req.map(|()| RequestBody::Http3(upload));
     let exchange = async {
         let reply = service.call(binding, peer, req).await;
         let write = respond(&mut send, reply.response, head);
@@ -150,7 +114,7 @@ where
     };
     let result = tokio::select! {
         biased;
-        _ = malformed.notified() => {
+        Ok(()) = malformed => {
             send.stop_stream(Code::H3_MESSAGE_ERROR);
             return Ok(());
         }

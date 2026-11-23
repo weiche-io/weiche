@@ -1,5 +1,8 @@
 //! adapt worker-local transport bodies for proxy dispatch.
-use super::super::up::{PooledBody, TimedBody};
+use super::super::{
+    net::h3::Upload,
+    up::{PooledBody, TimedBody},
+};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -16,10 +19,10 @@ pub enum RequestBody {
         /// incoming data and trailer frames.
         Incoming,
     ),
-    /// adapt the HTTP/3 receive stream on demand.
-    Stream(
-        /// pinned worker-local stream of upload frames.
-        Pin<Box<dyn Body<Data = Bytes, Error = io::Error>>>,
+    /// receive decoded HTTP/3 frames from the worker-local reader.
+    Http3(
+        /// bounded upload and its reader task.
+        Upload,
     ),
 }
 
@@ -76,5 +79,5 @@ macro_rules! forward_body {
     };
 }
 
-forward_body!(RequestBody, Incoming, Stream);
+forward_body!(RequestBody, Incoming, Http3);
 forward_body!(ResponseBody, Full, Upstream);
