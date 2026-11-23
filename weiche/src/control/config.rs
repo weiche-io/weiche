@@ -2,7 +2,7 @@
 use super::CONTROLLER_NAME;
 use anyhow::ensure;
 use k8s_openapi::api::core::v1::{
-    Affinity, EnvVar, LocalObjectReference, ResourceRequirements, SeccompProfile,
+    Affinity, EnvVar, LocalObjectReference, PodTemplateSpec, ResourceRequirements, SeccompProfile,
     Toleration, TopologySpreadConstraint,
 };
 use serde::{Deserialize, Deserializer, de::Error};
@@ -190,6 +190,8 @@ pub struct Settings {
     pub bind_address: IpAddr,
     /// namespaces authorized to host Gateway proxy workloads.
     pub namespaces: BTreeSet<String>,
+    /// native pod template rendered by the platform chart.
+    pub pod_template: PodTemplateSpec,
     /// container image rendered into per-Gateway proxy Deployments.
     pub image: String,
     /// image pull policy for proxy containers.

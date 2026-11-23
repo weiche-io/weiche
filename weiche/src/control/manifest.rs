@@ -9,12 +9,7 @@ use k8s_openapi::{
     ByteString,
     api::{
         apps::v1::{Deployment, DeploymentSpec},
-        core::v1::{
-            Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-            ExecAction, ObjectFieldSelector, PodSecurityContext, PodSpec,
-            PodTemplateSpec, Probe, Secret, SecurityContext, Service, ServicePort,
-            ServiceSpec, Sysctl, Volume, VolumeMount,
-        },
+        core::v1::{Secret, Service, ServicePort, ServiceSpec},
         rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject},
     },
     apimachinery::pkg::{
@@ -32,18 +27,6 @@ type Tags = BTreeMap<String, String>;
 /// omit optional Kubernetes lists when the installation supplies no entries.
 fn nonempty<T>(values: impl ExactSizeIterator<Item = T>) -> Option<Vec<T>> {
     (values.len() != 0).then(|| values.collect())
-}
-
-/// build Kubernetes string lists from static names and target identifiers.
-fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
-    values.map(str::to_owned).into()
-}
-
-/// fill selected optional Kubernetes fields and leave the rest absent from SSA.
-macro_rules! options {
-    ($kind:ident, $($field:ident = $value:expr),+ $(,)?) => {
-        Some($kind { $($field: Some($value),)+ ..Default::default() })
-    };
 }
 
 /// common identity and metadata shared by all resources owned by one Gateway.
@@ -106,9 +89,9 @@ impl Target<'_> {
     /// restrict proxy access to its snapshot, report and provisioner binding.
     pub fn role(&self, binding: &str) -> Role {
         let rule = |group: &str, resource: &str, name: &str, verbs: &[&str]| PolicyRule {
-            api_groups: Some(strings([group])),
-            resources: Some(strings([resource])),
-            resource_names: Some(strings([name])),
+            api_groups: Some(vec![group.into()]),
+            resources: Some(vec![resource.into()]),
+            resource_names: Some(vec![name.into()]),
             verbs: verbs.iter().map(|v| (*v).into()).collect(),
             ..Default::default()
         };
@@ -145,107 +128,30 @@ impl Target<'_> {
         BTreeMap::from([(OWNER.into(), self.owner.uid.clone())])
     }
 
-    /// deploy the requested replicas with the same pod selector used by the service.
+    /// bind the platform pod template to this gateway's identity and snapshot.
     pub fn deployment(&self, settings: &Settings, replicas: i32) -> Deployment {
-        let options = &settings.installation;
-        let mut pod =
-            self.template(options.pod_labels.clone(), options.pod_annotations.clone());
-        pod.labels.get_or_insert_default().extend(self.selector());
-        Deployment {
-            spec: DeploymentSpec {
-                replicas: Some(replicas),
-                selector: LabelSelector {
-                    match_labels: Some(self.selector()),
-                    ..Default::default()
-                },
-                template: PodTemplateSpec {
-                    metadata: Some(pod),
-                    spec: Some(self.pod_spec(settings)),
-                },
+        let mut template = settings.pod_template.clone();
+        let meta = template.metadata.get_or_insert_default();
+        let gateway = self.template(
+            meta.labels.take().unwrap_or_default(),
+            meta.annotations.take().unwrap_or_default(),
+        );
+        meta.labels = gateway.labels;
+        meta.labels.get_or_insert_default().extend(self.selector());
+        meta.annotations = gateway.annotations;
+        template.spec.get_or_insert_default().service_account_name =
+            Some(self.name.into());
+        let mut deployment: Deployment = self.owned();
+        deployment.spec = DeploymentSpec {
+            replicas: Some(replicas),
+            selector: LabelSelector {
+                match_labels: Some(self.selector()),
                 ..Default::default()
             },
-            ..self.owned()
-        }
-    }
-
-    /// configure the pod network namespace, scheduling and memory-backed runtime volume.
-    fn pod_spec(&self, settings: &Settings) -> PodSpec {
-        let options = &settings.installation;
-        let mut node_selector = options.node_selector.clone();
-        node_selector.insert("kubernetes.io/os".into(), "linux".into());
-        let host = options.host_network;
-        PodSpec {
-            service_account_name: Some(self.name.into()),
-            node_selector: Some(node_selector),
-            image_pull_secrets: Some(settings.pull_secrets.clone()),
-            termination_grace_period_seconds: Some(
-                options.termination_grace_period_seconds,
-            ),
-            volumes: Some(vec![Volume {
-                name: "run".into(),
-                empty_dir: options!(EmptyDirVolumeSource, medium = "Memory".into()),
-                ..Default::default()
-            }]),
-            containers: vec![self.container(settings)],
-            host_network: host.then_some(true),
-            dns_policy: options
-                .dns_policy
-                .clone()
-                .or_else(|| host.then(|| "ClusterFirstWithHostNet".into())),
-            // the port sysctl requires a private network namespace.
-            security_context: (!host).then(|| PodSecurityContext {
-                sysctls: Some(vec![Sysctl {
-                    name: "net.ipv4.ip_unprivileged_port_start".into(),
-                    value: "0".into(),
-                }]),
-                ..Default::default()
-            }),
-            tolerations: nonempty(options.tolerations.iter().cloned()),
-            affinity: options.affinity.clone(),
-            topology_spread_constraints: nonempty(
-                options.topology_spread_constraints.iter().cloned(),
-            ),
-            priority_class_name: options.priority_class_name.clone(),
+            template,
             ..Default::default()
-        }
-    }
-
-    /// configure the proxy process, readiness command and container privileges.
-    fn container(&self, settings: &Settings) -> Container {
-        let options = &settings.installation;
-        Container {
-            name: "proxy".into(),
-            image: Some(settings.image.clone()),
-            image_pull_policy: Some(settings.pull_policy.clone()),
-            args: Some(strings(["proxy", self.name])),
-            resources: Some(settings.resources.clone()),
-            env: Some(proxy_env(settings)),
-            volume_mounts: Some(vec![VolumeMount {
-                name: "run".into(),
-                mount_path: "/run/weiche".into(),
-                ..Default::default()
-            }]),
-            readiness_probe: options!(
-                Probe,
-                exec = ExecAction {
-                    command: Some(strings(["/usr/local/bin/weiche", "ready"]))
-                },
-                period_seconds = 1,
-                failure_threshold = 1
-            ),
-            security_context: options!(
-                SecurityContext,
-                run_as_non_root = true,
-                run_as_user = 65532,
-                allow_privilege_escalation = false,
-                capabilities = Capabilities {
-                    drop: Some(strings(["ALL"])),
-                    add: options.host_network.then(|| strings(["NET_BIND_SERVICE"])),
-                },
-                seccomp_profile = settings.seccomp_profile.clone()
-            ),
-            ..Default::default()
-        }
+        };
+        deployment
     }
 
     /// expose listener ports with the installation's address and traffic policies.
@@ -294,47 +200,6 @@ impl Target<'_> {
             ..Default::default()
         }
     }
-}
-
-/// assemble the proxy environment with platform-supplied overrides in declaration order.
-fn proxy_env(settings: &Settings) -> Vec<EnvVar> {
-    let options = &settings.installation;
-    let binding = &options.provisioner_binding;
-    let literal = |name: &str, value: String| EnvVar {
-        name: name.into(),
-        value: Some(value),
-        ..Default::default()
-    };
-    let mut env = vec![
-        literal("WEICHE_PROVISIONER_BINDING", binding.clone()),
-        EnvVar {
-            name: "POD_UID".into(),
-            value_from: options!(
-                EnvVarSource,
-                field_ref = ObjectFieldSelector {
-                    field_path: "metadata.uid".into(),
-                    ..Default::default()
-                }
-            ),
-            ..Default::default()
-        },
-    ];
-    if options.http3.enabled {
-        env.push(literal("WEICHE_HTTP3", "true".into()));
-        if let Some(port) = options.http3.advertised_port {
-            env.push(literal("WEICHE_HTTP3_PORT", port.to_string()));
-        }
-    }
-    for (name, value) in [
-        ("RUST_LOG", options.log.level.as_str()),
-        ("WEICHE_LOG_FORMAT", options.log.format.as_str()),
-    ] {
-        if !value.is_empty() && !options.extra_env.iter().any(|var| var.name == name) {
-            env.push(literal(name, value.into()));
-        }
-    }
-    env.extend_from_slice(&options.extra_env);
-    env
 }
 
 /// return the Kubernetes IP family name for an IP address.
