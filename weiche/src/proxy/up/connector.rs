@@ -3,15 +3,17 @@ use super::{
     super::{
         super::ir::Protocol,
         admission::EndpointKey,
+        config::TcpConfig,
         http::RequestBody,
         io::{Io, TlsIo},
+        net::tcp,
     },
     deadline::TimedBody,
     http2::Upload,
     pool::ConnectionPool,
 };
 use anyhow::{Context, ensure};
-use compio::{net::TcpStream, runtime, tls::rustls::pki_types::ServerName};
+use compio::{runtime, tls::rustls::pki_types::ServerName};
 use cyper_core::{CompioExecutor, CompioTimer};
 use futures::TryFutureExt;
 use hyper::client::conn::{http1, http2};
@@ -29,7 +31,7 @@ impl ConnectionPool {
     pub async fn connect(&self, endpoint: &EndpointKey) -> anyhow::Result<Connected> {
         let (sender, connection) = http1::Builder::new()
             .max_buf_size(self.max_buffer)
-            .handshake(open(endpoint).await?)
+            .handshake(open(endpoint, &self.tcp).await?)
             .await?;
         let address = endpoint.address;
         let driver = connection.with_upgrades().unwrap_or_else(move |error| {
@@ -47,7 +49,7 @@ impl ConnectionPool {
             .timer(CompioTimer)
             .max_send_buf_size(self.max_buffer)
             .max_header_list_size(self.max_buffer as u32)
-            .handshake(open(endpoint).await?)
+            .handshake(open(endpoint, &self.tcp).await?)
             .await?;
         let address = endpoint.address;
         let driver = connection.unwrap_or_else(move |error| {
@@ -58,8 +60,8 @@ impl ConnectionPool {
 }
 
 /// open TCP and negotiate backend TLS when configured.
-async fn open(endpoint: &EndpointKey) -> anyhow::Result<Io> {
-    let stream = TcpStream::connect(endpoint.address).await?;
+async fn open(endpoint: &EndpointKey, tcp: &TcpConfig) -> anyhow::Result<Io> {
+    let stream = tcp::connect(endpoint.address, tcp).await?;
     let Some(tls) = &endpoint.tls else { return Ok(Io::plain(stream)?) };
     let name = ServerName::try_from(tls.hostname.clone())
         .context("invalid backend TLS hostname")?;

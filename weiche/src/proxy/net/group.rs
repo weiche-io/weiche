@@ -1,5 +1,5 @@
 //! coordinate UDP socket ownership across workers and protocol changes.
-use super::{super::worker::Worker, bind_socket, cid};
+use super::{super::config::SocketBuffers, bind_socket, cid};
 use compio::net::UdpSocket;
 use socket2::{Protocol, Socket, Type};
 use std::{
@@ -16,10 +16,16 @@ pub struct Groups(
     Arc<Mutex<BTreeMap<SocketAddr, Group>>>,
 );
 
+/// protocol reading datagrams from a reuseport group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DatagramMode {
+    Udp,
+    Quic,
+}
+
 /// sockets in kernel bind order and the protocol that currently owns them.
 struct Group {
-    /// whether the group serves QUIC or explicit UDP routes.
-    quic: bool,
+    mode: DatagramMode,
     /// each socket keeps its kernel index until the last reader finishes draining.
     sockets: Vec<Slot>,
 }
@@ -34,21 +40,40 @@ struct Slot {
 
 impl Group {
     /// bind all sockets before attaching the group-wide filter or admitting clients.
-    fn bind(addr: SocketAddr, workers: usize, quic: bool) -> io::Result<Self> {
+    fn bind(
+        addr: SocketAddr,
+        workers: usize,
+        mode: DatagramMode,
+        buffers: SocketBuffers,
+    ) -> io::Result<Self> {
         let sockets = (0..workers)
-            .map(|_| {
-                bind_socket(addr, Type::DGRAM, Protocol::UDP)
-                    .map(|socket| Slot { socket, busy: false })
+            .map(|id| {
+                let socket = bind_socket(addr, Type::DGRAM, Protocol::UDP, buffers, id)?;
+                Ok(Slot { socket, busy: false })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        if quic
+        if mode == DatagramMode::Quic
             && workers > 1
             && let Ok(count) = u16::try_from(workers)
             && let Err(error) = cid::attach(&sockets[0].socket, count)
         {
             tracing::warn!(%addr, %error, "quic reuseport steering unavailable");
         }
-        Ok(Self { quic, sockets })
+        Ok(Self { mode, sockets })
+    }
+
+    /// claim the slot only after attaching a descriptor to the worker runtime.
+    fn acquire(&mut self, id: usize, mode: DatagramMode) -> io::Result<UdpSocket> {
+        let slot = self.sockets.get_mut(id).ok_or(io::ErrorKind::InvalidInput)?;
+        if self.mode != mode || slot.busy {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous udp listener is draining",
+            ));
+        }
+        let socket = UdpSocket::from_std(slot.socket.try_clone()?.into())?;
+        slot.busy = true;
+        Ok(socket)
     }
 }
 
@@ -75,33 +100,26 @@ impl Drop for Reader {
     }
 }
 
-impl Worker {
-    /// reserve this worker's reader and a descriptor in the ordered UDP group.
-    pub fn datagram(
+impl Groups {
+    /// publish a new group only after its first worker has acquired a socket.
+    pub fn acquire(
         &self,
         addr: SocketAddr,
-        quic: bool,
+        id: usize,
+        workers: usize,
+        mode: DatagramMode,
+        buffers: SocketBuffers,
     ) -> io::Result<(UdpSocket, Reader)> {
-        let registry = &self.group.datagrams;
-        let id = self.id;
-        let mut groups = registry.0.lock().unwrap();
-        let group = match groups.entry(addr) {
-            Entry::Occupied(entry) => entry.into_mut(),
+        let mut groups = self.0.lock().unwrap();
+        let socket = match groups.entry(addr) {
+            Entry::Occupied(mut entry) => entry.get_mut().acquire(id, mode)?,
             Entry::Vacant(entry) => {
-                entry.insert(Group::bind(addr, self.runtime.workers.get(), quic)?)
+                let mut group = Group::bind(addr, workers, mode, buffers)?;
+                let socket = group.acquire(id, mode)?;
+                entry.insert(group);
+                socket
             }
         };
-        let slot = &mut group.sockets[id];
-        if group.quic != quic || slot.busy {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "previous UDP listener is draining",
-            ));
-        }
-        let socket = slot.socket.try_clone();
-        slot.busy = true;
-        let reader = Reader { groups: registry.clone(), addr, id };
-        drop(groups);
-        Ok((UdpSocket::from_std(socket?.into())?, reader))
+        Ok((socket, Reader { groups: self.clone(), addr, id }))
     }
 }

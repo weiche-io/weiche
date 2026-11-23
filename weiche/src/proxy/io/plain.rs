@@ -34,9 +34,8 @@ pub struct PlainIo {
 }
 
 impl PlainIo {
-    /// configure nodelay and nonblocking mode, taking ownership of the shared descriptor.
+    /// take ownership of the shared descriptor and switch it to nonblocking mode.
     pub fn new(stream: TcpStream) -> io::Result<Self> {
-        stream.set_nodelay(true)?;
         // into_poll_fd switches the descriptor to nonblocking mode once.
         let socket = stream.into_poll_fd()?.into_inner();
         Ok(Self {

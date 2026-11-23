@@ -67,10 +67,9 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// configure the worker-local socket and reserve its reusable receive buffer.
-    pub fn new(socket: TcpStream) -> io::Result<Self> {
-        socket.set_nodelay(true)?;
-        Ok(Self {
+    /// wrap the configured socket and reserve its reusable receive buffer.
+    pub fn new(socket: TcpStream) -> Self {
+        Self {
             socket: Rc::new(socket),
             input: Cursor::new(Vec::with_capacity(64 * 1024)),
             try_immediate_io: false,
@@ -79,7 +78,7 @@ impl Transport {
             send: None,
             send_error: None,
             wake: Arc::default(),
-        })
+        }
     }
 
     /// preserve unconsumed records, including bytes read ahead of the ClientHello.

@@ -3,13 +3,12 @@ use super::{
     super::{
         super::ir::StreamRoute,
         admission::{Admission, Permit},
-        worker::{Task, Worker},
     },
-    bind_socket,
+    BoundUdp,
 };
 use compio::{BufResult, net::UdpSocket, runtime::time::timeout};
 use futures::{
-    FutureExt, StreamExt,
+    StreamExt,
     future::{AbortHandle, abortable},
     stream::FuturesUnordered,
 };
@@ -26,31 +25,16 @@ use tokio::sync::watch;
 /// receive buffer capacity for a full datagram.
 const MAX_PACKET: usize = 65535;
 
-/// bind a reusable datagram socket on the worker's runtime.
-pub fn listen(address: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = bind_socket(address, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
-    UdpSocket::from_std(socket.into())
-}
-
-/// bind a raw listener and reserve its group slot through socket close when sharing UDP with QUIC.
-pub fn bind(
-    worker: &Worker,
-    address: SocketAddr,
+/// drive the peer flows until the listener can close.
+pub async fn serve(
+    listener: BoundUdp,
     routes: watch::Receiver<Arc<StreamRoute>>,
-) -> io::Result<Task> {
-    let idle = worker.runtime.upstream_idle_timeout;
-    let admission = worker.admission.clone();
-    if !worker.runtime.http3 {
-        return Ok(serve(listen(address)?, routes, admission, idle).boxed_local());
-    }
-    let (socket, reader) = worker.datagram(address, false)?;
-    Ok(async move {
-        let result = serve(socket.clone(), routes, admission, idle).await;
-        socket.close().await?;
-        drop(reader);
-        result
-    }
-    .boxed_local())
+    admission: Arc<Admission>,
+    idle: Duration,
+) -> io::Result<()> {
+    let result = forward(&listener.socket, routes, admission, idle).await;
+    listener.close().await?;
+    result
 }
 
 /// upstream socket and idle accounting for one downstream peer.
@@ -113,8 +97,8 @@ impl Flow {
 }
 
 /// serve UDP flows for one bound datagram socket until routes close.
-pub async fn serve(
-    socket: UdpSocket,
+async fn forward(
+    socket: &UdpSocket,
     mut routes: watch::Receiver<Arc<StreamRoute>>,
     admission: Arc<Admission>,
     idle: Duration,
@@ -155,7 +139,7 @@ pub async fn serve(
                 && let Ok(flow) = Flow::connect(target, permit).await
             {
                 let flow = Rc::new(flow);
-                let (reply, abort) = abortable(flow.clone().replies(&socket, peer, idle));
+                let (reply, abort) = abortable(flow.clone().replies(socket, peer, idle));
                 replies.push(reply);
                 entry.insert((flow, abort));
             }

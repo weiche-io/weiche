@@ -2,7 +2,7 @@
 use super::super::{
     super::ir::{StreamRoute, TlsSocket},
     admission::Permit,
-    config::RuntimeConfig,
+    config::{RuntimeConfig, TcpConfig},
     worker::{Task, Worker},
 };
 pub use super::listen_tcp as listen;
@@ -15,7 +15,7 @@ use compio::{
     tls::rustls::pki_types::DnsName,
 };
 use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
-use std::{io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, rc::Rc, sync::Arc};
 use tokio::sync::watch;
 
 /// serve a stream socket and keep the worker resources alive in its accept loop.
@@ -86,20 +86,27 @@ pub async fn forward(
     config: &RuntimeConfig,
 ) -> io::Result<()> {
     let Some(address) = routes.borrow().select() else { return Ok(()) };
-    relay(client, address, config.tcp_connect_timeout, Vec::new()).await
+    relay(client, address, &config.tcp, Vec::new()).await
+}
+
+/// open a backend stream with the same TCP policy for raw and HTTP connections.
+pub async fn connect(address: SocketAddr, tcp: &TcpConfig) -> io::Result<TcpStream> {
+    let stream = timeout(tcp.connect_timeout, TcpStream::connect(address))
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)??;
+    stream.set_nodelay(tcp.nodelay)?;
+    Ok(stream)
 }
 
 /// send any consumed prefix verbatim before relaying both halves of the stream.
 async fn relay(
     client: TcpStream,
     address: SocketAddr,
-    deadline: Duration,
+    tcp: &TcpConfig,
     prefix: Vec<u8>,
 ) -> io::Result<()> {
-    let mut upstream = timeout(deadline, TcpStream::connect(address))
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)??;
-    upstream.set_nodelay(true)?;
+    client.set_nodelay(tcp.nodelay)?;
+    let mut upstream = connect(address, tcp).await?;
     if !prefix.is_empty() {
         upstream.write_all(prefix).await.0?;
     }
@@ -126,7 +133,7 @@ pub async fn passthrough(
         return Ok(());
     }
     let Some(address) = routes.borrow().select(&host) else { return Ok(()) };
-    relay(client, address, config.tcp_connect_timeout, prefix).await
+    relay(client, address, &config.tcp, prefix).await
 }
 
 /// assemble the first handshake across records while retaining every byte for replay.

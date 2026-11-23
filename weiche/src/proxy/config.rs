@@ -10,22 +10,54 @@ use std::{
 };
 use tokio::sync::watch;
 
+/// requested payload capacity in bytes for each direction of a listener socket.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SocketBuffers {
+    pub recv: Option<usize>,
+    pub send: Option<usize>,
+}
+
+/// listener queue and stream settings for TCP.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpConfig {
+    pub backlog: i32,
+    pub nodelay: bool,
+    pub buffers: SocketBuffers,
+    pub connect_timeout: Duration,
+}
+
+/// downstream UDP socket sizing and per-peer flow lifetime.
+#[derive(Clone, Debug)]
+pub struct UdpConfig {
+    pub buffers: SocketBuffers,
+    pub idle_timeout: Duration,
+}
+
+/// downstream HTTP/3 advertisement and QUIC transport settings.
+#[derive(Clone, Debug)]
+pub struct QuicConfig {
+    /// serve downstream HTTP/3 alongside terminating HTTPS listeners.
+    pub enabled: bool,
+    /// externally reachable UDP port when different from the listener port.
+    pub advertised_port: Option<u16>,
+    pub buffers: SocketBuffers,
+    pub max_concurrent_bidi_streams: u32,
+    pub idle_timeout: Duration,
+}
+
 /// process-wide limits and downstream listener policy.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    /// serve downstream HTTP/3 alongside terminating HTTPS listeners.
-    pub http3: bool,
-    /// externally reachable UDP port when different from the listener port.
-    pub http3_advertised_port: Option<u16>,
+    pub tcp: TcpConfig,
+    pub udp: UdpConfig,
+    pub quic: QuicConfig,
     /// number of worker runtimes sharing the listener sockets.
     pub workers: NonZeroUsize,
     /// maximum downstream connections and flows across workers.
     pub downstream_connections_global: NonZeroUsize,
     /// maximum backend connections on each worker.
     pub upstream_connections_per_worker: NonZeroUsize,
-    /// deadline for opening a raw TCP backend connection.
-    pub tcp_connect_timeout: Duration,
-    /// idle timeout for pooled backends, UDP flows and QUIC connections.
+    /// idle timeout for pooled HTTP backends.
     pub upstream_idle_timeout: Duration,
     /// maximum time a downstream socket may occupy a permit before TLS completes.
     pub tls_handshake_timeout: Duration,
@@ -39,7 +71,7 @@ pub struct RuntimeConfig {
     pub http_max_headers: usize,
     /// maximum HTTP/1 buffer and multiplexed HTTP field section size.
     pub http_max_buffer: usize,
-    /// maximum concurrent HTTP/2 streams and QUIC bidirectional streams.
+    /// maximum concurrent HTTP/2 streams.
     pub http2_max_concurrent_streams: u32,
 }
 
@@ -47,12 +79,33 @@ impl RuntimeConfig {
     /// use the default connection limits and disable downstream HTTP/3.
     pub fn new(workers: NonZeroUsize) -> Self {
         Self {
-            http3: false,
-            http3_advertised_port: None,
+            tcp: TcpConfig {
+                backlog: 1024,
+                nodelay: true,
+                // leave both buffers unlocked for linux TCP auto-tuning.
+                buffers: SocketBuffers::default(),
+                connect_timeout: Duration::from_secs(10),
+            },
+            udp: UdpConfig {
+                buffers: SocketBuffers {
+                    recv: Some(2 * 1024 * 1024),
+                    send: Some(2 * 1024 * 1024),
+                },
+                idle_timeout: Duration::from_secs(30),
+            },
+            quic: QuicConfig {
+                enabled: false,
+                advertised_port: None,
+                buffers: SocketBuffers {
+                    recv: Some(4 * 1024 * 1024),
+                    send: Some(4 * 1024 * 1024),
+                },
+                max_concurrent_bidi_streams: 128,
+                idle_timeout: Duration::from_secs(30),
+            },
             workers,
             downstream_connections_global: NonZeroUsize::new(1024).unwrap(),
             upstream_connections_per_worker: NonZeroUsize::new(1024).unwrap(),
-            tcp_connect_timeout: Duration::from_secs(10),
             upstream_idle_timeout: Duration::from_secs(30),
             tls_handshake_timeout: Duration::from_secs(10),
             connection_drain_timeout: Duration::from_secs(5),
@@ -73,12 +126,12 @@ impl RuntimeConfig {
             Some(count) => count,
             None => std::thread::available_parallelism()?,
         });
-        config.http3 = match env::var("WEICHE_HTTP3").as_deref() {
+        config.quic.enabled = match env::var("WEICHE_HTTP3").as_deref() {
             Ok("true" | "1") => true,
             Ok("false" | "0") | Err(VarError::NotPresent) => false,
             _ => anyhow::bail!("WEICHE_HTTP3 must be true, 1, false or 0"),
         };
-        config.http3_advertised_port =
+        config.quic.advertised_port =
             setting("WEICHE_HTTP3_PORT", "invalid WEICHE_HTTP3_PORT")?;
         config.validate()?;
         Ok(config)
@@ -87,9 +140,31 @@ impl RuntimeConfig {
     /// check parser, listener and drain limits before starting the workers.
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            self.http3_advertised_port != Some(0),
+            self.quic.advertised_port != Some(0),
             "WEICHE_HTTP3_PORT must be positive"
         );
+        ensure!(self.tcp.backlog > 0, "tcp backlog must be positive");
+        ensure!(
+            self.quic.max_concurrent_bidi_streams > 0,
+            "quic stream limit must be positive"
+        );
+        ensure!(
+            self.quic.idle_timeout.as_millis() > 0
+                && compio::quic::IdleTimeout::try_from(self.quic.idle_timeout).is_ok(),
+            "quic idle timeout must fit a positive QUIC millisecond interval"
+        );
+        for (protocol, buffers) in [
+            ("tcp", self.tcp.buffers),
+            ("udp", self.udp.buffers),
+            ("quic", self.quic.buffers),
+        ] {
+            for (direction, size) in [("receive", buffers.recv), ("send", buffers.send)] {
+                ensure!(
+                    size.is_none_or(|n| (1..=i32::MAX as usize).contains(&n)),
+                    "{protocol} {direction} buffer size must fit a positive socket option"
+                );
+            }
+        }
         ensure!(
             self.http_max_headers > 0
                 && (8192..=u32::MAX as usize).contains(&self.http_max_buffer)
@@ -98,7 +173,8 @@ impl RuntimeConfig {
         );
         for (timeout, message) in [
             (self.listener_retry_interval, "listener retry interval must be positive"),
-            (self.tcp_connect_timeout, "tcp connect timeout must be positive"),
+            (self.tcp.connect_timeout, "tcp connect timeout must be positive"),
+            (self.udp.idle_timeout, "udp idle timeout must be positive"),
         ] {
             ensure!(!timeout.is_zero(), message);
         }

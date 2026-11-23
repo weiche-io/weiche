@@ -34,7 +34,7 @@ pub struct AcceptedTls {
 impl AcceptedTls {
     /// read a ClientHello over io_uring before choosing a server configuration.
     pub async fn accept(stream: TcpStream) -> io::Result<Self> {
-        let mut transport = Transport::new(stream)?;
+        let mut transport = Transport::new(stream);
         let mut acceptor = Acceptor::default();
         loop {
             poll_fn(|cx| transport.poll_input(cx)).await?;
@@ -71,7 +71,7 @@ impl TlsIo {
         name: ServerName<'static>,
         config: Arc<ClientConfig>,
     ) -> io::Result<Self> {
-        let transport = Transport::new(stream)?;
+        let transport = Transport::new(stream);
         let conn = ClientConnection::new(config, name).map_err(tls_error)?;
         Self::handshake(transport, conn.into()).await
     }

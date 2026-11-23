@@ -1,7 +1,11 @@
 //! worker-local connection capacity, endpoint generations and response leases.
 
 use super::{
-    super::{super::ir::Protocol, admission::EndpointKey, config::RuntimeConfig},
+    super::{
+        super::ir::Protocol,
+        admission::EndpointKey,
+        config::{RuntimeConfig, TcpConfig},
+    },
     http1::{Idle, Lease},
     http2::{Http2Connection, Http2Lease},
 };
@@ -110,6 +114,8 @@ pub struct ConnectionPool {
     endpoints: RefCell<HashMap<EndpointKey, Rc<Endpoint>>>,
     /// maximum simultaneous socket reservations.
     limit: usize,
+    /// connection settings for new backend sockets.
+    pub tcp: TcpConfig,
     /// maximum active streams per HTTP/2 connection.
     pub max_streams: usize,
     /// maximum idle age before a connection expires.
@@ -130,6 +136,7 @@ impl ConnectionPool {
         let pool = Rc::new(Self {
             endpoints: RefCell::new(HashMap::new()),
             limit: config.upstream_connections_per_worker.get(),
+            tcp: config.tcp,
             max_streams: config.http2_max_concurrent_streams as usize,
             idle_timeout: config.upstream_idle_timeout,
             max_buffer: config.http_max_buffer,

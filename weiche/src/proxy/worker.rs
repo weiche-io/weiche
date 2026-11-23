@@ -11,7 +11,7 @@ use super::{
     stopped,
 };
 use compio::runtime::time::sleep;
-use futures::{StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     io,
@@ -103,7 +103,7 @@ impl Listeners {
 
         let changed = self.revision.replace(snapshot.revision) != Some(snapshot.revision);
         let retry_quic =
-            worker.runtime.http3 && self.reconcile_http3(worker, gateway, changed);
+            worker.runtime.quic.enabled && self.reconcile_http3(worker, gateway, changed);
         // release obsolete stream routes before binding replacement passthrough sockets.
         retain(&mut self.streams, &gateway.streams, |active, next| {
             active.gateway_uid == next.gateway_uid
@@ -117,7 +117,7 @@ impl Listeners {
             &gateway.tls,
             update,
             |address, socket| {
-                let listener = tcp::listen(address)?;
+                let listener = tcp::listen(address, &worker.runtime.tcp, worker.id)?;
                 let (tx, rx) = watch::channel(socket.clone());
                 Ok((tx, tcp::serve(worker, listener, rx, tcp::passthrough)))
             },
@@ -132,9 +132,21 @@ impl Listeners {
                 let (route, rx) = watch::channel(next.route.clone());
                 let task = match transport {
                     Transport::Tcp => {
-                        tcp::serve(worker, tcp::listen(address)?, rx, tcp::forward)
+                        let listener =
+                            tcp::listen(address, &worker.runtime.tcp, worker.id)?;
+                        tcp::serve(worker, listener, rx, tcp::forward)
                     }
-                    Transport::Udp => udp::bind(worker, address, rx)?,
+                    Transport::Udp => {
+                        let listener =
+                            worker.group.bind_udp(address, worker.id, &worker.runtime)?;
+                        udp::serve(
+                            listener,
+                            rx,
+                            worker.admission.clone(),
+                            worker.runtime.udp.idle_timeout,
+                        )
+                        .boxed_local()
+                    }
                 };
                 Ok((
                     StreamListener { gateway_uid: next.gateway_uid.clone(), route },

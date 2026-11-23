@@ -130,7 +130,7 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
     let (listeners, state) = ListenerGroup::new(policy.workers.get());
     let (stop, shutdown) = channel(false);
     let mut threads = Threads { stop, handles: Vec::new() };
-    let http3 = policy.http3;
+    let http3 = policy.quic.enabled;
     let watch_stop = shutdown.clone();
     threads.spawn("weiche-proxy-watch".into(), move || {
         tokio::runtime::Builder::new_current_thread()

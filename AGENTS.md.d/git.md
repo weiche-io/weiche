@@ -6,5 +6,5 @@ diffs should be roughly from 20 lines to 200 lines.
 
 don't record benchmark results.
 
-write commit message like the linux kernel folks. however never merge, only
-rebase.
+write commit message like the linux kernel folks with hard linewrap. however
+never merge, only rebase.

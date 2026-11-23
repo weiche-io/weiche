@@ -90,8 +90,9 @@ impl Listener {
         address: SocketAddr,
         http: &HttpListener,
     ) -> io::Result<(Self, Task)> {
-        let runtime = &worker.runtime;
-        let (socket, reader) = worker.datagram(address, true)?;
+        let quic = &worker.runtime.quic;
+        let (socket, reader) =
+            worker.group.bind_quic(address, worker.id, quic.buffers)?;
         let certificates = Arc::new(Certificates::default());
         let binding = http.binding.clone();
         certificates.update(&http.certs.borrow());
@@ -105,9 +106,9 @@ impl Listener {
         let mut config = ServerConfig::with_crypto(Arc::new(crypto));
         let mut transport = TransportConfig::default();
         transport
-            .max_concurrent_bidi_streams(runtime.http2_max_concurrent_streams.into())
+            .max_concurrent_bidi_streams(quic.max_concurrent_bidi_streams.into())
             .max_idle_timeout(Some(
-                runtime.upstream_idle_timeout.try_into().map_err(io::Error::other)?,
+                quic.idle_timeout.try_into().map_err(io::Error::other)?,
             ))
             .datagram_receive_buffer_size(None);
         config.transport_config(Arc::new(transport));
@@ -119,10 +120,7 @@ impl Listener {
         let endpoint = Endpoint::new(socket, endpoint, Some(config), None)?;
         let (stop, shutdown) = watch::channel(false);
         let service = worker.server.service.clone();
-        service.set_http3(
-            &binding,
-            Some(runtime.http3_advertised_port.unwrap_or(binding.port)),
-        );
+        service.set_http3(&binding, Some(quic.advertised_port.unwrap_or(binding.port)));
         let task = serve(endpoint, worker.clone(), binding.clone(), shutdown, reader);
         Ok((Self { binding, service, certificates, _stop: stop }, task.boxed_local()))
     }
