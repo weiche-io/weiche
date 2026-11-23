@@ -47,7 +47,7 @@ pub struct Upload {
 
 impl Upload {
     /// signal the response writer separately from the body error delivered to Hyper.
-    pub(super) fn new(
+    pub fn new(
         stream: RequestStream<RecvStream, Bytes>,
         length: ContentLength,
     ) -> (Self, oneshot::Receiver<()>) {
