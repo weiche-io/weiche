@@ -32,9 +32,9 @@ backends. The runner executes inside the kind node to reach their cluster IPs.
 = Read the report <report>
 
 The suite prints each test result. Make copies its YAML report to
-`target/conformance/report.yaml` and removes the temporary cluster. On a pull
-request, the same report is available as the `gateway-api-conformance` workflow
-artifact.
+`target/conformance/report.yaml` and removes the temporary cluster. Pull request
+and release workflows upload a report for each architecture as
+`gateway-api-report-amd64` and `gateway-api-report-arm64`.
 
 = Current scope <current-scope>
 
