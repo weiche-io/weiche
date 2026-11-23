@@ -50,43 +50,36 @@ pub fn listener_tls(
     listener: &GatewayListeners,
 ) -> Result<Option<Arc<ServerTls>>, TlsError> {
     let invalid = |message| TlsError::new("InvalidCertificateRef", message);
+    let fail = |reason, message| Err(TlsError::new(reason, message));
+    let hostname = listener.hostname.as_deref().unwrap_or_default();
     let tls = match (listener.protocol.as_str(), &listener.tls) {
         ("TLS", Some(tls)) if passthrough(listener) => {
             if tls.options.as_ref().is_some_and(|options| !options.is_empty()) {
-                return Err(TlsError::new(
-                    "UnsupportedValue",
-                    "unsupported passthrough TLS options",
-                ));
+                return fail("UnsupportedValue", "unsupported passthrough TLS options");
             }
             // the gateway API ignores certificateRefs in passthrough mode.
             return Ok(None);
         }
         ("TLS", _) => {
-            return Err(TlsError::new(
-                "UnsupportedValue",
-                "TLS listeners require passthrough mode",
-            ));
+            return fail("UnsupportedValue", "TLS listeners require passthrough mode");
+        }
+        ("TCP" | "UDP", None) if hostname.is_empty() => return Ok(None),
+        ("TCP" | "UDP", _) => {
+            return fail(
+                "Invalid",
+                "raw transport listeners require an empty hostname and no TLS configuration",
+            );
         }
         ("HTTP", None) => return Ok(None),
         ("HTTPS", Some(tls)) => tls,
         ("HTTPS", None) => return Err(invalid("HTTPS requires a certificate reference")),
-        ("HTTP", Some(_)) => {
-            return Err(TlsError::new("Invalid", "HTTP does not accept TLS settings"));
-        }
-        _ => {
-            return Err(TlsError::new(
-                "UnsupportedProtocol",
-                "unsupported gateway listener protocol",
-            ));
-        }
+        ("HTTP", Some(_)) => return fail("Invalid", "HTTP does not accept TLS settings"),
+        _ => return fail("UnsupportedProtocol", "unsupported gateway listener protocol"),
     };
     if matches!(tls.mode, Some(GatewayListenersTlsMode::Passthrough))
         || tls.options.as_ref().is_some_and(|options| !options.is_empty())
     {
-        return Err(TlsError::new(
-            "Invalid",
-            "HTTPS requires TLS termination with default options",
-        ));
+        return fail("Invalid", "HTTPS requires TLS termination with default options");
     }
     let [reference] = tls.certificate_refs.as_deref().unwrap_or_default() else {
         return Err(invalid("HTTPS requires one TLS Secret reference"));
@@ -98,10 +91,10 @@ pub fn listener_tls(
         return Err(invalid("certificate reference must name a core Secret"));
     }
     if !stores.permits(namespace, "Gateway", target, kind, &reference.name) {
-        return Err(TlsError::new(
+        return fail(
             "RefNotPermitted",
             "certificate reference requires a ReferenceGrant in the Secret namespace",
-        ));
+        );
     }
     let secret = stores
         .secrets
@@ -113,17 +106,11 @@ pub fn listener_tls(
         .ok_or_else(|| {
             invalid("referenced TLS Secret is missing or has the wrong type")
         })?;
-    let field = |name| {
-        secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(name))
-            .map(|bytes| bytes.0.as_slice())
-    };
+    let field = |name: &str| Some(secret.data.as_ref()?.get(name)?.0.as_slice());
     let cert =
         field("tls.crt").ok_or_else(|| invalid("TLS Secret is missing tls.crt"))?;
     let key = field("tls.key").ok_or_else(|| invalid("TLS Secret is missing tls.key"))?;
-    ServerTls::from_pem(listener.hostname.as_deref().unwrap_or(""), cert, key)
+    ServerTls::from_pem(hostname, cert, key)
         .map(|tls| Some(Arc::new(tls)))
         .map_err(|_| invalid("invalid certificate chain or mismatched private key"))
 }

@@ -1,234 +1,164 @@
-//! consume this gateway's snapshot and acknowledge it after all local workers bind.
-use super::{
-    ir::{
-        GatewaySnapshot, Transport,
-        wire::{self, SNAPSHOT_KEY},
-    },
-    routing,
-    stream::{down::WorkerGroupState, stopped},
-};
-use anyhow::{Context, ensure};
-use futures::{StreamExt, pin_mut};
-use k8s_openapi::api::{
-    core::v1::{ConfigMap, Secret},
-    rbac::v1::RoleBinding,
-};
-use kube::{
-    Api, Client, ResourceExt,
-    api::{Patch, PatchParams},
-    runtime::{
-        WatchStreamExt,
-        reflector::{self, ObjectRef},
-        watcher,
-    },
-};
-use serde_json::json;
-use std::{collections::BTreeSet, fs, io, net::SocketAddr, time::Duration};
-use tokio::sync::watch;
+//! supervise the gateway watch and its worker-local compio data planes.
+pub mod admission;
+pub mod config;
+pub mod http;
+mod io;
+pub mod net;
+mod up;
+mod watch;
+mod worker;
 
-/// readiness marker containing the last applied snapshot digest.
-const READY: &str = "/run/weiche/ready";
+use super::ir::GatewaySnapshot;
+use admission::Admission;
+use anyhow::Context;
+use compio::{driver::ProactorBuilder, runtime::Runtime};
+use config::RuntimeConfig;
+use net::ListenerGroup;
+use std::{mem::DropGuard, sync::Arc, thread};
+use tokio::sync::{
+    oneshot,
+    watch::{Receiver, Sender, channel},
+};
+pub use watch::ready;
 
-/// kubelet exec probe, including the applied configuration digest for diagnostics.
-pub fn ready() -> anyhow::Result<()> {
-    println!("{}", fs::read_to_string(READY).context("listeners pending")?);
-    Ok(())
-}
-
-/// withdraw the readiness marker until all workers acknowledge the new revision.
-fn pending() -> io::Result<()> {
-    match fs::remove_file(READY) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
+/// build a thread-local compio io_uring runtime tuned for one worker thread.
+pub fn runtime() -> std::io::Result<Runtime> {
+    let mut proactor = ProactorBuilder::new();
+    proactor
+        .capacity(4096)
+        .single_issuer(true)
+        .defer_taskrun(true)
+        .coop_taskrun(true);
+    match Runtime::builder().with_proactor(proactor).build() {
+        Ok(rt) => Ok(rt),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            tracing::warn!(%error, "tuned io_uring flags unsupported, falling back to defaults");
+            Runtime::new()
+        }
+        Err(error) => Err(error),
     }
 }
 
-/// snapshot identity and exact set of sockets that every worker must bind.
-struct Desired {
-    /// digest used to acknowledge this snapshot to the controller.
-    version: String,
-    /// local publication sequence reported by workers.
-    revision: usize,
-    /// expected transport and address pairs.
-    sockets: BTreeSet<(Transport, SocketAddr)>,
+/// wait for process shutdown or the shutdown sender to close.
+pub async fn stopped(mut shutdown: Receiver<bool>) {
+    if !*shutdown.borrow_and_update() {
+        let _ = shutdown.changed().await;
+    }
 }
 
-impl Desired {
-    /// decode the snapshot and publish its listener configuration to the workers.
-    fn apply(
-        secret: &Secret,
-        tx: &mut routing::Writer,
-        http3: bool,
-    ) -> anyhow::Result<Self> {
-        ensure!(
-            secret.type_.as_deref() == Some("weiche.io/snapshot"),
-            "unexpected snapshot Secret type"
-        );
-        let bytes = &secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(SNAPSHOT_KEY))
-            .context("missing snapshot payload")?
-            .0;
-        let snapshot = GatewaySnapshot::decode(bytes)?;
-        let sockets = snapshot
-            .streams
-            .keys()
-            .copied()
-            .chain(
-                snapshot
-                    .sockets
-                    .keys()
-                    .chain(snapshot.tls.keys())
-                    .map(|addr| (Transport::Tcp, *addr)),
-            )
-            .chain(
-                snapshot
-                    .sockets
+/// completion signal and result of one supervised OS thread.
+struct ProxyThread {
+    /// wakes the caller's runtime when the thread exits or unwinds.
+    finished: oneshot::Receiver<()>,
+    /// retains the result or panic until the supervisor joins.
+    handle: thread::JoinHandle<anyhow::Result<()>>,
+}
+
+/// threads that share a shutdown signal with the worker on the caller's runtime.
+struct Threads {
+    /// stopping any member wakes the entire group.
+    stop: Sender<bool>,
+    /// join every started thread, including after a partial startup failure.
+    handles: Vec<ProxyThread>,
+}
+
+impl Threads {
+    /// signal the group on return or unwind and retain the result for the supervisor.
+    fn spawn(
+        &mut self,
+        name: String,
+        run: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let stop = self.stop.clone();
+        let (done, finished) = oneshot::channel();
+        let handle = thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || {
+                let _on_exit = DropGuard::new((stop, done), |(stop, done)| {
+                    stop.send_replace(true);
+                    let _ = done.send(());
+                });
+                run()
+            })
+            .with_context(|| format!("spawn {name}"))?;
+        self.handles.push(ProxyThread { finished, handle });
+        Ok(())
+    }
+
+    /// request shutdown, join all threads and report each failure with its origin.
+    async fn join(mut self, local: anyhow::Result<()>) -> anyhow::Result<()> {
+        self.stop.send_replace(true);
+        let mut errors: Vec<_> = local.err().into_iter().collect();
+        for ProxyThread { finished, handle } in self.handles.drain(..) {
+            // keep driving worker zero's runtime while other workers drain.
+            let _ = finished.await;
+            let name = handle.thread().name().unwrap_or("proxy thread").to_owned();
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")));
+            if let Err(error) = result.context(name) {
+                errors.push(error);
+            }
+        }
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.pop().unwrap()),
+            _ => anyhow::bail!(
+                "{}",
+                errors
                     .iter()
-                    .filter(|(_, s)| http3 && !s.listener.tls.is_empty())
-                    .map(|(addr, _)| (Transport::Udp, *addr)),
-            )
-            .collect::<BTreeSet<_>>();
-        if sockets.is_empty() {
-            tracing::info!(secret = %secret.name_any(), "snapshot has no active listeners; proxy readiness withdrawn");
+                    .map(|error| format!("{error:#}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         }
-        Ok(Self {
-            version: wire::version(bytes),
-            revision: tx.publish(snapshot),
-            sockets,
-        })
-    }
-
-    /// check every expected socket against its worker acknowledgements.
-    fn applied(&self, workers: &WorkerGroupState) -> bool {
-        !self.sockets.is_empty()
-            && self
-                .sockets
-                .iter()
-                .all(|&socket| workers.programmed(self.revision, socket))
     }
 }
 
-/// default RoleBinding and ClusterRole name granting namespace authorization.
-const DEFAULT_PROVISIONER_BINDING: &str = "weiche-gateway-provisioner";
-
-/// a withdrawn Helm namespace binding also withdraws permission to serve cached routes.
-async fn authorized(
-    bindings: &Api<RoleBinding>,
-    binding_name: &str,
-) -> anyhow::Result<bool> {
-    match bindings.get_opt(binding_name).await {
-        Ok(binding) => Ok(binding.is_some_and(|b| {
-            b.role_ref.kind == "ClusterRole" && b.role_ref.name == binding_name
-        })),
-        Err(kube::Error::Api(e)) if e.code == 403 => Ok(false),
-        Err(e) => Err(e.into()),
+impl Drop for Threads {
+    /// wake the watch and workers if the caller drops the supervisor future.
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
     }
 }
 
-/// watch only the named Secret; transient API errors leave the last valid snapshot serving.
-pub async fn run(
-    name: String,
-    http3: bool,
-    mut tx: routing::Writer,
-    mut workers: watch::Receiver<WorkerGroupState>,
-    stop: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    pending()?;
-    let client = Client::try_default().await?;
-    let ns = client.default_namespace();
-    let pod = std::env::var("POD_UID").context("missing pod UID")?;
-    let binding_name = std::env::var("WEICHE_PROVISIONER_BINDING")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_PROVISIONER_BINDING.to_owned());
-    let bindings = Api::<RoleBinding>::namespaced(client.clone(), ns);
-    ensure!(
-        authorized(&bindings, &binding_name).await?,
-        "gateway namespace authorization withdrawn"
-    );
-    let reports = Api::<ConfigMap>::namespaced(client.clone(), ns);
-    let secrets = Api::<Secret>::namespaced(client.clone(), ns);
-    let (store, writer) = reflector::store();
-    let stream = reflector::reflector(
-        writer,
-        watcher(
-            secrets,
-            watcher::Config::default().fields(&format!("metadata.name={name}")),
-        ),
-    )
-    .default_backoff();
-    pin_mut!(stream);
-    let secret_ref = ObjectRef::new(&name).within(ns);
-    let mut desired: Option<Desired> = None;
-    let mut local = None;
-    let mut reported = None;
-    let mut refresh_due = false;
-    let mut refresh = tokio::time::interval(Duration::from_secs(15));
-    let shutdown = super::shutdown();
-    let stop = stopped(stop);
-    tokio::pin!(stop, shutdown);
-    loop {
-        let applied = desired
-            .as_ref()
-            .filter(|d| d.applied(&workers.borrow()))
-            .map(|d| d.version.clone());
-        if local != applied {
-            if let Some(version) = &applied {
-                fs::write("/run/weiche/ready.tmp", version)?;
-                fs::rename("/run/weiche/ready.tmp", READY)?;
-            } else {
-                pending()?;
-            }
-            local.clone_from(&applied);
-        }
-        if reported != applied || (refresh_due && applied.is_some()) {
-            refresh_due = false;
-            let patch = json!({"data":{(&pod):applied}});
-            match reports
-                .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-                .await
-            {
-                Ok(_) => reported = applied,
-                Err(e) => tracing::warn!(error=%e, "could not acknowledge snapshot"),
-            }
-        }
-        tokio::select! {
-            _ = &mut shutdown => break,
-            _ = &mut stop => break,
-            change = workers.changed() => { change.context("worker reports stopped")?; }
-            _ = refresh.tick() => {
-                match authorized(&bindings, &binding_name).await {
-                    Ok(false) => { tracing::info!("gateway namespace authorization withdrawn"); break; }
-                    Ok(true) => refresh_due = true,
-                    Err(error) => tracing::warn!(%error, "could not refresh namespace authorization"),
-                }
-            }
-            event = stream.next() => match event.context("snapshot watch stopped")? {
-                Ok(
-                    watcher::Event::Apply(_)
-                    | watcher::Event::Delete(_)
-                    | watcher::Event::InitDone,
-                ) => match store.get(&secret_ref) {
-                    Some(secret) => match Desired::apply(&secret, &mut tx, http3) {
-                        Ok(next) => desired = Some(next),
-                        Err(e) => {
-                            tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot");
-                            desired = None;
-                            tx.publish(GatewaySnapshot::default());
-                        }
-                    },
-                    None => {
-                        desired = None;
-                        tx.publish(GatewaySnapshot::default());
-                    }
-                },
-                Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
-                Err(e) => tracing::warn!(error = %e, "snapshot watch interrupted"),
-            }
+/// start the watch on Tokio, run worker zero locally and join the other compio workers.
+pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
+    policy.validate()?;
+    let policy = Arc::new(policy);
+    let (writer, reader) = config::channel(GatewaySnapshot::default());
+    let (listeners, state) = ListenerGroup::new(policy.workers.get());
+    let (stop, shutdown) = channel(false);
+    let mut threads = Threads { stop, handles: Vec::new() };
+    let http3 = policy.http3;
+    let watch_stop = shutdown.clone();
+    threads.spawn("weiche-proxy-watch".into(), move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("create control-plane Tokio runtime")?
+            .block_on(watch::run(name, http3, writer, state, watch_stop))
+    })?;
+
+    let listeners = Arc::new(listeners);
+    let admission = Arc::new(Admission::new(policy.downstream_connections_global.get()));
+    for id in 1..policy.workers.get() {
+        // construct the worker-local future on its owning runtime.
+        let config = reader.clone();
+        let policy = policy.clone();
+        let admission = admission.clone();
+        let listeners = listeners.clone();
+        let stop = shutdown.clone();
+        let started = threads.spawn(format!("weiche-worker-{id}"), move || {
+            let io = runtime().context("create worker compio runtime")?;
+            tracing::info!(worker = id, driver = ?io.driver_type(), "starting compio worker");
+            io.block_on(worker::run(id, config, policy, admission, listeners, stop))
+        });
+        if started.is_err() {
+            return threads.join(started).await;
         }
     }
-    pending()?;
-    Ok(())
+    let result =
+        worker::run(0, reader, policy, admission, listeners.clone(), shutdown).await;
+    threads.join(result.context("worker 0")).await
 }

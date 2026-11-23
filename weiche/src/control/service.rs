@@ -4,6 +4,7 @@ use super::{
         GatewaySnapshot, Listener, SocketRoutes, StreamListener, TlsSocket, Transport,
     },
     Compiled, GatewayStores, compile,
+    config::Settings,
 };
 use kube::ResourceExt;
 use std::{
@@ -49,13 +50,21 @@ pub struct Plan {
 
 impl Plan {
     /// start a plan for the observed gateway.
-    pub fn new(gateway: Arc<Gateway>) -> Self {
+    pub fn new(gateway: Arc<Gateway>, settings: &Settings) -> Self {
+        let denied =
+            !settings.namespaces.contains(&gateway.namespace().unwrap_or_default());
+        let invalid_parameters = !denied
+            && gateway
+                .spec
+                .infrastructure
+                .as_ref()
+                .is_some_and(|i| i.parameters_ref.is_some());
         Self {
             gateway,
             addresses: vec![],
             programmed: false,
-            denied: false,
-            invalid_parameters: false,
+            denied,
+            invalid_parameters,
             issue_reason: None,
             issue: None,
             listeners: vec![],
@@ -63,17 +72,14 @@ impl Plan {
     }
 
     /// group eligible routes by socket and listener hostname.
-    pub fn compile(
-        stores: &GatewayStores,
-        gateway: Arc<Gateway>,
-        bind: IpAddr,
-    ) -> (Self, GatewaySnapshot) {
+    pub fn compile(&mut self, stores: &GatewayStores, bind: IpAddr) -> GatewaySnapshot {
+        let gateway = &self.gateway;
         let uid = gateway.uid().unwrap_or_default();
         let mut snapshot = GatewaySnapshot::default();
-        let mut listeners = Vec::new();
+        self.listeners.clear();
         for listener in &gateway.spec.listeners {
             let address = SocketAddr::new(bind, listener.port);
-            let mut result = compile(stores, &gateway, listener, address);
+            let mut result = compile(stores, gateway, listener);
             if result.accepted {
                 if matches!(listener.protocol.as_str(), "TCP" | "UDP") {
                     snapshot.streams.insert(
@@ -117,10 +123,10 @@ impl Plan {
                     socket.routes.append(&mut result.routes);
                 }
             }
-            listeners.push(result);
+            self.listeners.push(result);
         }
         snapshot.order_certificates();
-        (Self { listeners, ..Self::new(gateway) }, snapshot)
+        snapshot
     }
 
     /// check that the gateway is eligible and has at least one accepted listener.
@@ -131,7 +137,7 @@ impl Plan {
     }
 
     /// expose each accepted port once across virtual hosts sharing a transport.
-    pub fn ports(&self, http3: bool) -> Vec<serde_json::Value> {
+    pub fn ports(&self, http3: bool) -> Vec<(Transport, u16)> {
         let mut ports = BTreeSet::new();
         for (listener, result) in self
             .gateway
@@ -146,12 +152,6 @@ impl Plan {
                 ports.insert((Transport::Udp, listener.port));
             }
         }
-        ports.into_iter().map(|(transport, port)| {
-            let protocol = transport.protocol();
-            serde_json::json!({
-                "name": format!("{}-{port}", protocol.to_ascii_lowercase()), "port":port,
-                "protocol":protocol, "targetPort":port,
-            })
-        }).collect()
+        ports.into_iter().collect()
     }
 }
