@@ -11,6 +11,10 @@ controller:
       cpu: 10m
       memory: 32Mi
 proxy:
+  # keep one ring per proxy on kernels that charge io_uring queues to the shared uid.
+  extraEnv:
+    - name: WEICHE_WORKERS
+      value: "1"
   resources:
     requests:
       cpu: 10m
