@@ -4,18 +4,15 @@ mod upload;
 
 use super::super::{
     super::ir::Binding,
-    admission::Permit,
-    config::RuntimeConfig,
     http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
-    stopped,
 };
 use bytes::Bytes;
 use compio::{
     quic::{
-        Connection, Incoming,
+        Connection,
         h3::{
             self,
-            error::Code,
+            error::{Code, ConnectionError},
             server::{RequestResolver, RequestStream},
         },
     },
@@ -25,63 +22,65 @@ use fields::ContentLength;
 use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
 use http::{Method, Response, StatusCode};
 use http_body_util::BodyExt;
-use std::net::SocketAddr;
-use tokio::sync::watch;
+use std::{net::SocketAddr, time::Duration};
 pub use upload::Upload;
 
-/// keep the permit through TLS negotiation, concurrent requests and graceful drain.
-pub async fn serve(
-    incoming: Incoming,
-    service: &ProxyService,
-    binding: &Binding,
-    config: &RuntimeConfig,
-    _permit: Permit,
-    shutdown: watch::Receiver<bool>,
-) {
-    let mut stopping = std::pin::pin!(stopped(shutdown));
-    let handshake = async {
-        let transport = incoming.await?;
-        let conn = h3::server::builder()
-            .max_field_section_size(config.http_max_buffer as u64)
+/// established HTTP/3 control streams and their underlying QUIC connection.
+pub struct Session {
+    /// accepts request streams and sends GOAWAY during drain.
+    http: h3::server::Connection<Connection, Bytes>,
+    /// supplies the current peer address and waits for outstanding sends at shutdown.
+    transport: Connection,
+}
+
+impl Session {
+    /// open HTTP/3 control streams on a negotiated QUIC connection.
+    pub async fn new(
+        transport: Connection,
+        max_field_section_size: usize,
+    ) -> Result<Self, ConnectionError> {
+        let http = h3::server::builder()
+            .max_field_section_size(max_field_section_size as u64)
             .build(transport.clone())
             .await?;
-        Ok::<_, anyhow::Error>((transport, conn))
-    };
-    let (transport, mut conn) = tokio::select! {
-        biased;
-        _ = &mut stopping => return,
-        result = timeout(config.tls_handshake_timeout, handshake) => match result {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => { tracing::debug!(%error, "quic handshake failed"); return; }
-            Err(_) => { tracing::debug!("quic handshake timed out"); return; }
-        }
-    };
-    let mut requests = FuturesUnordered::new();
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stopping => break,
-            Some(()) = requests.next(), if !requests.is_empty() => {},
-            result = conn.accept() => match result {
-                Ok(Some(resolver)) => {
-                    let peer = transport.remote_address();
-                    requests.push(request(resolver, service, binding, peer).unwrap_or_else(move |error| {
-                        tracing::debug!(%peer, %error, "http/3 stream ended");
-                    }));
+        Ok(Self { http, transport })
+    }
+
+    /// serve independent requests until shutdown, then drain them under one deadline.
+    pub async fn serve(
+        mut self,
+        service: &ProxyService,
+        binding: &Binding,
+        mut stopping: impl Future<Output = ()> + Unpin,
+        drain_timeout: Duration,
+    ) {
+        let mut requests = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stopping => break,
+                Some(()) = requests.next(), if !requests.is_empty() => {},
+                result = self.http.accept() => match result {
+                    Ok(Some(resolver)) => {
+                        let peer = self.transport.remote_address();
+                        requests.push(request(resolver, service, binding, peer).unwrap_or_else(move |error| {
+                            tracing::debug!(%peer, %error, "http/3 stream ended");
+                        }));
+                    }
+                    Ok(None) => return,
+                    Err(error) => { tracing::debug!(%error, "http/3 connection ended"); return; }
                 }
-                Ok(None) => return,
-                Err(error) => { tracing::debug!(%error, "http/3 connection ended"); return; }
             }
         }
+        let _ = timeout(drain_timeout, async {
+            self.http.shutdown(0).await?;
+            while requests.next().await.is_some() {}
+            // a finished send stream can still have unacknowledged data on the wire.
+            self.transport.closed().await;
+            Ok::<_, ConnectionError>(())
+        })
+        .await;
     }
-    let _ = timeout(config.connection_drain_timeout, async {
-        conn.shutdown(0).await?;
-        while requests.next().await.is_some() {}
-        // a finished send stream can still have unacknowledged data on the wire.
-        transport.closed().await;
-        Ok::<_, h3::error::ConnectionError>(())
-    })
-    .await;
 }
 
 /// resolve one request and forward its upload and response independently.

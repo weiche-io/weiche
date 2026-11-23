@@ -14,8 +14,11 @@ fn valid_fields(headers: &HeaderMap) -> bool {
             .all(|v| v.as_bytes().eq_ignore_ascii_case(b"trailers"))
 }
 
-/// bytes still expected from DATA when the client supplied Content-Length.
-pub struct ContentLength(Option<u64>);
+/// validate a declared Content-Length through the final DATA frame.
+pub struct ContentLength(
+    /// remaining bytes, or None for an upload of unspecified length.
+    Option<u64>,
+);
 
 impl ContentLength {
     /// validate the initial fields before sending the request upstream.
