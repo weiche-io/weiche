@@ -10,6 +10,7 @@ data:
       server {
         listen 8080;
         listen [::]:8080;
+        add_header X-Bench-Backend echo always;
         location = /echo { return 200 $arg_msg; }
       }
     }

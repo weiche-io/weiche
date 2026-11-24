@@ -10,6 +10,12 @@ data:
           entryPoints: [websecure]
           tls: {}
           service: echo
+          middlewares: [bench-route]
+      middlewares:
+        bench-route:
+          headers:
+            customResponseHeaders:
+              X-Bench-Route: bench
       services:
         echo:
           loadBalancer:

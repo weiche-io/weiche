@@ -18,4 +18,8 @@ spec:
   parentRefs: [{name: ${gateway}}]
   hostnames: [${gateway}.example.test]
   rules:
-    - backendRefs: [{name: echo, port: 8080}]
+    - filters:
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            set: [{name: X-Bench-Route, value: ${gateway}}]
+      backendRefs: [{name: echo, port: 8080}]

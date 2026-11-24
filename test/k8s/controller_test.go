@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -96,7 +97,7 @@ func awaitLeader(t *testing.T, replicas int, retired string) leader {
 	return leader{}
 }
 
-type endpoint struct{ ip, host string }
+type endpoint struct{ ip, host, route string }
 
 var client = http.Client{
 	Timeout:       3 * time.Second,
@@ -104,14 +105,14 @@ var client = http.Client{
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
 
-func (e endpoint) probe() error {
+func (e endpoint) probe(c *http.Client) error {
 	msg := e.host + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	req, err := http.NewRequest("GET", "http://"+net.JoinHostPort(e.ip, "80")+"/echo?msg="+msg, nil)
 	if err != nil {
 		return err
 	}
 	req.Host = e.host
-	resp, err := client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
@@ -120,8 +121,9 @@ func (e endpoint) probe() error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != http.StatusOK || string(body) != msg {
-		return fmt.Errorf("%s via %s: %s, body %q", e.host, e.ip, resp.Status, body)
+	route, backend := resp.Header.Get("X-Bench-Route"), resp.Header.Get("X-Bench-Backend")
+	if resp.StatusCode != http.StatusOK || route != e.route || backend != "echo" || string(body) != msg {
+		return fmt.Errorf("%s via %s: %s, route %q, backend %q, body %q", e.host, e.ip, resp.Status, route, backend, body)
 	}
 	return nil
 }
@@ -132,7 +134,7 @@ func (e endpoint) await(t *testing.T) {
 	t.Helper()
 	var last error
 	for deadline, successes := time.Now().Add(time.Minute), 0; time.Now().Before(deadline); {
-		if last = e.probe(); last != nil {
+		if last = e.probe(&client); last != nil {
 			successes = 0
 			time.Sleep(time.Second)
 			continue
@@ -145,44 +147,62 @@ func (e endpoint) await(t *testing.T) {
 	t.Fatalf("route %s via %s did not converge: %v", e.host, e.ip, last)
 }
 
+func scaleControllers(t *testing.T, replicas int) {
+	t.Helper()
+	command(t, "helm", "upgrade", "weiche", "../../charts/weiche", "--reuse-values", "--set", fmt.Sprintf("controller.replicas=%d", replicas), "--wait", "--timeout=2m")
+}
+
 func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 	for _, e := range []endpoint{fixed, automatic} {
 		e.await(t)
 	}
 
-	// Keep eight clients per VIP for the entire run, including after a failure.
-	// Report the first error per VIP and count every subsequent failure.
-	stop := make(chan struct{})
-	var workers sync.WaitGroup
-	var probes [2]struct{ ok, failed atomic.Uint64 }
-	started := time.Now()
-	for i, e := range []endpoint{fixed, automatic} {
-		for range 8 {
-			workers.Go(func() {
-				for {
-					select {
-					case <-stop:
-						return
-					default:
-					}
-					if err := e.probe(); err != nil {
-						if probes[i].failed.Add(1) == 1 {
-							t.Errorf("interrupted forwarding to %s via %s: %v", e.host, e.ip, err)
-						}
-						continue
-					}
-					probes[i].ok.Add(1)
-				}
-			})
+	// Use the same mix and offered rate on both sides of the first Helm upgrade.
+	const rate = 100 // requests/s per VIP, alternating fresh and reusable connections
+	pooled := client
+	pooled.Transport = &http.Transport{MaxIdleConnsPerHost: 8}
+	defer pooled.CloseIdleConnections()
+	endpoints := []endpoint{fixed, automatic}
+	traffic := func(t *testing.T, ctx context.Context, window time.Duration, i int, ok, failed *atomic.Uint64) {
+		e := endpoints[i]
+		missed := fixedRate(ctx, rate, window, 8, func(slot int) error {
+			if slot%2 == 0 {
+				return e.probe(&client)
+			}
+			return e.probe(&pooled)
+		}, func(_ time.Duration, err error) {
+			if err == nil {
+				ok.Add(1)
+			} else if failed.Add(1) == 1 {
+				t.Errorf("%s via %s: %v", e.host, e.ip, err)
+			}
+		})
+		t.Logf("%s: ok=%d failed=%d missed=%d target=%d/s", e.host, ok.Load(), failed.Load(), missed, rate)
+		if missed > 0 {
+			t.Errorf("%s: runner missed %d scheduled requests", e.host, missed)
 		}
 	}
-	defer func() {
-		close(stop)
-		workers.Wait()
-		t.Logf("8 clients per VIP over %s: fixed ok=%d failed=%d; automatic ok=%d failed=%d", time.Since(started),
-			probes[0].ok.Load(), probes[0].failed.Load(), probes[1].ok.Load(), probes[1].failed.Load())
-	}()
 
+	if !t.Run("SingleReplicaBaseline", func(t *testing.T) {
+		awaitLeader(t, 1, "")
+		var workers sync.WaitGroup
+		for i := range endpoints {
+			workers.Go(func() {
+				traffic(t, t.Context(), 30*time.Second, i, new(atomic.Uint64), new(atomic.Uint64))
+			})
+		}
+		workers.Wait()
+	}) {
+		return
+	}
+
+	ctx, stop := context.WithCancel(t.Context())
+	var workers sync.WaitGroup
+	var probes [2]struct{ ok, failed atomic.Uint64 }
+	for i := range endpoints {
+		workers.Go(func() { traffic(t, ctx, 0, i, &probes[i].ok, &probes[i].failed) })
+	}
+	defer func() { stop(); workers.Wait() }()
 	var holder leader
 	var lastOK, lastFailed [2]uint64
 	for stage, replicas := range []int{1, 2, 3, 1} {
@@ -193,11 +213,11 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 				command(t, "kubectl", "annotate", "pod/"+holder.pod, "controller.kubernetes.io/pod-deletion-cost=-1000")
 				retired = holder.uid
 			}
-			command(t, "helm", "upgrade", "weiche", "../../charts/weiche", "--reuse-values", "--set", fmt.Sprintf("controller.replicas=%d", replicas), "--wait", "--timeout=2m")
+			scaleControllers(t, replicas)
 		}
 		holder = awaitLeader(t, replicas, retired)
 		// Only a working reconciler can serve this stage's new hostname.
-		fresh := endpoint{fixed.ip, fmt.Sprintf("stage-%d.example.test", stage)}
+		fresh := endpoint{fixed.ip, fmt.Sprintf("stage-%d.example.test", stage), fixed.route}
 		patch := fmt.Sprintf(`{"spec":{"hostnames":[%q,%q]}}`, fixed.host, fresh.host)
 		generation := command(t, "kubectl", "patch", "httproute/fixed", "--type=merge", "-p", patch, "-o=jsonpath={.metadata.generation}")
 		observed := `--for=jsonpath={.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}=` + strings.TrimSpace(string(generation))

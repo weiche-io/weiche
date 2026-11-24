@@ -78,8 +78,8 @@ func TestKubernetes(t *testing.T) {
 	command(t, "kubectl", "rollout", "status", "deployment/echo", "--timeout=2m")
 
 	// Claim the fixed VIP first, leaving exactly one IP for Cilium to assign.
-	fixed := endpoint{first.Next().String(), "fixed.example.test"}
-	automatic := endpoint{first.String(), "automatic.example.test"}
+	fixed := endpoint{first.Next().String(), "fixed.example.test", "fixed"}
+	automatic := endpoint{first.String(), "automatic.example.test", "automatic"}
 	for _, e := range []endpoint{fixed, automatic} {
 		name, _, _ := strings.Cut(e.host, ".")
 		addresses, request := "[]", ""
@@ -94,7 +94,13 @@ func TestKubernetes(t *testing.T) {
 			t.Fatalf("expected %s VIP %s, service reported %s", name, e.ip, got)
 		}
 	}
-	if t.Run("ControllerScaling", func(t *testing.T) { controllerScaling(t, fixed, automatic) }) {
-		t.Run("ProxyPerformance", func(t *testing.T) { compareProxies(t, dir, family, fixed.ip, automatic.ip) })
-	}
+	t.Run("ControllerScaling", func(t *testing.T) { controllerScaling(t, fixed, automatic) })
+	t.Run("ProxyPerformance", func(t *testing.T) {
+		// A failed scale-up may have left multiple controllers running.
+		if jsonpath(t, "deployment/weiche", "{.spec.replicas}") != "1" {
+			scaleControllers(t, 1)
+		}
+		awaitLeader(t, 1, "")
+		compareProxies(t, dir, family, fixed.ip, automatic.ip)
+	})
 }

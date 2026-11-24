@@ -3,10 +3,14 @@ package k8s
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -44,16 +48,26 @@ func compareProxies(t *testing.T, dir, family, weicheIP, traefikIP string) {
 	k("delete", "gateway/automatic", "--cascade=foreground", "--timeout=2m")
 	k("wait", "--for=delete", svc, "--timeout=2m")
 	k("patch", "gateway/fixed", "--type=json", "--patch-file=https-listener.json")
-	k("patch", "httproute/fixed", "--type=merge", "-p", `{"spec":{"parentRefs":[{"name":"fixed","sectionName":"websecure"}],"hostnames":["bench.example.test"]}}`)
+	k("patch", "httproute/fixed", "--type=json", "-p", `[
+		{"op":"add","path":"/spec/parentRefs/0/sectionName","value":"websecure"},
+		{"op":"replace","path":"/spec/hostnames","value":["bench.example.test"]},
+		{"op":"replace","path":"/spec/rules/0/filters/0/responseHeaderModifier/set/0/value","value":"bench"}]`)
 	// The echo Service is single-stack and has exactly one replica.
 	ip := k("get", "endpointslice", "-l", "kubernetes.io/service-name=echo", "-o=jsonpath={.items[0].endpoints[0].addresses[0]}")
 	apply(t, "traefik.yaml.in", map[string]string{"backend": net.JoinHostPort(ip, "8080"), "vip": traefikIP, "family": family})
 	k("rollout", "status", "deployment/traefik-bench", "--timeout=3m")
 	k("wait", "service/traefik-bench", "--for=jsonpath={.status.loadBalancer.ingress[0].ip}="+traefikIP, "--timeout=2m")
-	runComparison(t, roots, []string{net.JoinHostPort(weicheIP, "8443"), net.JoinHostPort(traefikIP, "8443")})
+	addrs := []string{net.JoinHostPort(weicheIP, "8443"), net.JoinHostPort(traefikIP, "8443")}
+	t.Run("PersistentConnections", func(t *testing.T) { runComparison(t, roots, addrs) })
+	for i, name := range []string{"Weiche", "Traefik"} {
+		t.Run("ShortConnections/"+name, func(t *testing.T) { shortConnections(t, roots, addrs[i]) })
+	}
 }
 
 var alpn = [...]string{"", "http/1.1", "h2", "h3"}
+
+// A bad protocol or incorrect successful payload always violates routing correctness.
+var errWrongResponse = errors.New("wrong proxy response")
 
 type benchClient struct {
 	*http.Client
@@ -76,11 +90,13 @@ func newBenchClient(roots *x509.CertPool, addr string, major int) benchClient {
 		tr := &http.Transport{TLSClientConfig: config, Protocols: p, DisableCompression: true, MaxConnsPerHost: 1}
 		client.Transport, closeTransport = tr, tr.CloseIdleConnections
 	}
-	return benchClient{client, closeTransport, major, "https://" + addr + "/echo?msg=" + benchPayload}
+	return benchClient{client, closeTransport, major, "https://" + addr + "/echo?msg="}
 }
 
-func (c benchClient) request() error {
-	req, err := http.NewRequest("GET", c.url, nil)
+func (c benchClient) request() error { return c.echo(benchPayload) }
+
+func (c benchClient) echo(payload string) error {
+	req, err := http.NewRequest("GET", c.url+url.QueryEscape(payload), nil)
 	if err != nil {
 		return err
 	}
@@ -98,8 +114,12 @@ func (c benchClient) request() error {
 	if resp.TLS != nil {
 		negotiated = resp.TLS.NegotiatedProtocol
 	}
-	if negotiated != alpn[c.major] || resp.ProtoMajor != c.major || resp.StatusCode != 200 || string(body) != benchPayload {
-		return fmt.Errorf("%s: expected %s, received %s (ALPN %q), %s, body %q", c.url, alpn[c.major], resp.Proto, negotiated, resp.Status, body)
+	route, backend := resp.Header.Get("X-Bench-Route"), resp.Header.Get("X-Bench-Backend")
+	if negotiated != alpn[c.major] || resp.ProtoMajor != c.major || (resp.StatusCode == 200 && (route != "bench" || backend != "echo" || string(body) != payload)) {
+		return fmt.Errorf("%w: expected %s and %q, got %s (ALPN %q), %s, route %q, backend %q, body %q", errWrongResponse, alpn[c.major], payload, resp.Proto, negotiated, resp.Status, route, backend, body)
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("%s: %s", c.url, resp.Status)
 	}
 	return nil
 }
@@ -213,14 +233,89 @@ func runComparison(t *testing.T, roots *x509.CertPool, addrs []string) {
 			}
 		}
 	}
+	writeSummary(t, summary.String())
+}
+
+func writeSummary(t *testing.T, text string) {
+	t.Helper()
 	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		if _, err := io.WriteString(f, summary.String()); err != nil {
+		if _, err := io.WriteString(f, text); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+// These are CI load targets, adjustable independently of the persistent-connection benchmark.
+var (
+	capacityRate         = flag.Int("capacity-rate", 200, "target fresh TLS connections per second per proxy")
+	capacityWindow       = flag.Duration("capacity-duration", 30*time.Second, "short-connection measurement window")
+	capacityErrorPercent = flag.Float64("capacity-error-percent", 0.1, "maximum percent of issued requests that may fail")
+	capacityP99          = flag.Duration("capacity-p99", 250*time.Millisecond, "maximum p99 latency of successful short connections")
+)
+
+func shortConnections(t *testing.T, roots *x509.CertPool, addr string) {
+	t.Helper()
+	if *capacityRate <= 0 || *capacityRate > int(time.Second) || *capacityWindow < time.Second ||
+		*capacityErrorPercent < 0 || *capacityErrorPercent > 100 || math.IsNaN(*capacityErrorPercent) || *capacityP99 <= 0 {
+		t.Fatal("invalid short-connection load targets")
+	}
+	c := newBenchClient(roots, addr, 1)
+	c.Transport.(*http.Transport).DisableKeepAlives = true
+	defer c.close()
+	var mu sync.Mutex
+	var latencies []time.Duration
+	var failed, wrong int
+	var firstError, firstWrong error
+	missed := fixedRate(t.Context(), *capacityRate, *capacityWindow, 64, func(slot int) error {
+		return c.echo(fmt.Sprintf("%s-%d", benchPayload, slot))
+	}, func(latency time.Duration, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err == nil {
+			latencies = append(latencies, latency)
+			return
+		}
+		failed++
+		if firstError == nil {
+			firstError = err
+		}
+		if errors.Is(err, errWrongResponse) {
+			wrong++
+			if firstWrong == nil {
+				firstWrong = err
+			}
+		}
+	})
+	issued := len(latencies) + failed
+	t.Logf("target=%d fresh TLS connections/s for %s, issued=%d missed=%d, ok=%d failed=%d wrong=%d", *capacityRate, *capacityWindow, issued, missed, len(latencies), failed, wrong)
+	if wrong > 0 {
+		t.Errorf("%d incorrect responses; first: %v", wrong, firstWrong)
+	}
+	if missed > 0 {
+		t.Errorf("inconclusive capacity: %d scheduled requests were never issued", missed)
+	}
+	if issued == 0 {
+		t.Fatal("no requests issued")
+	}
+	errPct := 100 * float64(failed) / float64(issued)
+	if missed == 0 && errPct > *capacityErrorPercent {
+		t.Errorf("failure rate %.4f%% exceeds %.4f%%; first: %v", errPct, *capacityErrorPercent, firstError)
+	}
+	if len(latencies) == 0 {
+		t.Fatal("no successful request to measure latency")
+	}
+	slices.Sort(latencies)
+	p99 := latencies[(len(latencies)*99+99)/100-1]
+	t.Logf("failure rate %.4f%% (limit %.4f%%), success p99 %s (limit %s)", errPct, *capacityErrorPercent, p99, *capacityP99)
+	if missed == 0 && p99 > *capacityP99 {
+		t.Errorf("success p99 %s exceeds %s", p99, *capacityP99)
+	}
+	name := t.Name()[strings.LastIndex(t.Name(), "/")+1:]
+	writeSummary(t, fmt.Sprintf("\n**%s %s fresh TLS connections** · target %d/s for %s · issued %d · missed %d · errors %.4f%% (limit %.4f%%) · incorrect %d · success p99 %s (limit %s)\n",
+		name, os.Getenv("FAMILY"), *capacityRate, *capacityWindow, issued, missed, errPct, *capacityErrorPercent, wrong, p99, *capacityP99))
 }
