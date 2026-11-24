@@ -1,3 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: echo}
+data:
+  nginx.conf: |
+    worker_processes 2;
+    events { worker_connections 2048; }
+    http {
+      access_log off;
+      server {
+        listen 8080;
+        listen [::]:8080;
+        location = /echo { return 200 $arg_msg; }
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,8 +28,12 @@ spec:
     spec:
       containers:
         - name: echo
-          image: registry.k8s.io/e2e-test-images/agnhost:2.53
-          command: [/agnhost, netexec, --http-port=8080]
+          image: nginx:1.30.8-alpine@sha256:6437a63b5c529f0e06162b3f593c0154cff6fa2ea0f94fd7c27928cb399e022d
+          volumeMounts:
+            - {name: config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf}
+      volumes:
+        - name: config
+          configMap: {name: echo}
 ---
 apiVersion: v1
 kind: Service

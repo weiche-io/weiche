@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,41 +145,44 @@ func (e endpoint) await(t *testing.T) {
 	t.Fatalf("route %s via %s did not converge: %v", e.host, e.ip, last)
 }
 
-func TestControllerScaling(t *testing.T) {
-	fixed := endpoint{os.Getenv("LAST_IP"), "fixed.example.test"}
-	automatic := endpoint{os.Getenv("FIRST_IP"), "automatic.example.test"}
+func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 	for _, e := range []endpoint{fixed, automatic} {
-		if net.ParseIP(e.ip) == nil {
-			t.Fatalf("missing VIP for %s: %q", e.host, e.ip)
-		}
 		e.await(t)
 	}
 
 	// Probe the original routes throughout every Helm upgrade and election. Once
 	// the baseline is established, a single failed request must fail the test.
-	stop, stopped := make(chan struct{}), make(chan struct{})
-	defer func() { close(stop); <-stopped }()
-	go func() {
-		defer close(stopped)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				for _, e := range []endpoint{fixed, automatic} {
+	stop := make(chan struct{})
+	var workers sync.WaitGroup
+	var completed [2]atomic.Uint64
+	started := time.Now()
+	for i, e := range []endpoint{fixed, automatic} {
+		for range 8 {
+			workers.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
 					if err := e.probe(); err != nil {
 						t.Errorf("interrupted forwarding to %s via %s: %v", e.host, e.ip, err)
 						return
 					}
+					completed[i].Add(1)
 				}
-			}
+			})
 		}
+	}
+	defer func() {
+		close(stop)
+		workers.Wait()
+		t.Logf("8 clients per VIP over %s: fixed=%d automatic=%d", time.Since(started), completed[0].Load(), completed[1].Load())
 	}()
 
 	var holder leader
 	for stage, replicas := range []int{1, 2, 3, 1} {
+		fixedBefore, automaticBefore := completed[0].Load(), completed[1].Load()
 		var retired string
 		if stage > 0 {
 			if replicas == 1 {
@@ -195,5 +200,6 @@ func TestControllerScaling(t *testing.T) {
 		observed := `--for=jsonpath={.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}=` + strings.TrimSpace(string(generation))
 		command(t, "kubectl", "wait", "httproute/fixed", observed, "--timeout=1m")
 		fresh.await(t)
+		t.Logf("%d replicas: fixed=%d automatic=%d successful requests", replicas, completed[0].Load()-fixedBefore, completed[1].Load()-automaticBefore)
 	}
 }

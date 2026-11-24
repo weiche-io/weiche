@@ -1,0 +1,6 @@
+[
+  {"op":"add","path":"/spec/listeners/-","value":{
+    "name":"websecure","protocol":"HTTPS","port":8443,"hostname":"bench.example.test",
+    "tls":{"mode":"Terminate","certificateRefs":[{"name":"bench-tls"}]}
+  }}
+]

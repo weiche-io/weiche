@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: traefik-bench}
+data:
+  routes.yaml: |
+    http:
+      routers:
+        bench:
+          rule: Host(`bench.example.test`)
+          entryPoints: [websecure]
+          tls: {}
+          service: echo
+      services:
+        echo:
+          loadBalancer:
+            servers: [{url: "http://${backend}"}]
+    tls:
+      certificates:
+        - {certFile: /certs/tls.crt, keyFile: /certs/tls.key}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: traefik-bench}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: traefik-bench}}
+  template:
+    metadata: {labels: {app: traefik-bench}}
+    spec:
+      containers:
+        - name: traefik
+          image: traefik:v3.8.0@sha256:cd3078e07dfe0c551b1df6fca2697c52f35da0a18c7bd81da4d3b1f012405098
+          args:
+            - --entryPoints.websecure.address=:8443
+            - --entryPoints.websecure.http3=true
+            - --providers.file.filename=/config/routes.yaml
+          env: [{name: GOMAXPROCS, value: "2"}]
+          resources:
+            requests: {cpu: 250m, memory: 64Mi}
+            limits: {cpu: "2", memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: tls, mountPath: /certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: traefik-bench}
+        - name: tls
+          secret: {secretName: bench-tls}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: traefik-bench}
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [${family}]
+  loadBalancerIP: "${vip}"
+  selector: {app: traefik-bench}
+  ports:
+    - {name: https, port: 8443, protocol: TCP}
+    - {name: quic, port: 8443, protocol: UDP}
