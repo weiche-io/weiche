@@ -1,6 +1,7 @@
 #let order = 10
 #let title = "Get started"
-#let description = "Build Weiche and run the Gateway API conformance suite on kind."
+#let description = "Install Gateway API CRDs and the Weiche Helm chart, expose your first Service, or run the conformance suite on kind."
 #let breadcrumb = [Guide]
-#let heading = [Test Weiche on kind]
-#let intro = [Run the same Gateway API conformance tests used on pull requests.]
+#let heading = [Get started with Weiche]
+#let intro = [Install Gateway API CRDs and the Weiche controller, expose a
+  Service with a Gateway and HTTPRoute, or run the conformance suite locally.]
