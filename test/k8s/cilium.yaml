@@ -1,0 +1,7 @@
+ipam:
+  mode: kubernetes
+ipv6:
+  enabled: true
+operator:
+  replicas: 1
+l7Proxy: false
