@@ -66,11 +66,21 @@ func compareProxies(t *testing.T, dir, family, weicheIP, traefikIP string) {
 	}
 	setup.publish(t)
 	t.Run("PersistentConnections", func(t *testing.T) { runComparison(t, roots, addrs) })
-	short := newMetricTable("Fresh connections", "Proxy", "Client → proxy (ALPN)", "Target (conn/s)", "Window (s)", "Max in flight", "Issued requests", "Missed slots", "OK", "Failed", "Incorrect responses", "Request errors (%)", "Error limit (%)", "Success p99 (ms)", "p99 limit (ms)", "Verdict")
-	defer short.publish(t)
-	for i, name := range []string{"Weiche", "Traefik"} {
-		t.Run("ShortConnections/"+name, func(t *testing.T) { shortConnections(t, roots, addrs[i], name, short) })
-	}
+	names := []string{"Weiche", "Traefik"}
+	t.Run("ShortConnections", func(t *testing.T) {
+		short := newMetricTable("Fresh connections", "Proxy", "Client → proxy (ALPN)", "Target (conn/s)", "Window (s)", "Max in flight", "Issued requests", "Missed slots", "OK", "Failed", "Incorrect responses", "Request errors (%)", "Error limit (%)", "Success p99 (ms)", "p99 limit (ms)", "Verdict")
+		defer short.publish(t)
+		for i, name := range names {
+			t.Run(name, func(t *testing.T) { shortConnections(t, roots, addrs[i], name, short) })
+		}
+	})
+	t.Run("MixedLoad", func(t *testing.T) {
+		table := newMetricTable("Unpaced mixed requests · persistent connections", "Proxy", "Client → proxy (ALPN)", "Connection slots", "Max in flight", "Issue window (s)", "Elapsed incl. drain (s)", "Requests", "OK", "Failed", "Incorrect (of failed)", "Request errors (%)", "Completed req/s", "OK req/s")
+		defer table.publish(t)
+		for i, name := range names {
+			t.Run(name, func(t *testing.T) { mixedLoad(t, roots, addrs[i], name, 30*time.Second, table) })
+		}
+	})
 }
 
 var frontend = [...]string{"", "HTTP/1.1 · TLS 1.3/TCP (`http/1.1`)", "HTTP/2 · TLS 1.3/TCP (`h2`)", "HTTP/3 · TLS 1.3/QUIC/UDP (`h3`)"}
