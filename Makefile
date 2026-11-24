@@ -8,3 +8,4 @@ SHELL     := bash
 include mk/log.mk
 include mk/site.mk
 include mk/conformance.mk
+include test/k8s/k8s.mk

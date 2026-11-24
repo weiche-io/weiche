@@ -1,0 +1,7 @@
+gatewayNamespaces: [default]
+controller:
+  replicas: 1
+proxy:
+  service:
+    type: LoadBalancer
+    ipFamilyPolicy: SingleStack

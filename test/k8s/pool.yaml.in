@@ -1,0 +1,7 @@
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: weiche
+spec:
+  blocks:
+    - cidr: "${pool}"
