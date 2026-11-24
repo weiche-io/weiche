@@ -58,11 +58,22 @@ func compareProxies(t *testing.T, dir, family, weicheIP, traefikIP string) {
 	k("rollout", "status", "deployment/traefik-bench", "--timeout=3m")
 	k("wait", "service/traefik-bench", "--for=jsonpath={.status.loadBalancer.ingress[0].ip}="+traefikIP, "--timeout=2m")
 	addrs := []string{net.JoinHostPort(weicheIP, "8443"), net.JoinHostPort(traefikIP, "8443")}
+	setup := newMetricTable("Proxy configuration", "Proxy", "Deployment", "Ready pods", "CPU limit/pod (cores)", "Memory limit/pod", "Proxy → backend", "Backend ready pods")
+	backendPods := jsonpath(t, "deployment/echo", "{.status.readyReplicas}")
+	for _, proxy := range []struct{ name, deploy string }{{"Weiche", "fixed"}, {"Traefik", "traefik-bench"}} {
+		config := jsonpath(t, "deployment/"+proxy.deploy, `{.status.readyReplicas}{" | "}{.spec.template.spec.containers[0].resources.limits.cpu}{" | "}{.spec.template.spec.containers[0].resources.limits.memory}`)
+		setup.row("%s | %s | %s | HTTP/1.1 · plaintext/TCP | %s", proxy.name, proxy.deploy, config, backendPods)
+	}
+	setup.publish(t)
 	t.Run("PersistentConnections", func(t *testing.T) { runComparison(t, roots, addrs) })
+	short := newMetricTable("Fresh connections", "Proxy", "Client → proxy (ALPN)", "Target (conn/s)", "Window (s)", "Max in flight", "Issued requests", "Missed slots", "OK", "Failed", "Incorrect responses", "Request errors (%)", "Error limit (%)", "Success p99 (ms)", "p99 limit (ms)", "Verdict")
+	defer short.publish(t)
 	for i, name := range []string{"Weiche", "Traefik"} {
-		t.Run("ShortConnections/"+name, func(t *testing.T) { shortConnections(t, roots, addrs[i]) })
+		t.Run("ShortConnections/"+name, func(t *testing.T) { shortConnections(t, roots, addrs[i], name, short) })
 	}
 }
+
+var frontend = [...]string{"", "HTTP/1.1 · TLS 1.3/TCP (`http/1.1`)", "HTTP/2 · TLS 1.3/TCP (`h2`)", "HTTP/3 · TLS 1.3/QUIC/UDP (`h3`)"}
 
 var alpn = [...]string{"", "http/1.1", "h2", "h3"}
 
@@ -77,7 +88,7 @@ type benchClient struct {
 }
 
 func newBenchClient(roots *x509.CertPool, addr string, major int) benchClient {
-	config := &tls.Config{RootCAs: roots, ServerName: benchHost, MinVersion: tls.VersionTLS13, NextProtos: []string{alpn[major]}}
+	config := &tls.Config{RootCAs: roots, ServerName: benchHost, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{alpn[major]}}
 	client := &http.Client{Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var closeTransport func()
 	if major == 3 {
@@ -125,20 +136,21 @@ func (c benchClient) echo(payload string) error {
 }
 
 type sample struct {
-	requestsPerSecond float64
-	p50, p95, p99     time.Duration
+	requests      int
+	elapsed       time.Duration
+	p50, p95, p99 time.Duration
 }
 
-const benchConnections = 8
+const (
+	benchConnections = 8
+	benchWarmup      = 2 * time.Second
+	benchWindow      = 5 * time.Second
+)
 
 // One independent transport per connection. Share it among four streams for
 // multiplexed protocols; HTTP/1.1 permits one outstanding request per connection.
-func measure(t *testing.T, roots *x509.CertPool, addr string, major int, duration time.Duration) sample {
+func measure(t *testing.T, roots *x509.CertPool, addr string, major, streams int, duration time.Duration) sample {
 	t.Helper()
-	streams := 4
-	if major == 1 {
-		streams = 1
-	}
 	clients := make([]benchClient, benchConnections)
 	for i := range clients {
 		clients[i] = newBenchClient(roots, addr, major)
@@ -177,7 +189,7 @@ func measure(t *testing.T, roots *x509.CertPool, addr string, major int, duratio
 		})
 	}
 	ready.Wait()
-	warmUntil = time.Now().Add(2 * time.Second)
+	warmUntil = time.Now().Add(benchWarmup)
 	end = warmUntil.Add(duration)
 	close(start)
 	workers.Wait()
@@ -194,17 +206,20 @@ func measure(t *testing.T, roots *x509.CertPool, addr string, major int, duratio
 	}
 	slices.Sort(timings)
 	percentile := func(p int) time.Duration { return timings[(len(timings)*p+99)/100-1] }
-	return sample{float64(len(timings)) / elapsed.Seconds(), percentile(50), percentile(95), percentile(99)}
+	return sample{len(timings), elapsed, percentile(50), percentile(95), percentile(99)}
 }
 
 // Alternate who goes first on each paired round to balance order effects on
 // a shared runner. Report every round so variation is visible.
 func runComparison(t *testing.T, roots *x509.CertPool, addrs []string) {
 	t.Helper()
-	var summary strings.Builder
-	fmt.Fprintf(&summary, "### Proxy comparison (%s)\n\n1 Pod/proxy, 2 vCPU limit, 256 MiB, TLS 1.3, 8 persistent connections; H1: 1 in-flight request/connection, H2/H3: 4 concurrent streams/connection. 2 s warm-up + 5 s measured per sample.\n\n", os.Getenv("FAMILY"))
-	fmt.Fprintln(&summary, "| Protocol | Round | Proxy | req/s | p50 ms | p95 ms | p99 ms |\n|---|---:|---|---:|---:|---:|---:|")
+	table := newMetricTable("Persistent connections", "Client → proxy (ALPN)", "Proxy", "Round", "Order", "Connection slots", "Max in flight/conn", "Warm-up (s)", "Target window (s)", "Elapsed incl. drain (s)", "OK", "OK req/s", "p50 (ms)", "p95 (ms)", "p99 (ms)")
+	defer table.publish(t)
 	for major := 1; major <= 3; major++ {
+		streams := 4
+		if major == 1 {
+			streams = 1
+		}
 		// Configuration propagation is outside the timed workload.
 		for _, addr := range addrs {
 			c := newBenchClient(roots, addr, major)
@@ -226,26 +241,11 @@ func runComparison(t *testing.T, roots *x509.CertPool, addrs []string) {
 			for order := range 2 {
 				i := (round + order) % 2
 				name := []string{"Weiche", "Traefik"}[i]
-				s := measure(t, roots, addrs[i], major, 5*time.Second)
-				row := fmt.Sprintf("| H%d | %d | %s | %.0f | %.2f | %.2f | %.2f |", major, round+1, name, s.requestsPerSecond, s.p50.Seconds()*1e3, s.p95.Seconds()*1e3, s.p99.Seconds()*1e3)
+				s := measure(t, roots, addrs[i], major, streams, benchWindow)
+				row := fmt.Sprintf("%s | %s | %d | %d | %d | %d | %g | %g | %.4f | %d | %.1f | %.3f | %.3f | %.3f", frontend[major], name, round+1, order+1, benchConnections, streams, benchWarmup.Seconds(), benchWindow.Seconds(), s.elapsed.Seconds(), s.requests, float64(s.requests)/s.elapsed.Seconds(), s.p50.Seconds()*1e3, s.p95.Seconds()*1e3, s.p99.Seconds()*1e3)
 				t.Log(row)
-				fmt.Fprintln(&summary, row)
+				table.row("%s", row)
 			}
-		}
-	}
-	writeSummary(t, summary.String())
-}
-
-func writeSummary(t *testing.T, text string) {
-	t.Helper()
-	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-		if _, err := io.WriteString(f, text); err != nil {
-			t.Fatal(err)
 		}
 	}
 }
@@ -258,7 +258,7 @@ var (
 	capacityP99          = flag.Duration("capacity-p99", 250*time.Millisecond, "maximum p99 latency of successful short connections")
 )
 
-func shortConnections(t *testing.T, roots *x509.CertPool, addr string) {
+func shortConnections(t *testing.T, roots *x509.CertPool, addr, name string, table *metricTable) {
 	t.Helper()
 	if *capacityRate <= 0 || *capacityRate > int(time.Second) || *capacityWindow < time.Second ||
 		*capacityErrorPercent < 0 || *capacityErrorPercent > 100 || math.IsNaN(*capacityErrorPercent) || *capacityP99 <= 0 {
@@ -271,7 +271,8 @@ func shortConnections(t *testing.T, roots *x509.CertPool, addr string) {
 	var latencies []time.Duration
 	var failed, wrong int
 	var firstError, firstWrong error
-	missed := fixedRate(t.Context(), *capacityRate, *capacityWindow, 64, func(slot int) error {
+	const concurrency = 64
+	missed := fixedRate(t.Context(), *capacityRate, *capacityWindow, concurrency, func(slot int) error {
 		return c.echo(fmt.Sprintf("%s-%d", benchPayload, slot))
 	}, func(latency time.Duration, err error) {
 		mu.Lock()
@@ -299,23 +300,34 @@ func shortConnections(t *testing.T, roots *x509.CertPool, addr string) {
 	if missed > 0 {
 		t.Errorf("inconclusive capacity: %d scheduled requests were never issued", missed)
 	}
-	if issued == 0 {
-		t.Fatal("no requests issued")
+	errValue, p99Value := "—", "—"
+	if issued > 0 {
+		errPct := 100 * float64(failed) / float64(issued)
+		errValue = fmt.Sprintf("%.4f", errPct)
+		if missed == 0 && errPct > *capacityErrorPercent {
+			t.Errorf("failure rate %.4f%% exceeds %.4f%%; first: %v", errPct, *capacityErrorPercent, firstError)
+		}
+	} else {
+		t.Error("no requests issued")
 	}
-	errPct := 100 * float64(failed) / float64(issued)
-	if missed == 0 && errPct > *capacityErrorPercent {
-		t.Errorf("failure rate %.4f%% exceeds %.4f%%; first: %v", errPct, *capacityErrorPercent, firstError)
+	if len(latencies) > 0 {
+		slices.Sort(latencies)
+		p99 := latencies[(len(latencies)*99+99)/100-1]
+		p99Value = fmt.Sprintf("%.3f", p99.Seconds()*1e3)
+		if missed == 0 && p99 > *capacityP99 {
+			t.Errorf("success p99 %s exceeds %s", p99, *capacityP99)
+		}
+	} else {
+		t.Error("no successful request to measure latency")
 	}
-	if len(latencies) == 0 {
-		t.Fatal("no successful request to measure latency")
+	verdict := "PASS"
+	if missed > 0 && wrong == 0 {
+		verdict = "INCONCLUSIVE"
+	} else if t.Failed() {
+		verdict = "FAIL"
 	}
-	slices.Sort(latencies)
-	p99 := latencies[(len(latencies)*99+99)/100-1]
-	t.Logf("failure rate %.4f%% (limit %.4f%%), success p99 %s (limit %s)", errPct, *capacityErrorPercent, p99, *capacityP99)
-	if missed == 0 && p99 > *capacityP99 {
-		t.Errorf("success p99 %s exceeds %s", p99, *capacityP99)
-	}
-	name := t.Name()[strings.LastIndex(t.Name(), "/")+1:]
-	writeSummary(t, fmt.Sprintf("\n**%s %s fresh TLS connections** · target %d/s for %s · issued %d · missed %d · errors %.4f%% (limit %.4f%%) · incorrect %d · success p99 %s (limit %s)\n",
-		name, os.Getenv("FAMILY"), *capacityRate, *capacityWindow, issued, missed, errPct, *capacityErrorPercent, wrong, p99, *capacityP99))
+	row := fmt.Sprintf("%s | %s | %d | %g | %d | %d | %d | %d | %d | %d | %s | %.4f | %s | %g | %s",
+		name, frontend[1], *capacityRate, capacityWindow.Seconds(), concurrency, issued, missed, len(latencies), failed, wrong, errValue, *capacityErrorPercent, p99Value, capacityP99.Seconds()*1e3, verdict)
+	t.Log(row)
+	table.row("%s", row)
 }

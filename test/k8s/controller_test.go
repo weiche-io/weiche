@@ -163,46 +163,62 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 	pooled.Transport = &http.Transport{MaxIdleConnsPerHost: 8}
 	defer pooled.CloseIdleConnections()
 	endpoints := []endpoint{fixed, automatic}
-	traffic := func(t *testing.T, ctx context.Context, window time.Duration, i int, ok, failed *atomic.Uint64) {
+	report := newMetricTable("Forwarding · HTTP/1.1 · TCP · plaintext", "Phase", "Controller replicas", "Gateway", "VIP", "Target (req/s/VIP)", "Fresh : keep-alive eligible (scheduled slots)", "In-flight limit/VIP", "OK", "Failed", "Missed")
+	defer report.publish(t)
+	type counts struct {
+		ok, failed atomic.Uint64
+		missed     int
+	}
+	traffic := func(t *testing.T, ctx context.Context, window time.Duration, i int, c *counts) {
 		e := endpoints[i]
-		missed := fixedRate(ctx, rate, window, 8, func(slot int) error {
+		c.missed = fixedRate(ctx, rate, window, 8, func(slot int) error {
 			if slot%2 == 0 {
 				return e.probe(&client)
 			}
 			return e.probe(&pooled)
 		}, func(_ time.Duration, err error) {
 			if err == nil {
-				ok.Add(1)
-			} else if failed.Add(1) == 1 {
+				c.ok.Add(1)
+			} else if c.failed.Add(1) == 1 {
 				t.Errorf("%s via %s: %v", e.host, e.ip, err)
 			}
 		})
-		t.Logf("%s: ok=%d failed=%d missed=%d target=%d/s", e.host, ok.Load(), failed.Load(), missed, rate)
-		if missed > 0 {
-			t.Errorf("%s: runner missed %d scheduled requests", e.host, missed)
+		t.Logf("%s: ok=%d failed=%d missed=%d target=%d/s", e.host, c.ok.Load(), c.failed.Load(), c.missed, rate)
+		if c.missed > 0 {
+			t.Errorf("%s: runner missed %d scheduled requests", e.host, c.missed)
 		}
 	}
 
 	if !t.Run("SingleReplicaBaseline", func(t *testing.T) {
 		awaitLeader(t, 1, "")
 		var workers sync.WaitGroup
+		var baseline [2]counts
 		for i := range endpoints {
 			workers.Go(func() {
-				traffic(t, t.Context(), 30*time.Second, i, new(atomic.Uint64), new(atomic.Uint64))
+				traffic(t, t.Context(), 30*time.Second, i, &baseline[i])
 			})
 		}
 		workers.Wait()
+		for i, e := range endpoints {
+			report.row("Baseline | 1 | %s | %s | %d | 1:1 | 8 | %d | %d | %d", e.route, e.ip, rate, baseline[i].ok.Load(), baseline[i].failed.Load(), baseline[i].missed)
+		}
 	}) {
 		return
 	}
 
 	ctx, stop := context.WithCancel(t.Context())
 	var workers sync.WaitGroup
-	var probes [2]struct{ ok, failed atomic.Uint64 }
+	var probes [2]counts
 	for i := range endpoints {
-		workers.Go(func() { traffic(t, ctx, 0, i, &probes[i].ok, &probes[i].failed) })
+		workers.Go(func() { traffic(t, ctx, 0, i, &probes[i]) })
 	}
-	defer func() { stop(); workers.Wait() }()
+	defer func() {
+		stop()
+		workers.Wait()
+		for i, e := range endpoints {
+			report.row("Scaling total | — | %s | %s | %d | 1:1 | 8 | %d | %d | %d", e.route, e.ip, rate, probes[i].ok.Load(), probes[i].failed.Load(), probes[i].missed)
+		}
+	}()
 	var holder leader
 	var lastOK, lastFailed [2]uint64
 	for stage, replicas := range []int{1, 2, 3, 1} {
@@ -226,6 +242,7 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 		for i, e := range []endpoint{fixed, automatic} {
 			ok, failed := probes[i].ok.Load(), probes[i].failed.Load()
 			t.Logf("%d replicas, %s: ok=%d failed=%d", replicas, e.host, ok-lastOK[i], failed-lastFailed[i])
+			report.row("Stage %d | %d | %s | %s | %d | 1:1 | 8 | %d | %d | —", stage+1, replicas, e.route, e.ip, rate, ok-lastOK[i], failed-lastFailed[i])
 			lastOK[i], lastFailed[i] = ok, failed
 		}
 	}

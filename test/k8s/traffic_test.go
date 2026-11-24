@@ -11,7 +11,11 @@ import (
 // A zero duration keeps the same schedule until the caller ends the phase.
 func fixedRate(ctx context.Context, rate int, duration time.Duration, concurrency int, request func(int) error, record func(time.Duration, error)) (missed int) {
 	start := time.Now()
-	period := time.Second / time.Duration(rate)
+	// Keep whole seconds and the fractional remainder separate. Rounding the
+	// period down (e.g. at 15/s) would schedule an extra slot at the window end.
+	slotAt := func(d time.Duration) int {
+		return int(d/time.Second)*rate + int((d%time.Second)*time.Duration(rate)/time.Second)
+	}
 	active := make(chan struct{}, concurrency)
 	var workers sync.WaitGroup
 	defer workers.Wait()
@@ -25,9 +29,9 @@ func fixedRate(ctx context.Context, rate int, duration time.Duration, concurrenc
 		}
 		elapsed := time.Since(start)
 		if duration > 0 && elapsed >= duration {
-			return missed + int((duration-1)/period) + 1 - slot
+			return missed + slotAt(duration-time.Nanosecond) + 1 - slot
 		}
-		due := int(elapsed / period)
+		due := slotAt(elapsed)
 		if due >= slot {
 			missed += due - slot
 			select {
@@ -43,6 +47,7 @@ func fixedRate(ctx context.Context, rate int, duration time.Duration, concurrenc
 			}
 			slot = due + 1
 		}
-		timer.Reset(time.Until(start.Add(time.Duration(slot) * period)))
+		next := time.Duration(slot/rate)*time.Second + (time.Duration(slot%rate)*time.Second+time.Duration(rate)-1)/time.Duration(rate)
+		timer.Reset(time.Until(start.Add(next)))
 	}
 }
