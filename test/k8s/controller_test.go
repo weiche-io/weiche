@@ -150,11 +150,11 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 		e.await(t)
 	}
 
-	// Probe the original routes throughout every Helm upgrade and election. Once
-	// the baseline is established, a single failed request must fail the test.
+	// Keep eight clients per VIP for the entire run, including after a failure.
+	// Report the first error per VIP and count every subsequent failure.
 	stop := make(chan struct{})
 	var workers sync.WaitGroup
-	var completed [2]atomic.Uint64
+	var probes [2]struct{ ok, failed atomic.Uint64 }
 	started := time.Now()
 	for i, e := range []endpoint{fixed, automatic} {
 		for range 8 {
@@ -166,10 +166,12 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 					default:
 					}
 					if err := e.probe(); err != nil {
-						t.Errorf("interrupted forwarding to %s via %s: %v", e.host, e.ip, err)
-						return
+						if probes[i].failed.Add(1) == 1 {
+							t.Errorf("interrupted forwarding to %s via %s: %v", e.host, e.ip, err)
+						}
+						continue
 					}
-					completed[i].Add(1)
+					probes[i].ok.Add(1)
 				}
 			})
 		}
@@ -177,12 +179,13 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 	defer func() {
 		close(stop)
 		workers.Wait()
-		t.Logf("8 clients per VIP over %s: fixed=%d automatic=%d", time.Since(started), completed[0].Load(), completed[1].Load())
+		t.Logf("8 clients per VIP over %s: fixed ok=%d failed=%d; automatic ok=%d failed=%d", time.Since(started),
+			probes[0].ok.Load(), probes[0].failed.Load(), probes[1].ok.Load(), probes[1].failed.Load())
 	}()
 
 	var holder leader
+	var lastOK, lastFailed [2]uint64
 	for stage, replicas := range []int{1, 2, 3, 1} {
-		fixedBefore, automaticBefore := completed[0].Load(), completed[1].Load()
 		var retired string
 		if stage > 0 {
 			if replicas == 1 {
@@ -200,6 +203,10 @@ func controllerScaling(t *testing.T, fixed, automatic endpoint) {
 		observed := `--for=jsonpath={.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}=` + strings.TrimSpace(string(generation))
 		command(t, "kubectl", "wait", "httproute/fixed", observed, "--timeout=1m")
 		fresh.await(t)
-		t.Logf("%d replicas: fixed=%d automatic=%d successful requests", replicas, completed[0].Load()-fixedBefore, completed[1].Load()-automaticBefore)
+		for i, e := range []endpoint{fixed, automatic} {
+			ok, failed := probes[i].ok.Load(), probes[i].failed.Load()
+			t.Logf("%d replicas, %s: ok=%d failed=%d", replicas, e.host, ok-lastOK[i], failed-lastFailed[i])
+			lastOK[i], lastFailed[i] = ok, failed
+		}
 	}
 }
