@@ -35,7 +35,7 @@ per-Gateway proxy workloads, then install the Helm chart:
 kubectl create namespace edge-gateways
 
 helm install weiche oci://ghcr.io/weiche-io/charts/weiche \
-  --version 0.2.0 \
+  --version 0.2.1 \
   --namespace weiche-system --create-namespace \
   --set 'gatewayNamespaces={edge-gateways}'
 ```
