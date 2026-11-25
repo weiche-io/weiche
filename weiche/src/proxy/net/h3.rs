@@ -5,7 +5,9 @@ mod upload;
 use super::super::super::log;
 use super::super::{
     super::ir::Binding,
-    http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
+    http::{
+        ProxyService, RequestBody, ResponseBody, access::Access, wire::strip_hop_headers,
+    },
 };
 use bytes::Bytes;
 use compio::{
@@ -94,6 +96,7 @@ async fn request(
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
     let (req, mut stream) = resolver.resolve_request().await?;
+    let access = Access::start(peer, &req);
     let length = match ContentLength::parse(req.headers()) {
         Ok(length) => length,
         Err(code) => {
@@ -108,6 +111,9 @@ async fn request(
     let req = req.map(|()| RequestBody::Http3(upload));
     let exchange = async {
         let reply = service.call(binding, Some(tls_listener), peer, req).await;
+        if let Some(access) = access {
+            access.responded(reply.response.status());
+        }
         let write = respond(&mut send, reply.response, head);
         match reply.deadline {
             Some(end) => timeout_at(end, write).await?,

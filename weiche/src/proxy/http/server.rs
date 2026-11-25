@@ -10,7 +10,7 @@ use super::super::{
     up::Tunnel,
     worker::{HttpListener, Task, Worker},
 };
-use super::{ProxyService, RequestBody};
+use super::{ProxyService, RequestBody, access::Access};
 use compio::{
     net::TcpStream,
     runtime::{self, time::timeout},
@@ -156,6 +156,7 @@ impl Worker {
             drain,
         });
         let service = service_fn(|request| {
+            let access = Access::start(peer, &request);
             let service = self.server.service.clone();
             let listener = listener.clone();
             let owner = owner.clone();
@@ -168,6 +169,9 @@ impl Worker {
                         request.map(RequestBody::Incoming),
                     )
                     .await;
+                if let Some(access) = access {
+                    access.responded(exchange.response.status());
+                }
                 if let Some(tunnel) = exchange.tunnel {
                     runtime::spawn(owner.relay(tunnel)).detach();
                 }
