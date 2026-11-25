@@ -2,6 +2,7 @@
 mod fields;
 mod upload;
 
+use super::super::super::log;
 use super::super::{
     super::ir::Binding,
     http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
@@ -65,11 +66,11 @@ impl Session {
                     Ok(Some(resolver)) => {
                         let peer = self.transport.remote_address();
                         requests.push(request(resolver, service, binding, tls_listener, peer).unwrap_or_else(move |error| {
-                            tracing::debug!(%peer, %error, "http/3 stream ended");
+                            log!(debug, "http/3 stream ended", peer = peer.to_string(), error = error.to_string());
                         }));
                     }
                     Ok(None) => return,
-                    Err(error) => { tracing::debug!(%error, "http/3 connection ended"); return; }
+                    Err(error) => { log!(debug, "http/3 connection ended", error = error.to_string()); return; }
                 }
             }
         }

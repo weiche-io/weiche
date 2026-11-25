@@ -6,6 +6,7 @@ pub mod quic;
 pub mod tcp;
 pub mod udp;
 
+use super::super::log;
 use super::{
     super::ir::{Revision, Transport},
     config::{RuntimeConfig, SocketBuffers, TcpConfig},
@@ -174,7 +175,14 @@ fn bind_socket(
     socket.set_reuse_port(true)?;
     socket.bind(&address.into())?;
     if worker_id == 0 && (clamped.recv.is_some() || clamped.send.is_some()) {
-        tracing::info!(%address, ?protocol, ?buffers, ?clamped, "listener socket buffers limited by kernel");
+        log!(
+            info,
+            "listener socket buffers limited by kernel",
+            address = address.to_string(),
+            protocol = format!("{protocol:?}"),
+            buffers = format!("{buffers:?}"),
+            clamped = format!("{clamped:?}")
+        );
     }
     Ok(socket)
 }

@@ -1,4 +1,5 @@
 //! upstream HTTP client handshakes and connections on the owning compio runtime.
+use super::super::super::log;
 use super::{
     super::{
         super::ir::Protocol,
@@ -35,7 +36,12 @@ impl ConnectionPool {
             .await?;
         let address = endpoint.address;
         let driver = connection.with_upgrades().unwrap_or_else(move |error| {
-            tracing::debug!(%address, %error, "upstream connection ended");
+            log!(
+                debug,
+                "upstream connection ended",
+                address = address.to_string(),
+                error = error.to_string()
+            );
         });
         Ok(Connected { sender, _driver: runtime::spawn(driver) })
     }
@@ -53,7 +59,12 @@ impl ConnectionPool {
             .await?;
         let address = endpoint.address;
         let driver = connection.unwrap_or_else(move |error| {
-            tracing::debug!(%address, %error, "upstream HTTP/2 connection ended");
+            log!(
+                debug,
+                "upstream HTTP/2 connection ended",
+                address = address.to_string(),
+                error = error.to_string()
+            );
         });
         Ok(Connected { sender, _driver: runtime::spawn(driver) })
     }

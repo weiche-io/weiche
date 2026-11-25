@@ -1,5 +1,6 @@
 //! maintain one QUIC endpoint per terminating HTTPS socket on each worker.
 //! compio drives UDP I/O, packet dispatch and per-connection timers for quinn-proto.
+use super::super::super::log;
 use super::super::{
     super::ir::{Binding, ServerTls},
     admission::Permit,
@@ -153,7 +154,7 @@ async fn serve(
                     // the first packet may predate a reload. pin the resolver used by this handshake.
                     match incoming.accept_with(config.clone()) {
                         Ok(connecting) => connections.push(connection(connecting, keys.clone(), &worker, &binding, permit, shutdown.clone())),
-                        Err(error) => tracing::debug!(%error, "quic accept failed"),
+                        Err(error) => log!(debug, "quic accept failed", error = error.to_string()),
                     }
                 } else {
                     incoming.refuse();
@@ -212,8 +213,8 @@ async fn connection(
         _ = &mut stopping => return,
         result = timeout(config.tls_handshake_timeout, handshake) => match result {
             Ok(Ok(session)) => session,
-            Ok(Err(error)) => { tracing::debug!(%error, "quic handshake failed"); return; }
-            Err(_) => { tracing::debug!("quic handshake timed out"); return; }
+            Ok(Err(error)) => { log!(debug, "quic handshake failed", error = error.to_string()); return; }
+            Err(_) => { log!(debug, "quic handshake timed out"); return; }
         }
     };
     session

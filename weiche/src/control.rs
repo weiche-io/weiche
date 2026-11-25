@@ -10,6 +10,7 @@ mod service;
 mod status;
 mod tls;
 
+use super::log;
 pub use compile::{CONTROLLER_NAME, Compiled, compile};
 pub use reconcile::run;
 pub use resolve::ResolveError;
@@ -118,14 +119,14 @@ impl GatewayController {
 
     /// notify the compiler after a reflector commits an update to a visible store.
     pub async fn run(self, changes: watch::Sender<()>) {
-        tracing::info!("starting kubernetes resource watches");
+        log!(info, "starting kubernetes resource watches");
         select_all(self.watches)
             .for_each(|()| {
                 changes.send_replace(());
                 ready(())
             })
             .await;
-        tracing::info!("kubernetes resource watches stopped");
+        log!(info, "kubernetes resource watches stopped");
     }
 }
 
@@ -147,18 +148,34 @@ where
     let (reader, writer) = reflector::store();
     let stream = reflector::reflector(writer, watcher::watcher(api, config))
         .default_backoff()
-        .filter_map(|result| ready(match result {
-            Ok(watcher::Event::Apply(resource) | watcher::Event::Delete(resource)) => {
-                tracing::debug!(kind = %K::kind(&()), namespace = resource.namespace().as_deref().unwrap_or(""), name = %resource.name_any(), "observed resource change");
-                Some(())
-            }
-            Ok(watcher::Event::InitDone) => Some(()),
-            Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => None,
-            Err(error) => {
-                tracing::error!(kind = %K::kind(&()), %error, "kubernetes resource watch failed");
-                None
-            }
-        })).boxed();
+        .filter_map(|result| {
+            ready(match result {
+                Ok(
+                    watcher::Event::Apply(resource) | watcher::Event::Delete(resource),
+                ) => {
+                    log!(
+                        debug,
+                        "observed resource change",
+                        kind = K::kind(&()),
+                        namespace = resource.namespace().unwrap_or_default(),
+                        name = resource.name_any()
+                    );
+                    Some(())
+                }
+                Ok(watcher::Event::InitDone) => Some(()),
+                Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => None,
+                Err(error) => {
+                    log!(
+                        error,
+                        "kubernetes resource watch failed",
+                        kind = K::kind(&()),
+                        error = error.to_string()
+                    );
+                    None
+                }
+            })
+        })
+        .boxed();
     watches.push(stream);
     reader
 }

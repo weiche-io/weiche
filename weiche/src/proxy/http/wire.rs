@@ -1,4 +1,5 @@
 //! translate HTTP wire formats and produce local HTTP and gRPC responses.
+use super::super::super::log;
 use super::super::{super::ir::Protocol, admission::EndpointKey, up::Exchange};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version, header,
@@ -55,7 +56,12 @@ impl ProxyError {
         {
             Self::Timeout
         } else {
-            tracing::warn!(%address, %error, "http backend request failed");
+            log!(
+                warn,
+                "http backend request failed",
+                address = address.to_string(),
+                error = error.to_string()
+            );
             Self::Upstream
         }
     }
