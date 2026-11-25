@@ -9,6 +9,7 @@ mod watch;
 mod worker;
 
 use super::ir::GatewaySnapshot;
+use super::log;
 use admission::Admission;
 use anyhow::Context;
 use compio::{driver::ProactorBuilder, runtime::Runtime};
@@ -32,7 +33,11 @@ pub fn runtime() -> std::io::Result<Runtime> {
     match Runtime::builder().with_proactor(proactor).build() {
         Ok(rt) => Ok(rt),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            tracing::warn!(%error, "tuned io_uring flags unsupported, falling back to defaults");
+            log!(
+                warn,
+                "tuned io_uring flags unsupported, falling back to defaults",
+                error = error.to_string()
+            );
             Runtime::new()
         }
         Err(error) => Err(error),
@@ -78,6 +83,7 @@ impl Threads {
                     stop.send_replace(true);
                     let _ = done.send(());
                 });
+                super::logging::prepare_thread();
                 run()
             })
             .with_context(|| format!("spawn {name}"))?;
@@ -150,7 +156,12 @@ pub async fn run(name: String, policy: RuntimeConfig) -> anyhow::Result<()> {
         let stop = shutdown.clone();
         let started = threads.spawn(format!("weiche-worker-{id}"), move || {
             let io = runtime().context("create worker compio runtime")?;
-            tracing::info!(worker = id, driver = ?io.driver_type(), "starting compio worker");
+            log!(
+                info,
+                "starting compio worker",
+                worker = id,
+                driver = format!("{:?}", io.driver_type())
+            );
             io.block_on(worker::run(id, config, policy, admission, listeners, stop))
         });
         if started.is_err() {

@@ -1,4 +1,5 @@
 //! serve downstream HTTP/1 and HTTP/2 connections on their owning runtime.
+use super::super::super::log;
 use super::super::{
     super::ir::{Binding, Listener, ServerTls},
     admission::Permit,
@@ -9,7 +10,7 @@ use super::super::{
     up::Tunnel,
     worker::{HttpListener, Task, Worker},
 };
-use super::{ProxyService, RequestBody};
+use super::{ProxyService, RequestBody, access::Access};
 use compio::{
     net::TcpStream,
     runtime::{self, time::timeout},
@@ -108,7 +109,12 @@ impl Worker {
             return;
         }
         if let Err(error) = stream.set_nodelay(self.runtime.tcp.nodelay) {
-            tracing::warn!(%peer, %error, "failed to set tcp nodelay");
+            log!(
+                warn,
+                "failed to set tcp nodelay",
+                peer = peer.to_string(),
+                error = error.to_string()
+            );
             return;
         }
         let (stream, h2, tls_listener) = if listener.tls {
@@ -117,11 +123,11 @@ impl Worker {
                 result = timeout(self.runtime.tls_handshake_timeout, accept_tls(stream, &certs)) => match result {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
-                        tracing::debug!(%peer, %error, "tls handshake failed");
+                        log!(debug, "tls handshake failed", peer = peer.to_string(), error = error.to_string());
                         return;
                     }
                     Err(_) => {
-                        tracing::debug!(%peer, "tls handshake timed out");
+                        log!(debug, "tls handshake timed out", peer = peer.to_string());
                         return;
                     }
                 },
@@ -130,7 +136,12 @@ impl Worker {
             (Io::tls(stream), Some(h2), Some(selected))
         } else {
             let Ok(stream) = Io::plain(stream).inspect_err(|error| {
-                tracing::warn!(%peer, %error, "failed to prepare HTTP socket");
+                log!(
+                    warn,
+                    "failed to prepare HTTP socket",
+                    peer = peer.to_string(),
+                    error = error.to_string()
+                );
             }) else {
                 return;
             };
@@ -145,6 +156,7 @@ impl Worker {
             drain,
         });
         let service = service_fn(|request| {
+            let access = Access::start(peer, &request);
             let service = self.server.service.clone();
             let listener = listener.clone();
             let owner = owner.clone();
@@ -157,6 +169,9 @@ impl Worker {
                         request.map(RequestBody::Incoming),
                     )
                     .await;
+                if let Some(access) = access {
+                    access.responded(exchange.response.status());
+                }
                 if let Some(tunnel) = exchange.tunnel {
                     runtime::spawn(owner.relay(tunnel)).detach();
                 }
@@ -170,7 +185,7 @@ impl Worker {
                 tokio::select! {
                     result = &mut connection => {
                         if let Err(error) = result {
-                            tracing::debug!(%peer, %error, "http connection ended");
+                            log!(debug, "http connection ended", peer = peer.to_string(), error = error.to_string());
                         }
                     }
                     _ = shutdown.changed() => {
@@ -220,7 +235,7 @@ impl Owner {
             },
         };
         if let Err(error) = result {
-            tracing::debug!(%error, "http tunnel ended");
+            log!(debug, "http tunnel ended", error = error.to_string());
         }
     }
 }

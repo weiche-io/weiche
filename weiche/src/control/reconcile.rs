@@ -1,4 +1,5 @@
 //! hold the Kubernetes writer lease while compiling and reconciling gateway workloads.
+use super::super::log;
 use super::{
     GatewayController, GatewayStores,
     config::Settings,
@@ -43,7 +44,7 @@ pub async fn run() -> anyhow::Result<()> {
                 biased;
                 next = lease.changed() => {
                     leader = next.context("controller lease lost or unavailable")?;
-                    tracing::info!(leader, "controller lease changed");
+                    log!(info, "controller lease changed", leader = leader);
                 }
                 result = lead(&client, &stores, &settings, rx.clone()), if leader => return result,
             }
@@ -100,7 +101,12 @@ async fn lead(
             )
             .await
             {
-                tracing::warn!(gateway=%plan.gateway.name_any(), %error, "could not reconcile gateway workload");
+                log!(
+                    warn,
+                    "could not reconcile gateway workload",
+                    gateway = plan.gateway.name_any(),
+                    error = error.to_string()
+                );
                 plan.issue = Some(
                     "could not provision proxy resources; see controller logs".into(),
                 );
@@ -113,13 +119,13 @@ async fn lead(
         if let Err(error) =
             update_status(client, stores, &options.controller_name, &plans).await
         {
-            tracing::warn!(%error, "could not update gateway status");
+            log!(warn, "could not update gateway status", error = error.to_string());
             retry = true;
         }
         if let Err(error) =
             provision::retired(client, stores, settings, &plans, &mut applied).await
         {
-            tracing::warn!(%error, "could not retire gateway resources");
+            log!(warn, "could not retire gateway resources", error = error.to_string());
             retry = true;
         }
         tokio::select! {

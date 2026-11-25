@@ -1,4 +1,5 @@
 //! reconcile a snapshot against the listeners owned by one compio runtime.
+use super::super::log;
 use super::{
     super::ir::{
         Binding, GatewaySnapshot, Listener, PublishedSnapshot, Revision, ServerTls,
@@ -98,7 +99,14 @@ impl Listeners {
             &gateway.sockets,
             |_, _| {},
             |address, socket| worker.bind_http(address, &socket.listener),
-            |address, error| tracing::warn!(%address, %error, "listener bind failed"),
+            |address, error| {
+                log!(
+                    warn,
+                    "listener bind failed",
+                    address = address.to_string(),
+                    error = error.to_string()
+                )
+            },
         );
 
         let changed = self.revision.replace(snapshot.revision) != Some(snapshot.revision);
@@ -121,7 +129,14 @@ impl Listeners {
                 let (tx, rx) = watch::channel(socket.clone());
                 Ok((tx, tcp::serve(worker, listener, rx, tcp::passthrough)))
             },
-            |address, error| tracing::warn!(%address, %error, "tls listener bind failed"),
+            |address, error| {
+                log!(
+                    warn,
+                    "tls listener bind failed",
+                    address = address.to_string(),
+                    error = error.to_string()
+                )
+            },
         );
         let retry_streams = bind_listeners(
             &self.serving,
@@ -155,7 +170,13 @@ impl Listeners {
             },
             |(transport, address), error| {
                 if error.kind() != io::ErrorKind::WouldBlock {
-                    tracing::warn!(%address, ?transport, %error, "transport listener bind failed");
+                    log!(
+                        warn,
+                        "transport listener bind failed",
+                        address = address.to_string(),
+                        transport = format!("{transport:?}"),
+                        error = error.to_string()
+                    );
                 }
             },
         );
@@ -182,7 +203,11 @@ impl Listeners {
             }
             let explicit = gateway.streams.contains_key(&(Transport::Udp, address));
             if explicit && changed && worker.id == 0 {
-                tracing::warn!(%address, "explicit udp listener takes precedence over http/3");
+                log!(
+                    warn,
+                    "explicit udp listener takes precedence over http/3",
+                    address = address.to_string()
+                );
             }
             !explicit
         });
@@ -194,7 +219,12 @@ impl Listeners {
             |address, http| quic::Listener::bind(worker, address, http),
             |address, error| {
                 if error.kind() != io::ErrorKind::WouldBlock {
-                    tracing::warn!(%address, %error, "http/3 listener bind failed");
+                    log!(
+                        warn,
+                        "http/3 listener bind failed",
+                        address = address.to_string(),
+                        error = error.to_string()
+                    );
                 }
             },
         )

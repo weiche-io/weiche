@@ -1,4 +1,5 @@
 //! coordinate UDP socket ownership across workers and protocol changes.
+use super::super::super::log;
 use super::{super::config::SocketBuffers, bind_socket, cid};
 use compio::net::UdpSocket;
 use socket2::{Protocol, Socket, Type};
@@ -57,7 +58,12 @@ impl Group {
             && let Ok(count) = u16::try_from(workers)
             && let Err(error) = cid::attach(&sockets[0].socket, count)
         {
-            tracing::warn!(%addr, %error, "quic reuseport steering unavailable");
+            log!(
+                warn,
+                "quic reuseport steering unavailable",
+                addr = addr.to_string(),
+                error = error.to_string()
+            );
         }
         Ok(Self { mode, sockets })
     }

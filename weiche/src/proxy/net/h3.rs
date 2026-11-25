@@ -2,9 +2,12 @@
 mod fields;
 mod upload;
 
+use super::super::super::log;
 use super::super::{
     super::ir::Binding,
-    http::{ProxyService, RequestBody, ResponseBody, wire::strip_hop_headers},
+    http::{
+        ProxyService, RequestBody, ResponseBody, access::Access, wire::strip_hop_headers,
+    },
 };
 use bytes::Bytes;
 use compio::{
@@ -65,11 +68,11 @@ impl Session {
                     Ok(Some(resolver)) => {
                         let peer = self.transport.remote_address();
                         requests.push(request(resolver, service, binding, tls_listener, peer).unwrap_or_else(move |error| {
-                            tracing::debug!(%peer, %error, "http/3 stream ended");
+                            log!(debug, "http/3 stream ended", peer = peer.to_string(), error = error.to_string());
                         }));
                     }
                     Ok(None) => return,
-                    Err(error) => { tracing::debug!(%error, "http/3 connection ended"); return; }
+                    Err(error) => { log!(debug, "http/3 connection ended", error = error.to_string()); return; }
                 }
             }
         }
@@ -93,6 +96,7 @@ async fn request(
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
     let (req, mut stream) = resolver.resolve_request().await?;
+    let access = Access::start(peer, &req);
     let length = match ContentLength::parse(req.headers()) {
         Ok(length) => length,
         Err(code) => {
@@ -107,6 +111,9 @@ async fn request(
     let req = req.map(|()| RequestBody::Http3(upload));
     let exchange = async {
         let reply = service.call(binding, Some(tls_listener), peer, req).await;
+        if let Some(access) = access {
+            access.responded(reply.response.status());
+        }
         let write = respond(&mut send, reply.response, head);
         match reply.deadline {
             Some(end) => timeout_at(end, write).await?,

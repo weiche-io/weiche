@@ -74,7 +74,7 @@ control plane, `GatewayClass`, RBAC, and platform proxy defaults.
   [`10`],
   [Grace period before killing the controller pod on shutdown.],
 
-  [`controller.log.level`], [`info`], [Tracing filter passed via `RUST_LOG`.],
+  [`controller.log.level`], [`info`], [Log filter passed via `RUST_LOG`.],
   [`controller.log.format`],
   [`text`],
   [Log format (`text` or `json`) passed via `WEICHE_LOG_FORMAT`.],
@@ -121,7 +121,7 @@ control plane, `GatewayClass`, RBAC, and platform proxy defaults.
   [`100m` CPU / `64Mi`–`256Mi` RAM],
   [Resource requests and limits for each proxy container.],
 
-  [`proxy.log.level`], [`info`], [Tracing filter passed via `RUST_LOG`.],
+  [`proxy.log.level`], [`info`], [Log filter passed via `RUST_LOG`.],
   [`proxy.log.format`],
   [`text`],
   [Log format (`text` or `json`) passed via `WEICHE_LOG_FORMAT`.],
@@ -193,7 +193,7 @@ The `weiche` binary exposes three subcommands:
 #table(
   columns: 3,
   table.header([Variable], [Default], [Description]),
-  [`RUST_LOG`], [`info`], [Tracing log filter for controller and proxy.],
+  [`RUST_LOG`], [`info`], [Log filter for controller and proxy, including per-target overrides.],
   [`WEICHE_LOG_FORMAT`], [`text`], [Log output format: `text` or `json`.],
   [`WEICHE_WORKERS`],
   [Available CPU parallelism],
@@ -220,6 +220,19 @@ The `weiche` binary exposes three subcommands:
   [Pod UID used as controller leader identity and proxy acknowledgement key in
     `ConfigMap`.],
 )
+
+== HTTP access logs
+
+The proxy emits one info-level event on the `weiche::access` target for each
+parsed HTTP/1, HTTP/2, or HTTP/3 request. Each event records the peer address,
+method, original path (without the query string), HTTP version, and status.
+`duration_us` measures the interval from request headers to response selection.
+A stream that ends before response selection has a null status.
+
+Access events follow `WEICHE_LOG_FORMAT` and are enabled at the default
+`info` level. Set `RUST_LOG=info,weiche::access=off` to keep operational logs
+only. Each producer thread has a bounded insomnilog queue. When it fills,
+new records are dropped and the backend reports the total at shutdown.
 
 == Built-in proxy runtime defaults
 

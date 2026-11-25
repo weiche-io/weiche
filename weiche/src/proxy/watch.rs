@@ -1,4 +1,5 @@
 //! consume this gateway's snapshot and acknowledge it after all local workers bind.
+use super::super::log;
 use super::{
     super::ir::{
         GatewaySnapshot, Transport,
@@ -186,7 +187,9 @@ pub async fn run(
                 .await
             {
                 Ok(_) => reported = next_ack,
-                Err(e) => tracing::warn!(error=%e, "could not acknowledge snapshot"),
+                Err(e) => {
+                    log!(warn, "could not acknowledge snapshot", error = e.to_string())
+                }
             }
         }
         tokio::select! {
@@ -195,16 +198,16 @@ pub async fn run(
             change = workers.changed() => { change.context("worker reports stopped")?; }
             _ = refresh.tick() => {
                 match authorized(&bindings, &binding_name).await {
-                    Ok(false) => { tracing::info!("gateway namespace authorization withdrawn"); break; }
+                    Ok(false) => { log!(info, "gateway namespace authorization withdrawn"); break; }
                     Ok(true) => refresh_due = true,
-                    Err(error) => tracing::warn!(%error, "could not refresh namespace authorization"),
+                    Err(error) => log!(warn, "could not refresh namespace authorization", error = error.to_string()),
                 }
             }
             event = stream.next() => match event.context("snapshot watch stopped")? {
                 Ok(Event::Apply(_) | Event::Delete(_) | Event::InitDone) => {
                     desired = store.get(&secret_ref).and_then(|secret| {
                         Desired::apply(&secret, &mut tx, http3)
-                            .inspect_err(|e| tracing::error!(error = %e, secret = %secret.name_any(), "invalid proxy snapshot"))
+                            .inspect_err(|e| log!(error, "invalid proxy snapshot", error = e.to_string(), secret = secret.name_any()))
                             .ok()
                     });
                     if desired.is_none() {
@@ -212,7 +215,7 @@ pub async fn run(
                     }
                 }
                 Ok(Event::Init | Event::InitApply(_)) => {}
-                Err(e) => tracing::warn!(error = %e, "snapshot watch interrupted"),
+                Err(e) => log!(warn, "snapshot watch interrupted", error = e.to_string()),
             }
         }
     }

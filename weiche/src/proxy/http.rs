@@ -1,4 +1,5 @@
 //! worker-local service composition; keep-alive requests borrow the current view.
+pub mod access;
 mod body;
 mod cors;
 mod filter;
