@@ -1206,6 +1206,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "insomnilog"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e396374230730c69fdb8bf1c31e0a7d9e4acb6aa80097fde9d0b8949bd8d8647"
+
+[[package]]
 name = "io-uring"
 version = "0.7.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2808,6 +2814,7 @@ dependencies = [
  "http-serde-ext",
  "hyper",
  "hyper-util",
+ "insomnilog",
  "k8s-openapi",
  "kube",
  "kube-lease-manager",
