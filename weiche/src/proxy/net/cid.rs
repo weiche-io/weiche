@@ -1,8 +1,8 @@
 //! steer server-issued connection IDs to their issuing worker after peer migration.
 use compio::quic::{ConnectionId, ConnectionIdGenerator};
 use libc::{
-    BPF_A, BPF_ABS, BPF_ALU, BPF_AND, BPF_B, BPF_H, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JMP,
-    BPF_JSET, BPF_LD, BPF_LEN, BPF_MOD, BPF_RET, BPF_W, sock_filter,
+    BPF_A, BPF_ABS, BPF_ALU, BPF_AND, BPF_B, BPF_H, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_JSET,
+    BPF_K, BPF_LD, BPF_LEN, BPF_RET, sock_filter,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{io, os::fd::AsRawFd, time::Duration};
@@ -36,28 +36,28 @@ impl ConnectionIdGenerator for Generator {
 /// build a classic reuseport filter for QUIC v1. both Linux UDP lookup paths pass
 /// sizeof(struct udphdr) to run_bpf_filter, which pulls it before running cBPF.
 /// absolute offset zero therefore addresses the first QUIC byte, including on IPv6.
-fn program(workers: u16) -> [sock_filter; 18] {
+fn program(workers: u16) -> [sock_filter; 16] {
     let op = |code, k| sock_filter { code: code as u16, jt: 0, jf: 0, k };
     let jump = |code, k, jt, jf| sock_filter { code: (BPF_JMP | code) as u16, jt, jf, k };
     [
         op(BPF_LD | BPF_LEN, 0),
-        jump(BPF_JGE, 3, 0, 13), // too short: hash
+        jump(BPF_JGE, 3, 0, 13), // too short for a worker index
         op(BPF_LD | BPF_B | BPF_ABS, 0),
         jump(BPF_JSET, 0x80, 2, 0), // long header: inspect type
         op(BPF_LD | BPF_H | BPF_ABS, 1),
-        op(BPF_JMP | BPF_JA, 10), // short header: reduce worker index
+        op(BPF_RET | BPF_A, 0), // short header carries the issuing worker's index
         op(BPF_ALU | BPF_AND, 0x30),
         jump(BPF_JEQ, 0x20, 1, 0), // handshake
-        jump(BPF_JEQ, 0x10, 0, 6), // zero-rtt, otherwise hash
+        jump(BPF_JEQ, 0x10, 0, 6), // zero-rtt, otherwise use the flow tuple
         op(BPF_LD | BPF_LEN, 0),
         jump(BPF_JGE, 8, 0, 4),
         op(BPF_LD | BPF_B | BPF_ABS, 5),
         jump(BPF_JEQ, 8, 0, 2),
         op(BPF_LD | BPF_H | BPF_ABS, 6),
-        op(BPF_JMP | BPF_JA, 1),
-        op(BPF_LD | BPF_W | BPF_ABS, (libc::SKF_AD_OFF + libc::SKF_AD_RXHASH) as u32),
-        op(BPF_ALU | BPF_MOD, u32::from(workers)),
         op(BPF_RET | BPF_A, 0),
+        // returning an index outside the group selects linux's UDP four-tuple hash.
+        // skb->hash can be unset on ingress, which would pin every Initial to slot zero.
+        op(BPF_RET | BPF_K, u32::from(workers)),
     ]
 }
 

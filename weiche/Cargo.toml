@@ -36,6 +36,7 @@ kube = { version = "5", default-features = false, features = [
 ] }
 kube-lease-manager = "0.13"
 libc = "0.2"
+mimalloc = "0.1.52"
 regex = "1.13.1"
 ring = "0.17"
 rmp-serde = "1"
