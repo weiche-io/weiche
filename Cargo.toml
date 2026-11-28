@@ -1,3 +1,8 @@
 [workspace]
 members = ["weiche", "weiche-gtwapi"]
 resolver = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
