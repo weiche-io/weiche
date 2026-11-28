@@ -1,9 +1,14 @@
 //! dispatch the controller, proxy and readiness probe commands.
 use anyhow::{Context, bail};
+use mimalloc::MiMalloc;
 use weiche::{
     control, log, logging,
     proxy::{self, config::RuntimeConfig},
 };
+
+/// serve worker-local allocations through mimalloc's per-thread heaps.
+#[global_allocator]
+static ALLOCATOR: MiMalloc = MiMalloc;
 
 /// configure logging and start the requested process role.
 fn main() -> anyhow::Result<()> {
